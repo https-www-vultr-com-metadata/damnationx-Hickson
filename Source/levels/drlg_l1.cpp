@@ -6,12 +6,14 @@
 #include "engine/load_file.hpp"
 #include "engine/point.hpp"
 #include "engine/random.hpp"
+#include "levels/survivors_layout.hpp"
 #include "engine/rectangle.hpp"
 #include "gendung_defs.hpp"
 #include "levels/crypt.h"
 #include "levels/drlg_quests.hpp"
 #include "levels/gendung.h"
 #include "player.h"
+#include "survivors.h"
 #include "utils/bitset2d.hpp"
 #include "utils/is_of.hpp"
 #include "utils/status_macros.hpp"
@@ -1165,6 +1167,30 @@ bool PlaceStairs(lvl_entry entry)
 
 void GenerateLevel(lvl_entry entry)
 {
+	if (IsSurvivorsMode() && leveltype == DTYPE_CATHEDRAL) {
+		// Use the level seed for a connected clearing, then let the native
+		// Cathedral converter generate its walls and floor details.
+		DRLG_InitTrans();
+		InitDungeonFlags();
+		DungeonMask.reset();
+		const auto layout = GenerateSurvivorsLayout(GetLCGEngineState());
+		for (int y = 0; y < DMAXY; ++y)
+			for (int x = 0; x < DMAXX; ++x)
+				if (layout[x][y]) DungeonMask.set(x, y);
+		MakeDmt();
+		FixTilesPatterns();
+		FloodTransparencyValues(Floor);
+		FixDirtTiles();
+		FixCornerTiles();
+		Substitution();
+		ApplyShadowsPatterns();
+		FillFloor();
+		SetPiece = {};
+		SetPieceRoom = {};
+		ViewPosition = { 56, 56 };
+		memcpy(pdungeon, dungeon, sizeof(pdungeon));
+		return;
+	}
 	if (LevelSeeds[currlevel])
 		SetRndSeed(*LevelSeeds[currlevel]);
 

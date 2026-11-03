@@ -22,7 +22,12 @@ set(DEVILUTIONX_SYSTEM_BZIP2 OFF)
 
 # Package the assets with the APK.
 set(BUILD_ASSETS_MPQ OFF)
-set(DEVILUTIONX_ASSETS_OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/android-project/app/src/main/assets")
+if(DAMNATIONX_HOST_LIB)
+  # Native Bevy hosts package their own assets, independently of the legacy SDL APK project.
+  set(DEVILUTIONX_ASSETS_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/assets")
+else()
+  set(DEVILUTIONX_ASSETS_OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/android-project/app/src/main/assets")
+endif()
 
 # Disable sanitizers. They're not supported out-of-the-box.
 set(ASAN OFF)

@@ -34,6 +34,7 @@
 #include "monsters/validation.hpp"
 #include "mpq/mpq_common.hpp"
 #include "pfile.h"
+#include "survivors.h"
 #include "plrmsg.h"
 #include "qol/stash.h"
 #include "stores.h"
@@ -2421,6 +2422,10 @@ constexpr uint8_t StashVersion = 0;
 
 void LoadStash()
 {
+	if (IsSurvivorsMode()) {
+		Stash = {};
+		return;
+	}
 	const char *filename;
 	if (!gbIsMultiplayer)
 		filename = "spstashitems";
@@ -2715,6 +2720,114 @@ void SaveHeroItems(SaveWriter &saveWriter, Player &player)
 		SaveItem(file, item);
 }
 
+void SaveSurvivorsBuyback(SaveWriter &writer, std::span<const Item> items, std::span<const int> prices)
+{
+	const size_t itemSize = gbIsHellfire ? HellfireItemSaveSize : DiabloItemSaveSize;
+	SaveHelper file(writer, "survivors-buyback", 4 + items.size() * (4 + itemSize));
+	file.WriteLE<uint8_t>(1); // version
+	file.WriteLE<uint8_t>(gbIsHellfire ? 1 : 0);
+	file.WriteLE<uint16_t>(static_cast<uint16_t>(items.size()));
+	for (size_t index = 0; index < items.size(); ++index) {
+		file.WriteLE<int32_t>(prices[index]);
+		SaveItem(file, items[index]);
+	}
+}
+
+void SaveSurvivorsLedgerHeldItem(SaveWriter &writer, const Item &item)
+{
+	const size_t itemSize = gbIsHellfire ? HellfireItemSaveSize : DiabloItemSaveSize;
+	SaveHelper file(writer, "survivors-held", 2 + (item.isEmpty() ? 0 : itemSize));
+	file.WriteLE<uint8_t>(gbIsHellfire ? 1 : 0);
+	file.WriteLE<uint8_t>(item.isEmpty() ? 0 : 1);
+	if (!item.isEmpty()) SaveItem(file, item);
+}
+
+void SaveSurvivorsGroundItems(SaveWriter &writer, std::span<const Item> items)
+{
+	const size_t itemSize = gbIsHellfire ? HellfireItemSaveSize : DiabloItemSaveSize;
+	SaveHelper file(writer, "survivors-ground", 4 + items.size() * itemSize);
+	file.WriteLE<uint8_t>(1);
+	file.WriteLE<uint8_t>(gbIsHellfire ? 1 : 0);
+	file.WriteLE<uint16_t>(static_cast<uint16_t>(items.size()));
+	for (const Item &item : items) SaveItem(file, item);
+}
+
+bool LoadSurvivorsGroundItems(std::optional<SaveReader> archive, std::vector<Item> &items)
+{
+	items.clear();
+	if (!archive) return false;
+	LoadHelper file(std::move(archive), "survivors-ground");
+	if (!file.IsValid(4)) return false;
+	const auto version = file.NextLE<uint8_t>();
+	const auto hellfire = file.NextLE<uint8_t>();
+	const auto count = file.NextLE<uint16_t>();
+	const size_t itemSize = gbIsHellfire ? HellfireItemSaveSize : DiabloItemSaveSize;
+	if (version != 1 || hellfire != static_cast<unsigned>(gbIsHellfire) || count > 4096
+	    || file.Size() != 4 + count * itemSize) return false;
+	const bool previousHellfire = gbIsHellfireSaveGame;
+	gbIsHellfireSaveGame = gbIsHellfire;
+	for (unsigned i = 0; i < count; ++i) {
+		Item item {};
+		LoadAndValidateItemData(file, item);
+		if (item.isEmpty()) { gbIsHellfireSaveGame = previousHellfire; items.clear(); return false; }
+		items.push_back(std::move(item));
+	}
+	gbIsHellfireSaveGame = previousHellfire;
+	return true;
+}
+
+bool LoadSurvivorsLedgerHeldItem(std::optional<SaveReader> archive, Item &item)
+{
+	item = {};
+	if (!archive) return false;
+	LoadHelper file(std::move(archive), "survivors-held");
+	if (!file.IsValid(2)) return false;
+	const auto hellfire = file.NextLE<uint8_t>();
+	const auto present = file.NextLE<uint8_t>();
+	const size_t itemSize = gbIsHellfire ? HellfireItemSaveSize : DiabloItemSaveSize;
+	if (hellfire != static_cast<unsigned>(gbIsHellfire) || present > 1
+	    || file.Size() != 2 + (present ? itemSize : 0)) return false;
+	if (!present) return true;
+	const bool previousHellfire = gbIsHellfireSaveGame;
+	gbIsHellfireSaveGame = gbIsHellfire;
+	LoadAndValidateItemData(file, item);
+	gbIsHellfireSaveGame = previousHellfire;
+	return !item.isEmpty();
+}
+
+bool LoadSurvivorsBuyback(std::optional<SaveReader> archive, std::vector<Item> &items, std::vector<int> &prices)
+{
+	items.clear();
+	prices.clear();
+	if (!archive) return false;
+	// Archives created before buyback was introduced contain no entry.
+	if (!archive->HasFile("survivors-buyback")) return true;
+	LoadHelper file(std::move(archive), "survivors-buyback");
+	if (!file.IsValid(4)) return false;
+	const auto version = file.NextLE<uint8_t>();
+	const auto hellfire = file.NextLE<uint8_t>();
+	const auto count = file.NextLE<uint16_t>();
+	const size_t itemSize = gbIsHellfire ? HellfireItemSaveSize : DiabloItemSaveSize;
+	if (version != 1 || hellfire != static_cast<unsigned>(gbIsHellfire) || count > 40
+	    || file.Size() != 4 + count * (4 + itemSize)) return false;
+	const bool previousHellfire = gbIsHellfireSaveGame;
+	gbIsHellfireSaveGame = gbIsHellfire;
+	for (unsigned index = 0; index < count; ++index) {
+		const int price = file.NextLE<int32_t>();
+		Item item {};
+		LoadAndValidateItemData(file, item);
+		if (price <= 0 || item.isEmpty()) {
+			gbIsHellfireSaveGame = previousHellfire;
+			items.clear(); prices.clear();
+			return false;
+		}
+		items.push_back(item);
+		prices.push_back(price);
+	}
+	gbIsHellfireSaveGame = previousHellfire;
+	return true;
+}
+
 void SaveStash(SaveWriter &stashWriter)
 {
 	const char *filename;
@@ -2941,6 +3054,8 @@ void SaveGameData(SaveWriter &saveWriter)
 
 void SaveGame()
 {
+	if (IsSurvivorsMode())
+		return;
 	gbValidSaveFile = true;
 	pfile_write_hero(/*writeGameData=*/true);
 	sfile_write_stash();

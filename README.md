@@ -1,35 +1,29 @@
 # DamnationX
-<p align="center">
-  <img width="512" height="768"  alt="image" src="https://github.com/user-attachments/assets/28099fbe-2c4a-42a4-bd2c-948a0c973541" />
-</p>
-
 
 DamnationX is a build of [DevilutionX](https://github.com/diasurgical/devilutionX) with optional HD art, a native 3D runtime, an online lobby and sound packs imported from your own copy of Diablo II or Diablo II: Resurrected.
 
 Download the game from [Releases](https://github.com/trygentic/damnationx/releases), or play the browser build at [damnationx.net](https://damnationx.net). You must supply your own Diablo game data.
 
-## Beta 8.2 hotfix
+## Beta 9
 
-[Beta 8.2 is available](https://github.com/trygentic/damnationx/releases/tag/v1.6.0-beta.8.2). It fixes walking toward buildings, repeated path changes while holding the mouse, and movement drift after stopping. Cathedral walls and archways fade around the hero when they block the camera. Dungeon doors and arches are larger, and permanent dungeon portals are farther from stair arrivals.
+[Beta 9 is available](https://github.com/trygentic/damnationx/releases/tag/v1.6.0-beta.9). It adds Survivors Mode, a five-act co-op mode with a rolling world, encircling monster rings, automatic attacks and its own hero progression. New multiplayer rooms use host-authoritative networking, so the host keeps playing while another player is slow or disconnected. Everyone in a room should use the same release.
 
-The native Graphics menu includes a hover-outline toggle and thickness slider, with a thinner default outline. Show FPS is on by default and can be changed in that menu or with `--fps on` / `--fps off` when launching the packaged game. The 3D loading screen waits for models, meshes and textures to finish loading and reports progress. Town lighting uses the original trailer baseline again. Starting the legacy look with ray tracing disabled also avoids a render-target crash on ray-capable graphics devices.
-
-This release also includes the beta 8.1 fixes for Windows startup, Python discovery, resumable D2R imports, hover names, ground item labels and chest poses.
+The native game has a new main menu and intro, a first-run brightness calibration screen, and controller mapping in its options. D2R imports accept Steam installs as well as Battle.net, and no longer need Python. Tristram's D2R buildings keep their brown and green colors at night, and town shadows no longer switch on and off while walking.
 
 The native game supports 3D, Classic and HD 2D rendering. Its Toxoid engine ships as compiled code with a license notice. This repository contains the game core and launcher; it does not contain the proprietary engine implementation.
 
-The browser uses a separate C++ WASM/WebGPU renderer. It supports local HD packs and D2R sound imports, but it does not run the native engine or convert D2R characters and environments. Android remains on beta 7.
+The browser download uses a separate C++ WASM/WebGPU renderer. It supports local HD packs and D2R sound imports, but it does not run the native engine. The hosted site also offers 3D Resurrect, a browser build of the native engine that can convert D2R art from a locally selected install. Android remains on beta 7.
 
 ## Install the desktop game
 
-The table below lists the beta 8.2 downloads. Each desktop download contains the game and launcher. Extract the complete archive into a writable folder and keep its files together.
+The table below lists the beta 9 downloads. Each desktop download contains the game and launcher. Extract the complete archive into a writable folder and keep its files together.
 
 | Platform | Package | Requirements |
 | --- | --- | --- |
-| Windows | `damnationx-game-and-launcher-1.6.0-beta.8.2-windows-x64.zip` | 64-bit Windows 10 or later; Direct3D 12 or Vulkan GPU and driver |
-| Linux x64 | `damnationx-game-and-launcher-1.6.0-beta.8.2-linux-x64.tar.gz` | Ubuntu 24.04 or compatible; glibc 2.39 or later; X11 or Wayland; Vulkan driver |
-| Linux ARM64 | `damnationx-game-and-launcher-1.6.0-beta.8.2-linux-arm64.tar.gz` | The same Linux requirements on 64-bit ARM hardware |
-| macOS | `damnationx-game-and-launcher-1.6.0-beta.8.2-macos26.2-arm64.tar.gz` | Apple Silicon; macOS 26.2 or later |
+| Windows | `damnationx-game-and-launcher-1.6.0-beta.9-windows-x64.zip` | 64-bit Windows 10 or later; Direct3D 12 or Vulkan GPU and driver |
+| Linux x64 | `damnationx-game-and-launcher-1.6.0-beta.9-linux-x64.tar.gz` | Ubuntu 24.04 or compatible; glibc 2.39 or later; X11 or Wayland; Vulkan driver |
+| Linux ARM64 | `damnationx-game-and-launcher-1.6.0-beta.9-linux-arm64.tar.gz` | The same Linux requirements on 64-bit ARM hardware |
+| macOS | `damnationx-game-and-launcher-1.6.0-beta.9-macos26.2-arm64.tar.gz` | Apple Silicon; macOS 26.2 or later |
 
 Run `launcher.exe` on Windows. On Linux or macOS, open a terminal in the extracted folder and run `./launcher`. The launcher finds the neighboring game executable. Select your Diablo data folder, import any optional art or sound packs, then press Play.
 
@@ -57,13 +51,11 @@ The pack uses the existing WebP export, with PNG files where that export retains
 
 ## Import Diablo II: Resurrected art
 
-Use Import installed D2R in the desktop launcher and select your owned D2R installation. Converted models, environments, interface art and portal fields remain on your computer.
+Use Import installed D2R in the desktop launcher and select your owned D2R installation from Battle.net or Steam. Converted models, environments, interface art and portal fields remain on your computer.
 
-The importer requires Python 3.11 or later. It checks the saved interpreter and searches for another installed version if that selection is missing or too old. Windows Store execution aliases are skipped. You can choose an interpreter under Launch options > Python. Managed environments are rebuilt when broken; upgrading Python does not require deleting launcher settings in AppData.
+The desktop packages include the native importer and converter, so imports need no Python, CMake or compiler. The launcher finds Steam installs through Steam's library folders, and a Battle.net install can be selected directly. A failed or cancelled import keeps the previous playable assets and the completed conversion work for a retry.
 
-The native import helper can be supplied in the package. If it is absent, conversion requires CMake 3.20 or later and a C/C++17 compiler. The launcher creates a Python environment and installs NumPy and Pillow by default, which requires internet access. A failed or cancelled import preserves the previous playable assets and keeps completed conversion work for a retry.
-
-D2R art is optional and independent of the HD pack. The browser cannot run this conversion.
+D2R art is optional and independent of the HD pack. In a browser, only 3D Resurrect on damnationx.net can run this conversion.
 
 ## Play in a browser
 
@@ -71,14 +63,14 @@ At [damnationx.net](https://damnationx.net), choose your game files and press Pl
 
 To host the browser download yourself:
 
-1. Extract `DamnationX-1.6.0-beta.8.2-web.zip`.
+1. Extract `DamnationX-1.6.0-beta.9-web.zip`.
 2. Serve its folder over HTTP on localhost, or HTTPS on another host. Opening `index.html` directly from disk does not work.
 3. Open the page in Chrome or Edge and select your own game data.
 
 For a local server:
 
 ```sh
-cd DamnationX-1.6.0-beta.8.2-web
+cd DamnationX-1.6.0-beta.9-web
 python3 -m http.server 8000
 ```
 

@@ -29,9 +29,11 @@ const HASH_FILE_LIMIT: u64 = 16 * 1024 * 1024;
 pub struct SourceFingerprint {
     /// Canonical owned D2R installation.
     pub game_dir: PathBuf,
-    /// `Version` from `.build.info`, for logs and the hint text.
+    /// `Version` from Battle.net's `.build.info`, or the Steam build's name, for
+    /// logs and the hint text.
     pub build: String,
-    /// Hash of `.build.info`; it changes with every game patch.
+    /// Hash of `.build.info` (Battle.net) or `Data/.build.config` (Steam); it
+    /// changes with every game patch.
     pub build_info: u64,
     /// Importer recipes (art) or the converting executable (sounds).
     pub converter: u64,
@@ -134,16 +136,46 @@ fn build_version(text: &str) -> String {
         .unwrap_or_else(|| "?".into())
 }
 
+/// A Steam build's name: `build-name` from its `.build.config` when that is a
+/// plain token, otherwise the config's hash. The converter names caches the same way.
+fn steam_build_version(text: &str, hash: u64) -> String {
+    text.lines()
+        .filter_map(|line| line.split_once('='))
+        .find(|(key, _)| key.trim() == "build-name")
+        .map(|(_, value)| value.trim())
+        .filter(|name| {
+            name.bytes()
+                .next()
+                .is_some_and(|c| c.is_ascii_alphanumeric())
+                && name
+                    .bytes()
+                    .all(|c| c.is_ascii_alphanumeric() || b"._-".contains(&c))
+        })
+        .map_or_else(|| format!("steam-{hash:016x}"), str::to_owned)
+}
+
 /// Fingerprint an owned install plus a converter hash.
 pub fn source_fingerprint(game_dir: &Path, converter: u64) -> Result<SourceFingerprint, String> {
     let game_dir = game_dir.canonicalize().map_err(|e| e.to_string())?;
-    let bytes = fs::read(game_dir.join(".build.info"))
-        .map_err(|e| format!("Cannot read .build.info: {e}"))?;
+    let layout = crate::assets::d2r_layout(&game_dir).ok_or_else(|| {
+        format!(
+            "{} is not a D2R install: it has neither .build.info nor Data/.build.config",
+            game_dir.display()
+        )
+    })?;
+    let build_file = layout.build_file(&game_dir);
+    let bytes =
+        fs::read(&build_file).map_err(|e| format!("Cannot read {}: {e}", build_file.display()))?;
     let mut build_info = FNV_START;
     fnv(&mut build_info, &bytes);
     let text = String::from_utf8_lossy(&bytes);
+    let text = text.trim_start_matches('\u{feff}');
+    let build = match layout {
+        crate::assets::D2rLayout::BattleNet { .. } => build_version(text),
+        crate::assets::D2rLayout::Steam { .. } => steam_build_version(text, build_info),
+    };
     Ok(SourceFingerprint {
-        build: build_version(text.trim_start_matches('\u{feff}')),
+        build,
         game_dir,
         build_info,
         converter,
@@ -491,6 +523,45 @@ mod tests {
     }
 
     #[test]
+    fn steam_installs_are_fingerprinted_by_their_build_config() {
+        let temp = tempfile::tempdir().unwrap();
+        let game = temp.path().join("Diablo II Resurrected");
+        fs::create_dir_all(game.join("Data")).unwrap();
+        // Lines from a Steam 3.2.0.1 static build config; it has no build-name.
+        let config = "# Build Configuration\n\nroot = bf9064519cc56ba5fe197ce27e4729a1\n\
+                      vfs-root = c04d868dcbb3c6e1ee11e1348ccfb526 b2aa4ad9d284dd1492000e00004fc499\n\
+                      key-layout-index-bits = 0\nkey-layout-0 = 8 8 40 1\n";
+        fs::write(game.join("Data/.build.config"), config).unwrap();
+        let first = source_fingerprint(&game, 7).unwrap();
+        assert!(first.build.starts_with("steam-"), "{}", first.build);
+        assert_eq!(first.build.len(), "steam-".len() + 16);
+        assert_eq!(source_fingerprint(&game, 7).unwrap(), first);
+        // A patch rewrites the config, so the previous import no longer matches.
+        fs::write(
+            game.join("Data/.build.config"),
+            config.replace("bf9064519cc56ba5", "0123456789abcdef"),
+        )
+        .unwrap();
+        let patched = source_fingerprint(&game, 7).unwrap();
+        assert_ne!(patched.build_info, first.build_info);
+        assert_ne!(patched.build, first.build);
+        // A plain build-name is shown as is; anything else falls back to the hash.
+        assert_eq!(
+            steam_build_version("build-name = D2R-3.2.0.1_93236\n", 1),
+            "D2R-3.2.0.1_93236"
+        );
+        assert_eq!(
+            steam_build_version("build-name = ../x\n", 0xab),
+            "steam-00000000000000ab"
+        );
+        // Neither layout: say what is missing instead of a bare I/O error.
+        let empty = temp.path().join("empty");
+        fs::create_dir_all(&empty).unwrap();
+        let error = source_fingerprint(&empty, 7).unwrap_err();
+        assert!(error.contains("Data/.build.config"), "{error}");
+    }
+
+    #[test]
     fn importer_fingerprint_ignores_docs_tests_and_bytecode() {
         let temp = tempfile::tempdir().unwrap();
         let importer = temp.path();
@@ -516,7 +587,7 @@ mod tests {
         fs::write(cache.join("glb/mapping.resolved.json"), b"{}").unwrap();
         fs::write(cache.join(ART_STAMP), b"{}").unwrap();
         fs::write(cache.join(SOUND_STAMP), b"{}").unwrap();
-        // Siblings of the cache: HD library and the managed Python stay.
+        // The separate HD library stays.
         fs::create_dir_all(root.join("damnationx/hd-combined/hd")).unwrap();
         fs::write(root.join("damnationx/hd-combined/hd/keep.png"), b"x").unwrap();
         let devilution = root.join("diasurgical/devilution");

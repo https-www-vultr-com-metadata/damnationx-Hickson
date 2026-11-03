@@ -225,7 +225,7 @@ mod tests {
     fn interrupted_models_keep_complete_files_and_discard_incomplete_ones() {
         let temp = tempfile::tempdir().unwrap();
         let game = temp.path().join("owned");
-        fs::create_dir_all(&game).unwrap();
+        fs::create_dir_all(game.join("Data")).unwrap();
         fs::write(game.join(".build.info"), "build 1").unwrap();
         let importer = temp.path().join("recipes");
         fs::create_dir_all(&importer).unwrap();
@@ -261,7 +261,7 @@ mod tests {
         let game = temp.path().join("owned");
         let importer = temp.path().join("recipes");
         fs::create_dir_all(importer.join("d2r_import")).unwrap();
-        fs::create_dir_all(&game).unwrap();
+        fs::create_dir_all(game.join("Data")).unwrap();
         fs::write(game.join(".build.info"), "build 1").unwrap();
         let cache = temp.path().join("d2r-models");
         let mut work = Work::open(&cache, &game).unwrap();
@@ -294,7 +294,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let game = temp.path().join("owned");
         let cache = temp.path().join("d2r-models");
-        fs::create_dir_all(&game).unwrap();
+        fs::create_dir_all(game.join("Data")).unwrap();
         fs::create_dir_all(&cache).unwrap();
         fs::write(game.join(".build.info"), "build 1").unwrap();
         std::os::unix::fs::symlink(&game, cache.join(".import-work")).unwrap();

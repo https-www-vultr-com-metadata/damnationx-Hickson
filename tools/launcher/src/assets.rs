@@ -184,7 +184,6 @@ pub struct AssetCandidates {
     pub d2r_dirs: Vec<PathBuf>,
     pub d2r_installs: Vec<PathBuf>,
     pub importers: Vec<PathBuf>,
-    pub pythons: Vec<PathBuf>,
 }
 
 /// A portable contained relative path, including Windows rules on Unix hosts.
@@ -542,8 +541,98 @@ pub fn normalize_d2r(path: &Path) -> PathBuf {
     }
 }
 
+/// Where Steam installs Diablo II: Resurrected (app 2536520) inside a library folder.
+pub fn d2r_steam_install(library: &Path) -> PathBuf {
+    library
+        .join("steamapps")
+        .join("common")
+        .join("Diablo II Resurrected")
+}
+
+/// How an owned Diablo II: Resurrected install stores its CASC archives.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum D2rLayout {
+    /// Battle.net: `.build.info` beside `Data/` (`config`, `data`, `indices`).
+    BattleNet { data: PathBuf },
+    /// Steam (since patch 3.2.0.1): no `.build.info`. `Data/.build.config`
+    /// describes a static store of `GG-PPPPPPPP.data` archives in that folder.
+    Steam { build_config: PathBuf },
+}
+
+impl D2rLayout {
+    /// The file that identifies the installed build; every patch changes it.
+    pub fn build_file(&self, game: &Path) -> PathBuf {
+        match self {
+            Self::BattleNet { .. } => game.join(".build.info"),
+            Self::Steam { build_config } => build_config.clone(),
+        }
+    }
+}
+
+/// The install's `Data` folder. Windows ships it as `Data`; a copy on a
+/// case-sensitive Linux or macOS volume may spell it `data`.
+fn d2r_data_dir(path: &Path) -> Option<PathBuf> {
+    let exact = path.join("Data");
+    if exact.is_dir() {
+        return Some(exact);
+    }
+    fs::read_dir(path)
+        .ok()?
+        .take(256)
+        .flatten()
+        .find(|entry| entry.file_name().eq_ignore_ascii_case("data") && entry.path().is_dir())
+        .map(|entry| entry.path())
+}
+
+/// The layout of a D2R install folder, or `None` when it is not one. A
+/// Battle.net `.build.info` wins, the same order CascLib opens them in.
+pub fn d2r_layout(path: &Path) -> Option<D2rLayout> {
+    let data = d2r_data_dir(path)?;
+    if path.join(".build.info").is_file() {
+        return Some(D2rLayout::BattleNet { data });
+    }
+    let build_config = data.join(".build.config");
+    build_config
+        .is_file()
+        .then_some(D2rLayout::Steam { build_config })
+}
+
 pub fn is_d2r_install(path: &Path) -> bool {
-    path.join(".build.info").is_file() && path.join("Data").is_dir()
+    d2r_layout(path).is_some()
+}
+
+/// A chosen D2R folder, moved up to the install when the player picked its
+/// `Data` folder instead. Anything else is returned unchanged.
+pub fn d2r_install_root(path: &Path) -> PathBuf {
+    if !is_d2r_install(path) {
+        let picked_data = path
+            .file_name()
+            .is_some_and(|name| name.eq_ignore_ascii_case("data"));
+        if let Some(parent) = path.parent().filter(|_| picked_data) {
+            if is_d2r_install(parent) {
+                return parent.to_path_buf();
+            }
+        }
+    }
+    path.to_path_buf()
+}
+
+pub fn normalize_importer(path: &Path) -> Option<PathBuf> {
+    // Accept the extracted package, its resources folder, or the recipe itself.
+    [
+        path.to_path_buf(),
+        path.join("d2r-import"),
+        path.join("resources/d2r-import"),
+        path.join("tools/d2r-import"),
+    ]
+    .into_iter()
+    .find(|root| root.join("mapping.toml").is_file() && root.join("env_mapping.toml").is_file())
+}
+
+pub fn select_importer(selected: Option<&Path>, candidates: &[PathBuf]) -> Option<PathBuf> {
+    selected
+        .and_then(normalize_importer)
+        .or_else(|| candidates.iter().find_map(|path| normalize_importer(path)))
 }
 
 fn game_status(path: Option<&Path>) -> AssetStatus {
@@ -859,7 +948,24 @@ pub fn detect() -> AssetCandidates {
             roots.push(path.join("Diablo II Resurrected"));
         }
     }
+    roots.extend(steam_d2r_candidates(&steam_root_candidates()));
     roots.push(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../d2r-import"));
+    scan_roots(&mut found, roots);
+    for list in [
+        &mut found.data_dirs,
+        &mut found.hd_dirs,
+        &mut found.d2r_dirs,
+        &mut found.d2r_installs,
+        &mut found.importers,
+    ] {
+        list.sort();
+        list.dedup();
+    }
+    found
+}
+
+/// Probes each candidate root for game data, HD packs, D2R installs and importers.
+fn scan_roots(found: &mut AssetCandidates, roots: Vec<PathBuf>) {
     for path in roots {
         if base_status(Some(&path)).ready {
             found.data_dirs.push(path.clone());
@@ -874,73 +980,215 @@ pub fn detect() -> AssetCandidates {
         if is_d2r_install(&path) {
             found.d2r_installs.push(path.clone());
         }
-        if path.join("d2r_import/__main__.py").is_file() && path.join("requirements.txt").is_file()
-        {
-            found.importers.push(path);
+        if let Some(importer) = normalize_importer(&path) {
+            found.importers.push(importer);
         }
     }
-    found.pythons = python_candidates();
-    for list in [
-        &mut found.data_dirs,
-        &mut found.hd_dirs,
-        &mut found.d2r_dirs,
-        &mut found.d2r_installs,
-        &mut found.importers,
-    ] {
-        list.sort();
-        list.dedup();
-    }
-    found
 }
 
-/// Candidates only; the import worker probes their version before using them.
-pub fn python_candidates() -> Vec<PathBuf> {
-    let mut candidates = Vec::new();
-    if let Some(paths) = std::env::var_os("PATH") {
-        for directory in std::env::split_paths(&paths) {
-            // Windows Store execution aliases are not installed interpreters.
-            if directory.components().any(|c| {
-                c.as_os_str()
-                    .to_string_lossy()
-                    .eq_ignore_ascii_case("WindowsApps")
-            }) {
-                continue;
+/// Where Steam keeps its own folder on this OS. A missing install is fine: the
+/// caller then finds no libraryfolders.vdf there.
+fn steam_root_candidates() -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    if cfg!(windows) {
+        for key in ["PROGRAMFILES(X86)", "PROGRAMFILES"] {
+            if let Some(path) = std::env::var_os(key).map(PathBuf::from) {
+                roots.push(path.join("Steam"));
             }
-            for name in if cfg!(windows) {
-                vec!["python.exe", "python3.exe", "py.exe"]
-            } else {
-                vec!["python3", "python"]
-            } {
-                let path = directory.join(name);
-                if path.is_file() {
-                    candidates.push(path);
+        }
+        roots.push(PathBuf::from(r"C:\Program Files (x86)\Steam"));
+    }
+    if let Some(home) = directories::BaseDirs::new().map(|d| d.home_dir().to_path_buf()) {
+        if cfg!(target_os = "macos") {
+            roots.push(home.join("Library/Application Support/Steam"));
+            // Windows Steam inside a CrossOver bottle. Its libraryfolders.vdf
+            // holds Windows paths, which are skipped on this OS.
+            if let Ok(bottles) =
+                fs::read_dir(home.join("Library/Application Support/CrossOver/Bottles"))
+            {
+                for bottle in bottles.take(64).flatten() {
+                    roots.push(bottle.path().join("drive_c/Program Files (x86)/Steam"));
                 }
             }
         }
+        if cfg!(target_os = "linux") {
+            roots.push(home.join(".local/share/Steam"));
+            roots.push(home.join(".steam/steam"));
+            roots.push(home.join(".var/app/com.valvesoftware.Steam/.local/share/Steam"));
+            roots.push(home.join("snap/steam/common/.local/share/Steam"));
+        }
     }
-    // The python.org installer need not add Python to PATH. Search its usual
-    // per-user install location as well, including after a version upgrade.
-    if cfg!(windows) {
-        if let Some(local) = std::env::var_os("LOCALAPPDATA") {
-            if let Ok(entries) = fs::read_dir(PathBuf::from(local).join("Programs/Python")) {
-                for entry in entries.flatten() {
-                    let executable = entry.path().join("python.exe");
-                    if executable.is_file() {
-                        candidates.push(executable);
+    roots
+}
+
+/// Diablo II: Resurrected inside each Steam library: every Steam root, then the
+/// libraries its libraryfolders.vdf lists. A missing or unreadable vdf adds
+/// nothing, and a library reached twice (say, through a symlink) is kept once.
+fn steam_d2r_candidates(steam_roots: &[PathBuf]) -> Vec<PathBuf> {
+    let mut libraries = Vec::new();
+    for root in steam_roots {
+        libraries.push(root.clone());
+        let vdf = root.join("steamapps/libraryfolders.vdf");
+        // Steam writes this file in a few KB; anything much larger is not it.
+        if fs::metadata(&vdf).is_ok_and(|meta| meta.len() <= 1024 * 1024) {
+            if let Ok(text) = fs::read_to_string(&vdf) {
+                libraries.extend(steam_library_paths(&text));
+            }
+        }
+    }
+    let mut seen = BTreeSet::new();
+    libraries.retain(|library| {
+        seen.insert(fs::canonicalize(library).unwrap_or_else(|_| library.clone()))
+    });
+    libraries
+        .into_iter()
+        .map(|library| d2r_steam_install(&library))
+        .collect()
+}
+
+/// One Valve KeyValues token: quoted or bare text, or a brace.
+enum VdfToken {
+    Text(String),
+    Open,
+    Close,
+}
+
+/// Tokenizes Valve KeyValues text. Malformed input yields fewer tokens, never an error.
+fn steam_vdf_tokens(text: &str) -> Vec<VdfToken> {
+    let mut tokens = Vec::new();
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            _ if c.is_whitespace() => {}
+            '{' => tokens.push(VdfToken::Open),
+            '}' => tokens.push(VdfToken::Close),
+            '/' if chars.peek() == Some(&'/') => {
+                // A `//` comment runs to the end of the line.
+                for c in chars.by_ref() {
+                    if c == '\n' {
+                        break;
                     }
                 }
             }
+            '"' => {
+                // Only \\ and \" are escapes, so a lone Windows backslash is kept as is.
+                let mut value = String::new();
+                let mut closed = false;
+                while let Some(next) = chars.next() {
+                    match next {
+                        '"' => {
+                            closed = true;
+                            break;
+                        }
+                        '\\' if matches!(chars.peek(), Some('\\' | '"')) => {
+                            value.extend(chars.next());
+                        }
+                        _ => value.push(next),
+                    }
+                }
+                // An unclosed quote is a truncated file: keep nothing from it.
+                if closed {
+                    tokens.push(VdfToken::Text(value));
+                }
+            }
+            _ => {
+                let mut value = String::from(c);
+                while let Some(&next) = chars.peek() {
+                    if next.is_whitespace() || matches!(next, '{' | '}' | '"') {
+                        break;
+                    }
+                    value.push(next);
+                    chars.next();
+                }
+                tokens.push(VdfToken::Text(value));
+            }
         }
-        candidates.push(PathBuf::from("py.exe"));
     }
-    candidates.sort();
-    candidates.dedup();
-    candidates
+    tokens
+}
+
+/// The value of every "path" key in a libraryfolders.vdf, at any depth. A value
+/// spelled "path" is not a key. Empty paths, and paths that are not absolute on
+/// this OS (a Windows bottle's `C:\...` read on macOS), are skipped.
+fn steam_library_paths(vdf_text: &str) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    let mut key: Option<String> = None;
+    for token in steam_vdf_tokens(vdf_text) {
+        match (key.take(), token) {
+            (Some(name), VdfToken::Text(value)) => {
+                let path = PathBuf::from(&value);
+                if name.eq_ignore_ascii_case("path") && path.is_absolute() {
+                    paths.push(path);
+                }
+            }
+            (None, VdfToken::Text(name)) => key = Some(name),
+            (_, VdfToken::Open | VdfToken::Close) => {}
+        }
+    }
+    paths
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "requires a completed owned D2R Rust import in D2R_RUST_TEST_GLB"]
+    fn owned_rust_mapping_passes_launcher_validation() {
+        let path = std::env::var_os("D2R_RUST_TEST_GLB").expect("set D2R_RUST_TEST_GLB");
+        let status = inspect(&AssetPaths {
+            d2r_dir: Some(PathBuf::from(path)),
+            ..Default::default()
+        });
+        assert!(status.d2r_mapping.ready, "{}", status.d2r_mapping.detail);
+    }
+
+    #[test]
+    #[ignore = "requires completed owned D2R Rust world, UI and portal in D2R_RUST_TEST_GLB"]
+    fn owned_rust_world_and_ui_pass_launcher_validation() {
+        let path = std::env::var_os("D2R_RUST_TEST_GLB").expect("set D2R_RUST_TEST_GLB");
+        let status = inspect(&AssetPaths {
+            d2r_dir: Some(PathBuf::from(path)),
+            ..Default::default()
+        });
+        assert!(
+            status.d2r_environment.ready,
+            "{}",
+            status.d2r_environment.detail
+        );
+        assert!(status.d2r_ui.ready, "{}", status.d2r_ui.detail);
+        assert!(status.d2r_portal.ready, "{}", status.d2r_portal.detail);
+    }
+
+    #[test]
+    fn importer_accepts_package_and_resources_folders_and_repairs_stale_selection() {
+        let temp = tempfile::tempdir().unwrap();
+        let recipe = temp.path().join("resources/d2r-import");
+        fs::create_dir_all(&recipe).unwrap();
+        fs::write(recipe.join("mapping.toml"), "").unwrap();
+        fs::write(recipe.join("env_mapping.toml"), "").unwrap();
+        for folder in [
+            temp.path().to_path_buf(),
+            temp.path().join("resources"),
+            recipe.clone(),
+        ] {
+            assert_eq!(
+                normalize_importer(&folder),
+                Some(recipe.clone()),
+                "{}",
+                folder.display()
+            );
+        }
+        assert_eq!(
+            select_importer(Some(&temp.path().join("old-release")), &[recipe.clone()]),
+            Some(recipe.clone())
+        );
+        assert!(select_importer(Some(&temp.path().join("missing")), &[]).is_none());
+        assert_eq!(
+            select_importer(Some(&recipe), &[temp.path().join("missing")]),
+            Some(recipe)
+        );
+    }
 
     #[test]
     fn selected_base_archive_is_checked_directly_and_mixed_case_folder_fallback_works() {
@@ -1267,5 +1515,253 @@ mod tests {
             hd_status(temp.path()).unwrap_err(),
             "HD index exceeds supported size"
         );
+    }
+
+    fn tree(root: &Path, dirs: &[&str], files: &[&str]) -> PathBuf {
+        for dir in dirs {
+            fs::create_dir_all(root.join(dir)).unwrap();
+        }
+        for file in files {
+            let path = root.join(file);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, "").unwrap();
+        }
+        root.to_path_buf()
+    }
+
+    /// Steam's install as reported by a player's diagnostic: `D2R.exe`, no
+    /// `.build.info`, and `Data/` holding `.build.config` beside the archives.
+    fn steam_install(root: &Path) -> PathBuf {
+        tree(
+            root,
+            &[],
+            &[
+                "D2R.exe",
+                "Data/.build.config",
+                "Data/00-00000001.data",
+                "Data/00-0000000e.data",
+            ],
+        )
+    }
+
+    #[test]
+    fn d2r_layout_accepts_battle_net_and_steam_installs_and_nothing_partial() {
+        let temp = tempfile::tempdir().unwrap();
+        let battle_net = tree(
+            &temp.path().join("battle-net"),
+            &["Data/indices", "Data/data", "Data/config"],
+            &[".build.info"],
+        );
+        assert_eq!(
+            d2r_layout(&battle_net),
+            Some(D2rLayout::BattleNet {
+                data: battle_net.join("Data")
+            })
+        );
+        let steam = steam_install(&temp.path().join("steam"));
+        let build_config = steam.join("Data").join(".build.config");
+        assert_eq!(
+            d2r_layout(&steam),
+            Some(D2rLayout::Steam {
+                build_config: build_config.clone()
+            })
+        );
+        assert_eq!(d2r_layout(&steam).unwrap().build_file(&steam), build_config);
+        assert_eq!(
+            D2rLayout::BattleNet {
+                data: battle_net.join("Data")
+            }
+            .build_file(&battle_net),
+            battle_net.join(".build.info")
+        );
+        // A case-sensitive copy that spells the folder `data` is still an install.
+        let lowercase = tree(
+            &temp.path().join("lowercase"),
+            &[],
+            &["data/.build.config", "data/00-00000001.data"],
+        );
+        assert!(is_d2r_install(&lowercase));
+        let partial = [
+            tree(&temp.path().join("build-info-only"), &[], &[".build.info"]),
+            tree(&temp.path().join("data-dir-only"), &["Data"], &[]),
+            tree(
+                &temp.path().join("archives-only"),
+                &[],
+                &["Data/00-00000001.data"],
+            ),
+            tree(
+                &temp.path().join("config-at-root"),
+                &["Data"],
+                &[".build.config"],
+            ),
+            tree(
+                &temp.path().join("data-is-a-file"),
+                &[],
+                &[".build.info", "Data"],
+            ),
+            tree(
+                &temp.path().join("config-is-a-dir"),
+                &["Data/.build.config"],
+                &[],
+            ),
+        ];
+        for root in &partial {
+            assert!(!is_d2r_install(root), "{}", root.display());
+        }
+    }
+
+    #[test]
+    fn a_picked_data_folder_resolves_to_its_install() {
+        let temp = tempfile::tempdir().unwrap();
+        let steam = steam_install(&temp.path().join("steam"));
+        assert_eq!(d2r_install_root(&steam.join("Data")), steam);
+        assert_eq!(d2r_install_root(&steam), steam);
+        let battle_net = tree(
+            &temp.path().join("bnet"),
+            &["Data/indices"],
+            &[".build.info"],
+        );
+        assert_eq!(d2r_install_root(&battle_net.join("Data")), battle_net);
+        // Not an install, and not the Data folder of one: unchanged.
+        let other = tree(&temp.path().join("other/Data"), &[], &[]);
+        assert_eq!(d2r_install_root(&other), other);
+    }
+
+    /// Writes a libraryfolders.vdf listing these libraries the way Steam escapes them.
+    fn library_vdf(libraries: &[PathBuf]) -> String {
+        let mut text = String::from("\"libraryfolders\"\n{\n");
+        for (index, library) in libraries.iter().enumerate() {
+            let escaped = library.display().to_string().replace('\\', "\\\\");
+            text.push_str(&format!(
+                "\t\"{index}\"\n\t{{\n\t\t\"path\"\t\t\"{escaped}\"\n\t\t\"label\"\t\t\"path\"\n\t}}\n"
+            ));
+        }
+        text.push_str("}\n");
+        text
+    }
+
+    #[test]
+    fn steam_library_paths_read_every_absolute_path_key() {
+        let vdf = r#""libraryfolders"
+{
+	"0"
+	{
+		"path"		"C:\\Program Files (x86)\\Steam"
+		"label"		"path"
+		"contentid"		"1234567890"
+	}
+	"1"
+	{
+		"path"		"D:\\SteamLibrary"
+		"apps"
+		{
+			"2536520"		"42928243987"
+		}
+	}
+	"2"
+	{
+		"path"		"/mnt/games/SteamLibrary"
+	}
+}"#;
+        let expected: Vec<PathBuf> = if cfg!(windows) {
+            vec![
+                PathBuf::from(r"C:\Program Files (x86)\Steam"),
+                PathBuf::from(r"D:\SteamLibrary"),
+            ]
+        } else {
+            // Windows paths from a bottle's vdf are not paths on this OS.
+            vec![PathBuf::from("/mnt/games/SteamLibrary")]
+        };
+        assert_eq!(steam_library_paths(vdf), expected);
+    }
+
+    #[test]
+    fn steam_library_paths_skip_malformed_and_truncated_entries() {
+        let library = if cfg!(windows) {
+            r"E:\\games"
+        } else {
+            "/games"
+        };
+        let unescaped = PathBuf::from(library.replace(r"\\", r"\"));
+        assert!(steam_library_paths("").is_empty());
+        assert!(steam_library_paths("}} { garbage \"unclosed").is_empty());
+        // A key without a value, an empty path and an unclosed value add nothing.
+        assert!(steam_library_paths(r#""path""#).is_empty());
+        assert!(steam_library_paths(r#""path" """#).is_empty());
+        assert!(steam_library_paths(&format!(r#""path" "{library}"#)).is_empty());
+        // A file cut off mid-entry keeps the entries that were finished.
+        let truncated = format!(
+            r#""libraryfolders" {{ "0" {{ "path" "{library}" }} "1" {{ "path" "{library}x"#
+        );
+        assert_eq!(steam_library_paths(&truncated), vec![unescaped]);
+    }
+
+    #[test]
+    fn steam_d2r_candidates_follow_libraryfolders_and_survive_missing_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let steam = temp.path().join("Steam");
+        let library = temp.path().join("games/SteamLibrary");
+        let vdf = steam.join("steamapps/libraryfolders.vdf");
+        let root_only = vec![d2r_steam_install(&steam)];
+        // A Steam folder that does not exist is still a candidate; probing it finds nothing.
+        assert_eq!(steam_d2r_candidates(&[steam.clone()]), root_only);
+        fs::create_dir_all(steam.join("steamapps")).unwrap();
+        fs::write(&vdf, "\"libraryfolders\" { \"1\" {").unwrap();
+        assert_eq!(steam_d2r_candidates(&[steam.clone()]), root_only);
+        // Library 0 repeats the Steam root, which must not be listed twice.
+        fs::write(&vdf, library_vdf(&[steam.clone(), library.clone()])).unwrap();
+        let mut found = steam_d2r_candidates(&[steam.clone()]);
+        found.sort();
+        let mut expected = vec![d2r_steam_install(&steam), d2r_steam_install(&library)];
+        expected.sort();
+        assert_eq!(found, expected);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn steam_d2r_candidates_list_a_symlinked_steam_folder_once() {
+        let temp = tempfile::tempdir().unwrap();
+        let real = temp.path().join(".local/share/Steam");
+        fs::create_dir_all(real.join("steamapps")).unwrap();
+        fs::create_dir(temp.path().join(".steam")).unwrap();
+        std::os::unix::fs::symlink(&real, temp.path().join(".steam/steam")).unwrap();
+        assert_eq!(
+            steam_d2r_candidates(&[real.clone(), temp.path().join(".steam/steam")]),
+            vec![d2r_steam_install(&real)]
+        );
+    }
+
+    #[test]
+    fn a_steam_install_in_another_library_is_detected() {
+        let temp = tempfile::tempdir().unwrap();
+        let steam = temp.path().join("Steam");
+        let library = temp.path().join("SteamLibrary");
+        fs::create_dir_all(steam.join("steamapps")).unwrap();
+        fs::write(
+            steam.join("steamapps/libraryfolders.vdf"),
+            library_vdf(&[steam.clone(), library.clone()]),
+        )
+        .unwrap();
+        let install = steam_install(&d2r_steam_install(&library));
+        // The Steam root's own copy is incomplete, so it is not an install.
+        fs::create_dir_all(d2r_steam_install(&steam).join("Data")).unwrap();
+        let mut found = AssetCandidates::default();
+        scan_roots(&mut found, steam_d2r_candidates(&[steam]));
+        assert_eq!(found.d2r_installs, vec![install]);
+    }
+
+    #[test]
+    fn steam_root_candidates_include_the_install_folder_for_this_os() {
+        let roots = steam_root_candidates();
+        let has = |suffix: &str| roots.iter().any(|root| root.ends_with(suffix));
+        if cfg!(target_os = "macos") {
+            assert!(has("Library/Application Support/Steam"));
+        }
+        if cfg!(target_os = "linux") {
+            assert!(has(".local/share/Steam") && has(".steam/steam"));
+        }
+        if cfg!(windows) {
+            assert!(has(r"Program Files (x86)\Steam"));
+        }
     }
 }

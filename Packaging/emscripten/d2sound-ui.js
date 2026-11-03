@@ -169,9 +169,15 @@
 			return null;
 		}
 		var paths = files.map(function(file) { return file.path.toLowerCase(); });
+		// Steam installs (patch 3.2.0.1 and later) have no .build.info: Data holds .build.config and .data archives.
+		if (paths.indexOf('.build.info') < 0 && paths.indexOf('data/.build.config') >= 0) {
+			if (!paths.some(function(path) { return /^data\/[^/]+\.data$/.test(path); }))
+				return 'This is not a Diablo II Resurrected folder: Data has no .data archives.';
+			return null;
+		}
 		if (paths.indexOf('.build.info') < 0)
-			return 'This is not a Diablo II Resurrected folder: .build.info is missing. Choose the folder that contains D2R.exe and Data'
-				+ (window.showDirectoryPicker ? '.' : ' (if it is, this browser hides the .build.info file: use Chrome or Edge).');
+			return 'This is not a Diablo II Resurrected folder: .build.info (Battle.net) or Data/.build.config (Steam) is missing. Choose the folder that contains D2R.exe and Data'
+				+ (window.showDirectoryPicker ? '.' : ' (if it is, this browser hides these files: use Chrome or Edge).');
 		if (!paths.some(function(path) { return /^data\/data\/[^/]+\.idx$/.test(path); }))
 			return 'This is not a Diablo II Resurrected folder: Data/data has no .idx files.';
 		return null;
@@ -223,7 +229,7 @@
 		switch (result.error) {
 		case '': break;
 		case 'open-archives-failed': return 'Failed to open the Diablo II archives.';
-		case 'open-storage-failed': return 'Failed to open the Diablo II Resurrected data (Data/data, Data/config and .build.info are needed).';
+		case 'open-storage-failed': return 'Failed to open the Diablo II Resurrected data (Battle.net needs .build.info, Data/data and Data/config; Steam needs Data/.build.config and its .data archives).';
 		case 'no-sounds-found': return 'No sounds were found in these files.';
 		case 'sound-maps-missing': return 'The sound maps are missing from the game assets.';
 		default: return 'The import failed (' + result.error + ').';

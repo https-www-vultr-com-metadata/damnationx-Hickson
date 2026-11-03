@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>DamnationX — 3D Resurrect</title>
+<style>
+:root{color-scheme:dark;font:16px/1.5 system-ui;background:#08090b;color:#ded8cb}*{box-sizing:border-box}[hidden]{display:none!important}body{margin:0}main{max-width:850px;margin:6vh auto;padding:28px;border:1px solid #534333;background:#111214}h1{font-family:Georgia,serif;font-weight:normal;color:#cbb18b;margin:0 0 12px}p{color:#bbb6ab}label{display:block;margin:22px 0}input{display:block;margin-top:8px;max-width:100%}button,a{color:#e0c69f}button{font:inherit;background:#30251b;border:1px solid #8b7050;padding:10px 24px;cursor:pointer}button:disabled{opacity:.45;cursor:default}#status{white-space:pre-wrap}#canvas{display:none;width:100vw;height:100vh;outline:none}body.playing main{display:none}body.playing #canvas{display:block}small{display:block;color:#999}#error{color:#ffada4;white-space:pre-wrap}select{font:inherit;padding:5px;background:#17191d;color:inherit}footer{margin-top:24px;font-size:14px}#d2r-categories{display:flex;flex-wrap:wrap;gap:8px 20px}#d2r-categories label{margin:8px 0}#d2r-categories input{display:inline-block;margin:0 6px 0 0}details{margin:12px 0}summary{cursor:pointer;color:#cbb18b}
+</style>
+</head>
+<body><main>
+<h1>DamnationX · 3D Resurrect</h1>
+<p>Explore Sanctuary with animated 3D characters, PBR terrain, shadows, moving water, grass, fog, particles and the D2R look.</p>
+<label>1. Your Diablo game files <small>Choose DIABDAT.MPQ or SPAWN.MPQ. Optional Hellfire MPQs can be selected together. Files stay in your browser.</small><input id="game-files" type="file" accept=".mpq" multiple></label>
+<label>2. Your Diablo II: Resurrected installation <small>Optional. Choose the installed game folder: Battle.net installs contain <b>.build.info</b> and <b>Data</b>, Steam installs contain <b>Data/.build.config</b>. Assets are converted locally in a worker; the install stays on your computer. Conversion can take several minutes.</small><input id="d2r-raw-files" type="file" webkitdirectory multiple></label>
+<button id="d2r-pick-install" hidden>Choose installed D2R folder</button>
+<details><summary>D2R conversion options</summary>
+<div id="d2r-categories">
+<label><input type="checkbox" data-d2r-category="player" checked>Heroes</label>
+<label><input type="checkbox" data-d2r-category="towner" checked>Towners</label>
+<label><input type="checkbox" data-d2r-category="monster" checked>Monsters</label>
+<label><input type="checkbox" data-d2r-category="object" checked>Objects</label>
+<label><input type="checkbox" data-d2r-category="environment" checked>Environment</label>
+<label><input type="checkbox" data-d2r-category="ui" checked>HUD and menus</label>
+<label><input type="checkbox" data-d2r-category="vfx" checked>Portal effects</label>
+</div>
+<label>Texture size <select id="d2r-texture-size"><option value="256">256 px</option><option value="512" selected>512 px</option><option value="1024">1024 px</option></select></label>
+</details>
+<button id="d2r-cancel" hidden>Cancel conversion</button>
+<details><summary>Already converted D2R assets</summary><label>Choose the importer's <b>glb</b> folder containing mapping.resolved.json and env/.<input id="d2r-files" type="file" webkitdirectory multiple></label></details>
+<label>3. Your HD pack <small>Optional. Choose the pack's hd folder.</small><input id="hd-files" type="file" webkitdirectory multiple></label>
+<label>Render mode <select id="render-mode"><option value="3d">3D Resurrect</option value="classic">Classic</option><option value="hd">HD 2D</option></select></label>
+<p id="status" role="status">Restoring your local files…</p><p id="error" role="alert"></p>
+<button id="play" disabled>Play</button>
+<footer>WebGPU required. Ray tracing is disabled in the browser. Ctrl+M changes render mode; Ctrl+O enables the orbit camera. <a href="../index.html">Classic web launcher</a></footer>
+</main><canvas id="canvas" tabindex="0" oncontextmenu="event.preventDefault()"></canvas>
+<script type="module" src="bootstrap.mjs"></script>
+</body></html>

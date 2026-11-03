@@ -4,8 +4,10 @@
  * Implementation of visual grid-based store UI.
  */
 #include "qol/visual_store.h"
+#include "dvlnet/async_runtime.h"
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <span>
 
@@ -25,12 +27,15 @@
 #include "items.h"
 #include "minitext.h"
 #include "options.h"
+#include "pfile.h"
 #include "panels/info_box.hpp"
 #include "panels/ui_panels.hpp"
 #include "player.h"
+#include "plrmsg.h"
 #include "qol/stash.h"
 #include "spells.h"
 #include "stores.h"
+#include "survivors.h"
 #include "utils/format_int.hpp"
 #include "utils/language.h"
 #include "utils/str_cat.hpp"
@@ -48,6 +53,34 @@ OptionalOwnedClxSpriteList VisualStorePanelArt;
 OptionalOwnedClxSpriteList VisualStoreNavButtonArt;
 OptionalOwnedClxSpriteList VisualStoreRepairAllButtonArt;
 OptionalOwnedClxSpriteList VisualStoreRepairButtonArt;
+
+std::array<std::vector<Item>, MAX_PLRS> BuybackItems;
+std::array<std::vector<int>, MAX_PLRS> BuybackPrices;
+
+std::vector<Item> &LocalBuybackItems() { return BuybackItems[MyPlayerId]; }
+std::vector<int> &LocalBuybackPrices() { return BuybackPrices[MyPlayerId]; }
+
+int VisualPrice(size_t index, const Item &item)
+{
+	if (VisualStore.activeTab == VisualStoreTab::Buyback && index < LocalBuybackPrices().size())
+		return LocalBuybackPrices()[index];
+	return item._iIvalue;
+}
+
+// Include the cells occupied by the sold item: they will be freed before the
+// gold is added. Reject the transaction before removing the item if necessary.
+bool SurvivorsSaleGoldFits(const Player &player, int price, int soldIndex)
+{
+	int64_t room = 0;
+	for (int i = 0; i < player._pNumInv; ++i) {
+		const Item &item = player.InvList[i];
+		if (item._itype == ItemType::Gold) room += std::max(0, MaxGold - item._ivalue);
+	}
+	for (const int cell : player.InvGrid) {
+		if (cell == 0 || (soldIndex >= 0 && std::abs(cell) == soldIndex + 1)) room += MaxGold;
+	}
+	return room >= price;
+}
 
 int VisualStoreButtonPressed = -1;
 
@@ -72,6 +105,8 @@ std::span<Item> GetVendorItems(VisualStoreVendor vendor, VisualStoreTab tab)
 {
 	switch (vendor) {
 	case VisualStoreVendor::Smith: {
+		if (tab == VisualStoreTab::Buyback)
+			return LocalBuybackItems();
 		if (tab == VisualStoreTab::Premium) {
 			return { PremiumItems.data(), static_cast<size_t>(PremiumItems.size()) };
 		}
@@ -85,12 +120,12 @@ std::span<Item> GetVendorItems(VisualStoreVendor vendor, VisualStoreTab tab)
 	}
 	case VisualStoreVendor::Boy: {
 		if (BoyItem.isEmpty()) {
-			return {};
+			return { };
 		}
 		return { &BoyItem, 1 };
 	}
 	}
-	return {};
+	return { };
 }
 
 /** @brief Check if the current vendor has tabs (Smith only). */
@@ -226,6 +261,9 @@ void FreeVisualStoreGFX()
 
 void OpenVisualStore(VisualStoreVendor vendor)
 {
+	// Survivors can open the merchant in an arena without loading town first.
+	if (!HeadlessMode && !VisualStorePanelArt)
+		InitVisualStore();
 	IsVisualStoreOpen = true;
 	invflag = true; // Open inventory panel alongside
 
@@ -236,11 +274,7 @@ void OpenVisualStore(VisualStoreVendor vendor)
 	pcursstoreitem = -1;
 	pcursstorebtn = -1;
 
-	// Refresh item stat flags for current player
-	std::span<Item> items = GetVisualStoreItems();
-	for (Item &item : items) {
-		item._iStatFlag = MyPlayer->CanUseItem(item);
-	}
+	RefreshVisualStoreItemEligibility();
 
 	RefreshVisualStoreLayout();
 
@@ -251,6 +285,9 @@ void OpenVisualStore(VisualStoreVendor vendor)
 void CloseVisualStore()
 {
 	if (IsVisualStoreOpen) {
+		if (IsSurvivorsMode() && !gbIsMultiplayer && MyPlayer != nullptr
+		    && !pfile_save_survivors_inventory())
+			EventPlrMsg("Survivors gear was not saved. Put down held items and retry the shop.");
 		IsVisualStoreOpen = false;
 		invflag = false;
 		pcursstoreitem = -1;
@@ -264,19 +301,72 @@ void SetVisualStoreTab(VisualStoreTab tab)
 {
 	if (!VendorHasTabs())
 		return;
+	if (tab == VisualStoreTab::Buyback && (!IsSurvivorsMode() || (gbIsMultiplayer && !AsyncNetEnabled())))
+		return;
 
 	VisualStore.activeTab = tab;
 	VisualStore.currentPage = 0;
 	pcursstoreitem = -1;
 	pcursstorebtn = -1;
 
-	// Refresh item stat flags
-	std::span<Item> items = GetVisualStoreItems();
-	for (Item &item : items) {
-		item._iStatFlag = MyPlayer->CanUseItem(item);
-	}
+	RefreshVisualStoreItemEligibility();
 
 	RefreshVisualStoreLayout();
+}
+
+void ToggleSurvivorsBuyback()
+{
+	if (IsVisualStoreOpen && IsSurvivorsMode() && (!gbIsMultiplayer || AsyncNetEnabled()) && MyPlayer->HoldItem.isEmpty())
+		SetVisualStoreTab(VisualStore.activeTab == VisualStoreTab::Buyback ? VisualStoreTab::Basic : VisualStoreTab::Buyback);
+}
+
+void ResetSurvivorsBuyback()
+{
+	for (auto &items : BuybackItems) items.clear();
+	for (auto &prices : BuybackPrices) prices.clear();
+}
+
+std::span<const Item> GetSurvivorsBuybackItems(unsigned peer)
+{
+	return peer < BuybackItems.size() ? std::span<const Item>(BuybackItems[peer]) : std::span<const Item>();
+}
+
+std::span<const int> GetSurvivorsBuybackPrices(unsigned peer)
+{
+	return peer < BuybackPrices.size() ? std::span<const int>(BuybackPrices[peer]) : std::span<const int>();
+}
+
+bool SetSurvivorsBuyback(unsigned peer, std::span<const Item> items, std::span<const int> prices)
+{
+	if (peer >= BuybackItems.size() || items.size() != prices.size() || items.size() > SurvivorsBuybackLimit)
+		return false;
+	if (std::any_of(items.begin(), items.end(), [](const Item &item) { return item.isEmpty(); })
+	    || std::any_of(prices.begin(), prices.end(), [](int price) { return price <= 0; }))
+		return false;
+	BuybackItems[peer].assign(items.begin(), items.end());
+	BuybackPrices[peer].assign(prices.begin(), prices.end());
+	return true;
+}
+
+void RememberSurvivorsSale(unsigned peer, const Item &item, int price)
+{
+	if (peer >= BuybackItems.size() || item.isEmpty() || price <= 0) return;
+	auto &items = BuybackItems[peer];
+	auto &prices = BuybackPrices[peer];
+	if (items.size() == SurvivorsBuybackLimit) { items.erase(items.begin()); prices.erase(prices.begin()); }
+	items.push_back(item);
+	prices.push_back(price);
+}
+
+bool RemoveSurvivorsBuyback(unsigned peer, unsigned index, uint32_t seed, Item &item, int &price)
+{
+	if (peer >= BuybackItems.size() || index >= BuybackItems[peer].size() || BuybackItems[peer][index]._iSeed != seed)
+		return false;
+	item = BuybackItems[peer][index];
+	price = BuybackPrices[peer][index];
+	BuybackItems[peer].erase(BuybackItems[peer].begin() + index);
+	BuybackPrices[peer].erase(BuybackPrices[peer].begin() + index);
+	return true;
 }
 
 void VisualStoreNextPage()
@@ -312,6 +402,7 @@ int GetRepairCost(const Item &item)
 
 void VisualStoreRepairAll()
 {
+	if (AsyncNetStoreTransaction(AsyncStoreAction::RepairAll, 0, 0)) return;
 	Player &myPlayer = *MyPlayer;
 	int totalCost = 0;
 
@@ -372,6 +463,7 @@ void VisualStoreRepairItem(int invIndex)
 	if (item->isEmpty())
 		return;
 
+	if (AsyncNetStoreTransaction(AsyncStoreAction::Repair, invIndex, item->_iSeed)) return;
 	int cost = GetRepairCost(*item);
 	if (cost <= 0)
 		return;
@@ -415,6 +507,12 @@ std::span<Item> GetVisualStoreItems()
 	return GetVendorItems(VisualStore.vendor, VisualStore.activeTab);
 }
 
+void RefreshVisualStoreItemEligibility()
+{
+	if (MyPlayer == nullptr) return;
+	for (Item &item : GetVisualStoreItems()) item._iStatFlag = MyPlayer->CanUseItem(item);
+}
+
 int GetVisualStorePageCount()
 {
 	return std::max(1, static_cast<int>(VisualStore.pages.size()));
@@ -422,6 +520,12 @@ int GetVisualStorePageCount()
 
 void DrawVisualStore(const Surface &out)
 {
+	if (AsyncNetEnabled()) {
+		// World snapshots replace stock records and item reconstruction does not
+		// preserve this local, player-specific presentation flag.
+		RefreshVisualStoreItemEligibility();
+		RefreshVisualStoreLayout();
+	}
 	if (!VisualStorePanelArt)
 		return;
 
@@ -444,6 +548,10 @@ void DrawVisualStore(const Surface &out)
 		const Rectangle premBtnPos = { GetPanelPosition(UiPanels::Stash, VisualStoreButtonRect[TabButtonPremium].position), VisualStoreButtonRect[TabButtonPremium].size };
 		RenderClxSprite(out, (*VisualStoreNavButtonArt)[VisualStore.activeTab != VisualStoreTab::Premium], premBtnPos.position);
 		DrawString(out, _("Premium"), premBtnPos, { .flags = UiFlags::AlignCenter | premiumStyle });
+		if (IsSurvivorsMode() && (!gbIsMultiplayer || AsyncNetEnabled())) {
+			DrawString(out, VisualStore.activeTab == VisualStoreTab::Buyback ? "B: BUYBACK" : "B: Buyback",
+			    { panelPos + Displacement { 161, 25 }, { 105, TextHeight } }, { .flags = styleWhite });
+		}
 		break;
 	}
 	case VisualStoreVendor::Witch:
@@ -603,7 +711,7 @@ int16_t CheckVisualStoreHLight(Point mousePosition)
 			};
 
 			if (cell.contains(mousePosition)) {
-				const int price = item._iIvalue;
+				const int price = VisualPrice(itemIndex, item);
 				const bool canAfford = PlayerCanAfford(price);
 
 				InfoString = item.getName();
@@ -642,7 +750,7 @@ void CheckVisualStoreItem(Point mousePosition, bool isCtrlHeld, bool isShiftHeld
 		return;
 
 	// Check if player can afford the item
-	int price = item._iIvalue;
+	int price = VisualPrice(itemIndex, item);
 	uint32_t totalGold = MyPlayer->_pGold + Stash.gold;
 	if (totalGold < static_cast<uint32_t>(price)) {
 		// InitDiabloMsg(EMSG_NOT_ENOUGH_GOLD);
@@ -655,10 +763,28 @@ void CheckVisualStoreItem(Point mousePosition, bool isCtrlHeld, bool isShiftHeld
 		return;
 	}
 
+	if (AsyncNetEnabled()) {
+		AsyncStoreAction action = AsyncStoreAction::SmithBuy;
+		switch (VisualStore.vendor) {
+		case VisualStoreVendor::Smith: action = VisualStore.activeTab == VisualStoreTab::Buyback ? AsyncStoreAction::SurvivorsBuyback : VisualStore.activeTab == VisualStoreTab::Premium ? AsyncStoreAction::PremiumBuy : AsyncStoreAction::SmithBuy; break;
+		case VisualStoreVendor::Witch: action = AsyncStoreAction::WitchBuy; break;
+		case VisualStoreVendor::Healer: action = AsyncStoreAction::HealerBuy; break;
+		case VisualStoreVendor::Boy: action = AsyncStoreAction::BoyBuy; break;
+		}
+		AsyncNetStoreTransaction(action, itemIndex, item._iSeed);
+		return;
+	}
 	// Execute the purchase
 	TakePlrsMoney(price);
 	StoreAutoPlace(item, true);
 	PlaySFX(ItemInvSnds[ItemCAnimTbl[item._iCurs]]);
+	if (VisualStore.activeTab == VisualStoreTab::Buyback) {
+		LocalBuybackItems().erase(LocalBuybackItems().begin() + itemIndex);
+		LocalBuybackPrices().erase(LocalBuybackPrices().begin() + itemIndex);
+		pcursstoreitem = -1;
+		RefreshVisualStoreLayout();
+		return;
+	}
 
 	// Remove item from store (vendor-specific handling)
 	switch (VisualStore.vendor) {
@@ -712,11 +838,18 @@ void CheckVisualStorePaste(Point mousePosition)
 		return;
 	}
 
+	if (AsyncNetStoreTransaction(VisualStore.vendor == VisualStoreVendor::Smith ? AsyncStoreAction::SellHeldSmith : AsyncStoreAction::SellHeldWitch, 0, player.HoldItem._iSeed)) return;
 	// Calculate sell price
 	int sellPrice = GetSellPrice(player.HoldItem);
+	if (IsSurvivorsMode() && !gbIsMultiplayer && !SurvivorsSaleGoldFits(player, sellPrice, -1)) {
+		player.SaySpecific(HeroSpeech::IHaveNoRoom);
+		return;
+	}
+	if (IsSurvivorsMode() && !gbIsMultiplayer) RememberSurvivorsSale(MyPlayerId, player.HoldItem, sellPrice);
 
 	// Add gold to player
 	AddGoldToInventory(player, sellPrice);
+	player._pGold = CalculateGold(player);
 	PlaySFX(SfxID::ItemGold);
 
 	// Clear the held item
@@ -757,15 +890,21 @@ void SellItemToVisualStore(int invIndex)
 		return;
 	}
 
+	if (AsyncNetStoreTransaction(VisualStore.vendor == VisualStoreVendor::Smith ? AsyncStoreAction::SmithSell : AsyncStoreAction::WitchSell, INVITEM_INV_FIRST + invIndex, item._iSeed)) return;
 	// Calculate sell price
 	int sellPrice = GetSellPrice(item);
+	if (IsSurvivorsMode() && !gbIsMultiplayer && !SurvivorsSaleGoldFits(player, sellPrice, invIndex)) {
+		player.SaySpecific(HeroSpeech::IHaveNoRoom);
+		return;
+	}
+	if (IsSurvivorsMode() && !gbIsMultiplayer) RememberSurvivorsSale(MyPlayerId, item, sellPrice);
+	// Remove the item before adding gold so its former cells are available.
+	player.RemoveInvItem(invIndex);
 
 	// Add gold to player
 	AddGoldToInventory(player, sellPrice);
+	player._pGold = CalculateGold(player);
 	PlaySFX(SfxID::ItemGold);
-
-	// Remove item from inventory
-	player.RemoveInvItem(invIndex);
 }
 
 void CheckVisualStoreButtonPress(Point mousePosition)

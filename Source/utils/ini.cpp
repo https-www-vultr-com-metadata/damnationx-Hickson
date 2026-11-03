@@ -1,4 +1,5 @@
 #include "utils/ini.hpp"
+#include "utils/parse_int.hpp"
 
 #include <algorithm>
 #include <charconv>
@@ -227,7 +228,7 @@ int Ini::getInt(std::string_view section, std::string_view key, int defaultValue
 	if (xs.empty() || xs.back().value.empty()) return defaultValue;
 	const std::string_view str = xs.back().value;
 	int value;
-	const std::from_chars_result result = std::from_chars(str.data(), str.data() + str.size(), value);
+	const std::from_chars_result result = ParseDecimal(str.data(), str.data() + str.size(), value);
 	if (result.ec != std::errc()) {
 		app_fatal(std::format("ini: Failed to parse {}.{}={} as int", section, key, str));
 		return defaultValue;

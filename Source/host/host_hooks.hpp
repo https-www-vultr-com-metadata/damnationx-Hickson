@@ -34,6 +34,7 @@ namespace host {
 
 /** True from HostInit until the game thread finished: the game runs inside a host. */
 extern bool Active;
+inline void *AndroidJavaVm = nullptr; // supplied before the game thread starts; never owned by the core
 inline bool HideHud = false;
 inline bool HideInventory = false;
 inline bool HideStore = false;
@@ -78,6 +79,8 @@ int SfxLengthMs(int16_t sfxId);
 
 /** mainmenu_loop: true once when --host-hero asked to start straight into a game. */
 bool TakeAutoStart();
+/** ShouldShowCursor: --host-hide-cursor keeps the game's hand cursor out of recordings. */
+bool HideGameCursor();
 /** mainmenu_select_hero_dialog: picks or creates the hero named by --host-hero. False when not auto-starting. */
 bool SelectAutoStartHero(GameData *gameData);
 
@@ -89,6 +92,9 @@ bool DrawsWorld3D();
 /** fpv::ClearWorldArea in World3D: queues the ground item labels (Alt) at the items' places in the host's 3D view
  * (HostSetWorldView); `width` x `height` is the screen area they may anchor in. */
 void QueueWorldItemLabels(int width, int height);
+/** World-anchored UI marks in World3D: the screen point (as GetScreenPosition) of a tile's centre, `lift` tiles above
+ * its floor, in the host's 3D view (HostSetWorldView). False without a view or when the point is behind the camera. */
+bool ProjectWorldTile(Point tile, float lift, Point &screen);
 
 // ---- The HD pack without WebGPU (host_hd.cpp): the stubs of hd_*_webgpu.cpp ask the host ----
 
@@ -96,6 +102,7 @@ void QueueWorldItemLabels(int width, int height);
 bool HdSpritesAvailable();
 bool HdTilesAvailable();
 bool HdUiAvailable();
+bool HdUiSheetReady(int sheet);
 /** The HD UI hooks are installed at startup whenever the pack has hd/ui.txt (UI art loads once). */
 bool HdUiWanted();
 size_t HdTextureBudget();
@@ -125,13 +132,16 @@ inline void StopMusic() { }
 inline void StopStream(int16_t) { }
 inline int SfxLengthMs(int16_t) { return 1; }
 inline bool TakeAutoStart() { return false; }
+constexpr bool HideGameCursor() { return false; }
 inline bool SelectAutoStartHero(GameData *) { return false; }
 constexpr bool DrawsWorld3D() { return false; }
 inline void QueueWorldItemLabels(int, int) { }
+inline bool ProjectWorldTile(Point, float, Point &) { return false; }
 inline bool PollEvent(SDL_Event &) { return false; }
 inline bool HdSpritesAvailable() { return false; }
 inline bool HdTilesAvailable() { return false; }
 inline bool HdUiAvailable() { return false; }
+inline bool HdUiSheetReady(int) { return false; }
 constexpr bool HideHud = false;
 inline bool NativeInventoryPanel() { return false; }
 inline bool NativeStorePanel() { return false; }

@@ -17,6 +17,7 @@
 #include "config.h"
 #include "levels/dun_tile_data.hpp"
 #include "levels/gendung.h"
+#include "levels/survivors_rolling_runtime.hpp"
 #include "levels/tile_geometry.hpp"
 #include "objects.h"
 #include "utils/is_of.hpp"
@@ -247,7 +248,10 @@ void ResolveLevelPlacements()
 	current.hiddenTiles.fill(0);
 	current.hiddenObjects.clear();
 	current.hiddenLintels.fill(0);
-	if (!S.file || static_cast<int>(leveltype) != S.leveltype) {
+	// Authored level placements are pinned to local dungeon coordinates. They
+	// would jump with every rolling-world rebase and can hide otherwise valid
+	// floor geometry. Procedural worlds supply their own terrain instead.
+	if (SurvivorsRollingActive() || !S.file || static_cast<int>(leveltype) != S.leveltype) {
 		if (hadItems)
 			++current.generation;
 		return;

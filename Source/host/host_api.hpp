@@ -10,7 +10,7 @@
  * reads one snapshot. Everything in the snapshot is plain data with fixed layouts so it can be bound from Rust
  * (cxx ExternType Trivial) without hand-written C wrappers.
  *
- * Contract version 3. Changes are additive only: new fields go at the end of a struct and bump
+ * Contract version 6. Changes are additive only: new fields go at the end of a struct and bump
  * kHostApiVersion; existing fields keep their meaning and offset.
  *
  * Version 2 (additive, no struct changed): kHostMonsterSoundBase, HostSoundPath, HostReadAsset; HostInit accepts
@@ -31,13 +31,17 @@
  * HostUiState), the 2D view transform and the entities' screen rectangles (HostView2DSnapshot: HostView2D,
  * HostEntityScreenRect, HostView2DFrame), the audio settings (HostAudioSnapshot: HostAudioState; the settings menu shows
  * sound and music as available when embedded), and game state checkpoints (HostSaveState, HostLoadState).
+ *
+ * Version 6 (additive, existing layouts unchanged): renderer-independent first/third-person and XR gameplay
+ * controls (HostSetViewControl), saved camera options (HostCameraSettingsSnapshot, HostSetChaseSettings),
+ * camera mode cycling (kInputCycleCameraMode), and rebound controller actions (HostBoundKey).
  */
 
 #include <cstdint>
 
 namespace devilution::host {
 
-constexpr uint32_t kHostApiVersion = 5;
+constexpr uint32_t kHostApiVersion = 6;
 
 /**
  * Besides the game's own options (--data-dir, --save-dir, --config-dir, --lang, --spawn, --diablo, --hellfire, ...),
@@ -49,6 +53,7 @@ constexpr uint32_t kHostApiVersion = 5;
  *   --host-assets-dir <dir>  the game's own assets (the build's damnationx_host_assets/ or assets/ folder)
  *   --host-hd-dir <dir>      an explicit HD pack folder
  *   --host-no-hd             disable HD pack discovery, including a supplied --host-hd-dir
+ *   --host-hide-cursor       never draw the game's cursor (recordings and trailers)
  * Without --host-hero the game opens its main menu in the UI layer.
  */
 struct HostInitParams {
@@ -109,13 +114,72 @@ enum HostInputFlag : uint32_t {
 	kInputToggleRun = 1U << 1,
 	/** Toggle the first-person camera mode (Graphics > Camera Mode), like the game's ToggleFirstPerson key action. */
 	kInputToggleFirstPerson = 1U << 2,
+	/** Version 6: isometric -> first person -> third person -> isometric. */
+	kInputCycleCameraMode = 1U << 3,
 };
+
+/** Version 6: renderer-independent camera-relative gameplay controls. World yaw 0 faces +z, positive toward +x;
+ * pitch is positive up. Movement may use a separate head/controller yaw. Call before HostSubmitInput each frame;
+ * zero flags releases control. The host owns pointer lock, camera collision and world picking. */
+struct HostViewControl {
+	uint32_t flags; // kHostViewActive | kHostViewMouseLook | kHostViewOrbit | kHostViewXr
+	float yaw;
+	float pitch;
+	float moveYaw;
+	float moveForward; // -1..1
+	float moveStrafe;  // -1..1; positive right (-cos(yaw), 0, sin(yaw))
+};
+constexpr uint32_t kHostViewActive = 1U << 0;
+constexpr uint32_t kHostViewMouseLook = 1U << 1;
+constexpr uint32_t kHostViewOrbit = 1U << 2; // third-person orbit floor clicks walk
+constexpr uint32_t kHostViewXr = 1U << 3; // tracking owns the view independently of the saved flat camera mode
+void HostSetViewControl(const HostViewControl &control);
+/** Version 6: saved native options consumed by the host camera; distances are world tiles. */
+struct HostCameraSettings {
+	float horizontalFov;
+	float sensitivity; // raw native sensitivity, 5 is normal
+	float thirdPersonDistance;
+	uint32_t thirdPersonStyle; // 0 over shoulder, 1 orbit
+	uint32_t flags; // head bob 1, full body 2, invert mouse Y 4, weapon viewmodel 8
+};
+HostCameraSettings HostCameraSettingsSnapshot();
+/** Native host XR settings. Angles degrees; scale ratios, panel distance metres. */
+struct HostVrSettings {
+    uint32_t enabled;
+    uint32_t turnMode;
+    float snapTurnAngle;
+    float smoothTurnSpeed;
+    uint32_t vignette;
+    float worldScale;
+    float renderScale;
+    uint32_t seated;
+    uint32_t moveDirection;
+    uint32_t dominantHand;
+    float panelDistance;
+};
+HostVrSettings HostVrSettingsSnapshot();
+/** Presentation feedback from native combat, relative to the current monotonic clock. */
+struct HostViewFeedback { uint32_t slashAgeMs; uint32_t hitRemainingMs; uint32_t flags; }; // slash active 1, mirrored 2
+HostViewFeedback HostViewFeedbackSnapshot();
+
+/** Call before HostInit so the native VR category and saved values are available. */
+void HostSetVrSupport(bool available);
+
+/** Version 6: native key binding (0 unbound); mouse bindings retain KeymapperMouseButtonMask (bit31).
+ * Actions: 0 menu (Escape), 1 inventory, 2 interact, 3 character, 4 spellbook, 5 health potion,
+ * 6 mana potion, 7 automap, 8 spell list. */
+uint32_t HostBoundKey(uint32_t action);
+/** Version 6: persist host wheel/style changes in the native graphics options (world tiles, 0 shoulder / 1 orbit). */
+void HostSetChaseSettings(float distance, uint32_t style);
+/** Version 6: edit saved camera options from a native host menu. Non-finite input is ignored. */
+void HostSetCameraSettings(const HostCameraSettings &settings);
+void HostSetCameraMode(uint32_t mode);
 
 struct HostTickResult {
 	uint32_t gameTicks;  // simulation ticks run (0..n; the game runs at its fixed 20 Hz)
 	uint8_t quitRequested;
 	uint8_t inGame;      // 0 while in DiabloUI menus (main menu, hero select): render the UI layer only
-	uint8_t reserved[2]; // v3: reserved[0] = 1 when the player changed the render mode in the settings menu this tick
+	uint8_t reserved[2]; // [0] = render mode changed, [1] = waiting for the first authority snapshot
 };
 
 /** Mirrors render3d::WorldVertex (40 bytes). */
@@ -187,7 +251,7 @@ struct HostLight {
 	float x, y, z;
 	float radius; // tiles
 	uint8_t r, g, b;
-	uint8_t flags; // 1 = attached to an entity (missile, player light)
+	uint8_t flags; // 1 = attached to an entity (missile, player light); 2 = generated Survivors scenery light (open-field pool)
 	uint32_t entityId;
 };
 
@@ -239,6 +303,8 @@ struct HostFrame {
  * Starts the game without creating a window or a renderer. Loads the MPQs, options and saves as the normal
  * executable does. Returns false when the game data is missing or apiVersion does not match.
  */
+/** NativeActivity host JVM, supplied before HostInit. Zero clears it; no SDLActivity is required. */
+void HostSetAndroidJavaVm(uintptr_t javaVm);
 bool HostInit(const HostInitParams &params);
 
 /**

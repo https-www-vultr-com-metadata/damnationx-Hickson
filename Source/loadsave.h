@@ -7,6 +7,8 @@
 
 #include <cstdint>
 #include <expected>
+#include <span>
+#include <vector>
 
 #include "pfile.h"
 #include "player.h"
@@ -38,6 +40,12 @@ void RemoveEmptyInventory(Player &player);
 std::expected<void, std::string> LoadGame(bool firstflag);
 void SaveHotkeys(SaveWriter &saveWriter, const Player &player);
 void SaveHeroItems(SaveWriter &saveWriter, Player &player);
+void SaveSurvivorsBuyback(SaveWriter &writer, std::span<const Item> items, std::span<const int> prices);
+bool LoadSurvivorsBuyback(std::optional<SaveReader> archive, std::vector<Item> &items, std::vector<int> &prices);
+void SaveSurvivorsLedgerHeldItem(SaveWriter &writer, const Item &item);
+bool LoadSurvivorsLedgerHeldItem(std::optional<SaveReader> archive, Item &item);
+void SaveSurvivorsGroundItems(SaveWriter &writer, std::span<const Item> items);
+bool LoadSurvivorsGroundItems(std::optional<SaveReader> archive, std::vector<Item> &items);
 void SaveGameData(SaveWriter &saveWriter);
 void SaveGame();
 void SaveLevel(SaveWriter &saveWriter);

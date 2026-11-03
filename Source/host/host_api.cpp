@@ -19,6 +19,10 @@
 #include <string_view>
 #include <utility>
 #include <vector>
+#if defined(__ANDROID__) && defined(USE_SDL3)
+#include <jni.h>
+extern "C" jint JNI_OnLoad(JavaVM *, void *);
+#endif
 
 #ifdef USE_SDL3
 #include <SDL3/SDL.h>
@@ -27,6 +31,7 @@
 #endif
 
 #include "effects.h"
+#include "dvlnet/async_runtime.h"
 #include "d2sound/d2sound_core.hpp"
 #include "engine/assets.hpp"
 #include "engine/sound.h"
@@ -80,6 +85,8 @@ void ParseArgs(int argc, const char *const *argv)
 			Options.hdDisabled = true;
 		} else if (arg == "--host-continue") {
 			Options.continueGame = true;
+		} else if (arg == "--host-hide-cursor") {
+			Options.hideCursor = true;
 		} else {
 			GameArgs.emplace_back(arg);
 		}
@@ -94,6 +101,9 @@ void ParseArgs(int argc, const char *const *argv)
 
 int32_t HostImportD2Sounds(const char *installPath, const char *modsPath, const char *mapDir)
 {
+#if !defined(DEVILUTIONX_D2_SOUND_IMPORT)
+	return 2; // Importer is a separate browser worker; do not link native CASC here.
+#else
 	if (Initialized || Active || installPath == nullptr || modsPath == nullptr || mapDir == nullptr) {
 		std::cerr << "D2R sound import requires a fresh process and explicit source/output/map directories.\n";
 		return 2;
@@ -145,6 +155,20 @@ int32_t HostImportD2Sounds(const char *installPath, const char *modsPath, const 
 		std::cerr << "D2R sound import failed: " << error.what() << '\n';
 		return 1;
 	}
+#endif
+}
+
+void HostSetAndroidJavaVm(uintptr_t javaVm)
+{
+    if (!Active && AndroidJavaVm != reinterpret_cast<void *>(javaVm)) {
+        AndroidJavaVm = reinterpret_cast<void *>(javaVm);
+#if defined(__ANDROID__) && defined(USE_SDL3)
+        // Called from the launcher Java native method so JNI FindClass uses the app's class loader.
+        // NativeActivity's dlopen does not invoke JNI_OnLoad automatically for static SDL.
+        if (AndroidJavaVm != nullptr)
+            JNI_OnLoad(static_cast<JavaVM *>(AndroidJavaVm), nullptr);
+#endif
+    }
 }
 
 bool HostInit(const HostInitParams &params)
@@ -201,6 +225,7 @@ HostTickResult HostTick(uint32_t elapsedMs)
 	result.quitRequested = GameThreadFinished() ? 1 : 0;
 	result.inGame = InGame() ? 1 : 0;
 	result.reserved[0] = TakeRenderModeChanged() ? 1 : 0;
+	result.reserved[1] = gbRunGame && AsyncNetAwaitingInitialSnapshot() ? 1 : 0;
 	static const bool Trace = [] {
 		const char *value = std::getenv("DAMNATIONX_TRACE_INPUT");
 		return value != nullptr && value[0] == '1';

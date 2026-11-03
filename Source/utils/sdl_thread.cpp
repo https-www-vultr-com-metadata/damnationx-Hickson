@@ -2,7 +2,7 @@
 
 namespace devilution {
 
-#if !defined(__EMSCRIPTEN__)
+#if !defined(__EMSCRIPTEN__) || defined(__EMSCRIPTEN_PTHREADS__)
 int SDLCALL SdlThread::ThreadTranslate(void *ptr)
 {
 	auto handler = (void (*)())ptr;

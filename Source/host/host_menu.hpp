@@ -26,7 +26,15 @@ enum DxpMenuFlags : uint32_t {
 	DxpMenuFreePortal = 2048,
 };
 
+struct DxpPadBinding {
+	char name[128];
+	uint32_t button, modifier, enabled;
+};
+
 extern "C" {
+uint32_t dxp_pad_count();
+bool dxp_pad_binding(uint32_t index, DxpPadBinding *output, uint32_t size);
+bool dxp_pad_set(uint32_t index, uint32_t button, uint32_t modifier);
 bool dxp_menu_snapshot(DxpMenuSnapshot *output, uint32_t size);
 void dxp_menu_enable(bool enabled);
 /** 1 resume, 2 save, 3 load, 4 main menu, 5 quit. Requires an open menu. */
@@ -49,3 +57,4 @@ bool dxp_menu_set_fps(bool enabled);
 }
 
 static_assert(sizeof(DxpMenuSnapshot) == 16);
+static_assert(sizeof(DxpPadBinding) == 140);

@@ -420,16 +420,13 @@ public:
 	[[nodiscard]] size_t GetActiveListIndex() const override;
 	void SetActiveListIndex(size_t index) override;
 
-	void setAvailableResolutions(std::vector<std::pair<Size, std::string>> &&resolutions)
-	{
-		resolutions_ = std::move(resolutions);
-	}
+	void setAvailableResolutions(std::vector<std::pair<Size, std::string>> &&resolutions);
 
 	Size operator*() const { return size_; }
 
 private:
 	/** @brief View size. */
-	Size size_;
+	Size size_ { DEFAULT_WIDTH, DEFAULT_HEIGHT };
 	std::vector<std::pair<Size, std::string>> resolutions_;
 };
 
@@ -1109,6 +1106,7 @@ struct VrOptions : OptionCategoryBase {
 
 /** True in builds with VR support (DEVILUTIONX_XR): the VR category is listed then. */
 bool VrOptionsVisible();
+void SetHostVrSupport(bool available);
 
 struct Options {
 	GameModeOptions GameMode;

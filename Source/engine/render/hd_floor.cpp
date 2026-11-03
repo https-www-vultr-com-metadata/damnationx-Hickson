@@ -1,4 +1,5 @@
 #include "engine/render/hd_floor.hpp"
+#include "utils/parse_int.hpp"
 
 #include <algorithm>
 #include <charconv>
@@ -38,7 +39,7 @@ std::vector<std::string_view> SplitFields(std::string_view line)
 std::optional<int> ParseNonNegative(std::string_view field)
 {
 	int value = 0;
-	const auto [ptr, ec] = std::from_chars(field.data(), field.data() + field.size(), value);
+	const auto [ptr, ec] = ParseDecimal(field.data(), field.data() + field.size(), value);
 	if (ec != std::errc() || ptr != field.data() + field.size() || value < 0)
 		return std::nullopt;
 	return value;

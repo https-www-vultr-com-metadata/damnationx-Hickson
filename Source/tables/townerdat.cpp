@@ -4,6 +4,7 @@
  * Implementation of towner data loading from TSV files.
  */
 #include "tables/townerdat.hpp"
+#include "utils/parse_int.hpp"
 
 #include <charconv>
 #include <expected>
@@ -88,7 +89,7 @@ void ParseAnimOrder(std::string_view value, std::vector<uint8_t> &out)
 {
 	ParseCommaSeparatedList(value, out, [](std::string_view token) -> std::optional<uint8_t> {
 		int val = 0;
-		if (auto [ptr, ec] = std::from_chars(token.data(), token.data() + token.size(), val); ec == std::errc()) {
+		if (auto [ptr, ec] = ParseDecimal(token.data(), token.data() + token.size(), val); ec == std::errc()) {
 			return static_cast<uint8_t>(val);
 		}
 		return std::nullopt;

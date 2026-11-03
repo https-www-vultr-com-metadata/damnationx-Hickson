@@ -73,6 +73,11 @@ function(_damnationx_host_collect target out_var visited_var)
     if(_lib MATCHES "^::@")
       continue() # CMake's internal directory-scope markers
     endif()
+    # SDL's build exports this directory-scoped headers-only alias through a generator expression.
+    # It carries no link object and may no longer be a TARGET in this parent scope.
+    if(_lib STREQUAL "SDL3::Headers")
+      continue()
+    endif()
     if(TARGET ${_lib})
       get_target_property(_aliased ${_lib} ALIASED_TARGET)
       if(_aliased)
@@ -111,6 +116,39 @@ function(damnationx_host_write_link_manifest)
   list(REMOVE_DUPLICATES _items)
   list(REVERSE _items)
   list(REMOVE_ITEM _items "$<TARGET_LINKER_FILE:damnationx_host>")
-  string(REPLACE ";" "\n" _content "$<TARGET_LINKER_FILE:damnationx_host>;${_items}")
-  file(GENERATE OUTPUT "${CMAKE_BINARY_DIR}/damnationx_host_link.txt" CONTENT "${_content}\n" TARGET damnationx_host)
+  # Generator expressions can introduce a scoped headers alias only at generation time. Filter
+  # the evaluated list as well; Rust must never receive a headers-only target as a library name.
+  set(_link_items "$<FILTER:$<TARGET_LINKER_FILE:damnationx_host>;${_items},EXCLUDE,^SDL3::Headers$>")
+  file(GENERATE OUTPUT "${CMAKE_BINARY_DIR}/damnationx_host_link.txt" CONTENT "$<JOIN:${_link_items},\n>\n" TARGET damnationx_host)
 endfunction()
+
+# Browser simulation companion for the Bevy/WebGPU host. The C ABI deliberately
+# owns a separate heap; the Rust frontend copies snapshots rather than sharing
+# pointers across WebAssembly instances. A preloaded worker preserves the native
+# blocking game stack and rendezvous without Asyncify rewriting game code.
+if(EMSCRIPTEN)
+  if(EMSCRIPTEN_VERSION VERSION_LESS 4.0.11)
+    message(FATAL_ERROR "The Bevy browser host requires Emscripten 4.0.11 or newer. Older SDKs miscompile optimized C++ data/asset code. Activate a newer SDK and use a fresh build directory. The standalone classic browser profile is unchanged.")
+  endif()
+  add_executable(damnationx_core Source/host/browser_core.cpp)
+  target_link_dependencies(damnationx_core PRIVATE damnationx_host)
+  set_target_properties(damnationx_core PROPERTIES SUFFIX ".js")
+  target_link_options(damnationx_core PRIVATE
+    $<$<CONFIG:Release>:-O3>
+    --no-entry -sMODULARIZE=1 -sEXPORT_ES6=1 -sEXPORT_NAME=createDamnationXCore
+    -sALLOW_MEMORY_GROWTH=1 -sINITIAL_MEMORY=256MB -sMAXIMUM_MEMORY=2GB
+    -sSTACK_SIZE=8MB -sDEFAULT_PTHREAD_STACK_SIZE=64MB
+    -pthread -sPTHREAD_POOL_SIZE=1 -sALLOW_BLOCKING_ON_MAIN_THREAD=1
+    -sASYNCIFY=0
+    -sFORCE_FILESYSTEM=1 -sEXIT_RUNTIME=0
+    "-sEXPORTED_RUNTIME_METHODS=['FS','IDBFS','HEAPU8','HEAPU32','UTF8ToString']"
+    "-sEXPORTED_FUNCTIONS=['_malloc','_free','_dxp_panels_snapshot','_dxp_panels_enable','_dxp_panels_action','_dxp_panels_icon','_dxp_pad_count','_dxp_pad_binding','_dxp_pad_set','_dxp_menu_snapshot','_dxp_menu_enable','_dxp_menu_action','_dxp_menu_audio','_dxp_menu_gameplay','_dxp_menu_ui_scale','_dxp_menu_set_ui_scale','_dxp_menu_outlines','_dxp_menu_set_outlines','_dxp_menu_fps','_dxp_menu_set_fps','_dxp_frontend_snapshot','_dxp_frontend_command','_dxp_survivors_ui_snapshot','_dxp_survivors_ui_command']"
+    -lidbfs.js
+    "SHELL:--preload-file ${CMAKE_BINARY_DIR}/assets@/assets"
+    "SHELL:--preload-file ${CMAKE_BINARY_DIR}/mods@/mods"
+    $<$<BOOL:${DEVILUTIONX_LOBBY}>:-lwebsocket.js>
+  )
+  if(TARGET hellfire_copied_assets)
+    add_dependencies(damnationx_core hellfire_copied_assets)
+  endif()
+endif()

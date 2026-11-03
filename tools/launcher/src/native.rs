@@ -64,8 +64,6 @@ struct Settings {
     d2r_dir: Option<PathBuf>,
     d2r_install: Option<PathBuf>,
     importer: Option<PathBuf>,
-    python: PathBuf,
-    managed_python: bool,
     use_hd: bool,
     /// Master switch for everything imported from D2R (art, interface, sounds).
     /// Off restores original visuals and audio without touching the import.
@@ -92,12 +90,6 @@ impl Default for Settings {
             d2r_dir: None,
             d2r_install: None,
             importer: None,
-            python: PathBuf::from(if cfg!(windows) {
-                "python.exe"
-            } else {
-                "python3"
-            }),
-            managed_python: true,
             use_hd: true,
             use_d2r: true,
             use_models: true,
@@ -574,6 +566,8 @@ struct DesktopLauncher {
     cancelling: bool,
     close_after_job: bool,
     confirm_clear: bool,
+    game_process: Option<std::process::Child>,
+    game_log: Option<PathBuf>,
     #[cfg(feature = "trainer")]
     trainer: Option<PathBuf>,
 }
@@ -612,6 +606,8 @@ impl DesktopLauncher {
             cancelling: false,
             close_after_job: false,
             confirm_clear: false,
+            game_process: None,
+            game_log: None,
             #[cfg(feature = "trainer")]
             trainer: _trainer,
         };
@@ -652,6 +648,29 @@ impl DesktopLauncher {
     }
 
     fn poll(&mut self) {
+        if let Some(child) = &mut self.game_process {
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    self.game_process = None;
+                    if !status.success() {
+                        let log = self
+                            .game_log
+                            .as_ref()
+                            .map(|p| format!(" Game log: {}", p.display()))
+                            .unwrap_or_default();
+                        self.notice = Some((true, format!("The game exited with {status}.{log}")));
+                    } else {
+                        self.notice = Some((false, "Game closed.".into()));
+                    }
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    self.game_process = None;
+                    self.notice =
+                        Some((true, format!("Could not check the game process: {error}")));
+                }
+            }
+        }
         if let Some(found) = self
             .discover
             .try_recv()
@@ -670,14 +689,8 @@ impl DesktopLauncher {
             if self.settings.d2r_install.is_none() {
                 self.settings.d2r_install = found.d2r_installs.into_iter().next();
             }
-            if self.settings.importer.is_none() {
-                self.settings.importer = found.importers.into_iter().next();
-            }
-            if !self.settings.python.is_absolute() {
-                if let Some(python) = found.pythons.into_iter().next() {
-                    self.settings.python = python;
-                }
-            }
+            self.settings.importer =
+                assets::select_importer(self.settings.importer.as_deref(), &found.importers);
             self.refresh();
         }
         let events = self.job.as_ref().map(JobHandle::poll).unwrap_or_default();
@@ -877,28 +890,31 @@ impl DesktopLauncher {
             .filter(|p| assets::is_d2r_install(p))
             .or_else(|| {
                 rfd::FileDialog::new()
-                    .set_title("Select installed Diablo II Resurrected (.build.info + Data)")
+                    .set_title("Select your installed Diablo II Resurrected (Battle.net or Steam)")
                     .pick_folder()
+                    .map(|path| assets::d2r_install_root(&path))
             });
         let Some(game) = game else {
             return;
         };
         self.settings.d2r_install = Some(game.clone());
-        let Some(importer) = self.settings.importer.clone() else {
+        let discovered = assets::detect();
+        let Some(importer) =
+            assets::select_importer(self.settings.importer.as_deref(), &discovered.importers)
+        else {
             self.page = 1;
             self.notice = Some((
                 true,
-                "Locate the D2R importer tools in Launch options before importing.".into(),
+                "D2R importer files were not found. Fully extract the game-and-launcher ZIP, keeping resources/d2r-import beside the launcher, or select the extracted package/resources folder under Launch options > Importer tools. The D2R installation folder belongs in Import installed D2R, not Importer tools.".into(),
             ));
             return;
         };
+        self.settings.importer = Some(importer.clone());
         self.notice = None;
         self.start(JobRequest::ImportD2r(D2rImportRequest {
             game_dir: game,
             cache_dir: self.paths.d2r_cache.clone(),
             importer_dir: importer,
-            python: self.settings.python.clone(),
-            create_venv: self.settings.managed_python,
         }));
     }
 
@@ -912,6 +928,7 @@ impl DesktopLauncher {
                 rfd::FileDialog::new()
                     .set_title("Select your installed Diablo II Resurrected")
                     .pick_folder()
+                    .map(|path| assets::d2r_install_root(&path))
             });
         let Some(source) = source else {
             return;
@@ -959,7 +976,7 @@ impl DesktopLauncher {
         }
     }
 
-    fn play(&mut self, ctx: &egui::Context) {
+    fn play(&mut self) {
         if self.settings.paths() != self.requested_paths {
             self.refresh();
             return;
@@ -994,17 +1011,35 @@ impl DesktopLauncher {
         if let Some(parent) = plan.game.parent() {
             command.current_dir(parent);
         }
+        // Keep diagnostics available even when a Windows console disappears or
+        // the game exits immediately after a successful spawn.
+        self.game_log = None;
+        let log_path = self.paths.config_dir.join("game.log");
+        if std::fs::create_dir_all(&self.paths.config_dir).is_ok() {
+            if let Ok(log) = std::fs::File::create(&log_path) {
+                if let Ok(stderr) = log.try_clone() {
+                    command.stdout(log).stderr(stderr);
+                    self.game_log = Some(log_path);
+                }
+            }
+        }
         match command.spawn() {
-            Ok(_) => {
+            Ok(child) => {
                 if self.settings.runtime == Runtime::Classic {
                     crate::register_url_scheme(&plan.game);
                 }
-                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                self.game_process = Some(child);
+                self.notice = Some((false, "Game running.".into()));
             }
             Err(e) => {
+                let hint = if cfg!(windows) && e.raw_os_error() == Some(740) {
+                    " Windows requires administrator permission for this executable. Remove its 'Run this program as an administrator' compatibility setting, or start the launcher with the same permission."
+                } else {
+                    ""
+                };
                 self.notice = Some((
                     true,
-                    format!("Could not start {}: {e}", plan.game.display()),
+                    format!("Could not start {}: {e}.{hint}", plan.game.display()),
                 ))
             }
         }
@@ -1065,7 +1100,7 @@ impl DesktopLauncher {
         };
         card(ui, "03", "Diablo II: Resurrected", &d2r, |ui| {
             ui.label("Bring D2R characters, scenery and interface into Tristram.");
-            ui.small("Imports need Python 3.11+. Without a prebuilt d2rtool helper, they also need CMake 3.20+ and a C/C++17 compiler. Python can be selected under Launch options.");
+            ui.small("The included converter imports assets locally from your D2R installation.");
             path_label(ui, self.settings.d2r_dir.as_deref());
             ui.horizontal_wrapped(|ui| {
                 if ui
@@ -1237,7 +1272,7 @@ impl DesktopLauncher {
                         .set_title("Select your installed Diablo II Resurrected")
                         .pick_folder()
                     {
-                        self.settings.d2r_install = Some(path);
+                        self.settings.d2r_install = Some(assets::d2r_install_root(&path));
                     }
                 }
                 if ui
@@ -1317,7 +1352,7 @@ impl DesktopLauncher {
                 );
             });
         ui.add_space(14.0);
-        ui.weak("Imported locally from your installed game. Sound import does not require Python or graphics conversion.");
+        ui.weak("Imported locally from your installed game. Sound import does not require graphics conversion.");
     }
 
     fn options(&mut self, ui: &mut egui::Ui) {
@@ -1326,61 +1361,141 @@ impl DesktopLauncher {
             ui.heading("Game & display");
             ui.horizontal(|ui| {
                 ui.label("Game runtime");
-                egui::ComboBox::from_id_salt("runtime").selected_text(if self.settings.runtime==Runtime::Toxoid {"3D game (Toxoid)"} else {"Classic SDL game"}).show_ui(ui, |ui| {
-                    ui.selectable_value(&mut self.settings.runtime,Runtime::Toxoid,"3D game (Toxoid)");
-                    ui.selectable_value(&mut self.settings.runtime,Runtime::Classic,"Classic SDL game");
-                });
+                egui::ComboBox::from_id_salt("runtime")
+                    .selected_text(if self.settings.runtime == Runtime::Toxoid {
+                        "3D game (Toxoid)"
+                    } else {
+                        "Classic SDL game"
+                    })
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(
+                            &mut self.settings.runtime,
+                            Runtime::Toxoid,
+                            "3D game (Toxoid)",
+                        );
+                        ui.selectable_value(
+                            &mut self.settings.runtime,
+                            Runtime::Classic,
+                            "Classic SDL game",
+                        );
+                    });
             });
             ui.horizontal(|ui| {
-                ui.label("Game executable"); path_edit(ui,&mut self.settings.game);
+                ui.label("Game executable");
+                path_edit(ui, &mut self.settings.game);
                 if ui.button("Browse…").clicked() {
-                    if let Some(game) = rfd::FileDialog::new().set_title("Select damnationx_host or the classic game executable").pick_file() {
-                        let game = game_executable(&game); self.settings.runtime=runtime_for(&game); self.settings.game=game;
+                    if let Some(game) = rfd::FileDialog::new()
+                        .set_title("Select damnationx_host or the classic game executable")
+                        .pick_file()
+                    {
+                        let game = game_executable(&game);
+                        self.settings.runtime = runtime_for(&game);
+                        self.settings.game = game;
                     }
                 }
             });
             ui.horizontal(|ui| {
                 ui.label("Resolution");
-                egui::ComboBox::from_id_salt("native_resolution").selected_text(format!("{} × {}",self.settings.resolution[0],self.settings.resolution[1])).show_ui(ui, |ui| {
-                    for &(w,h) in RESOLUTIONS { if ui.selectable_label(self.settings.resolution==[w,h],format!("{w} × {h}")).clicked() { self.settings.resolution=[w,h]; self.settings.auto_resolution=false; } }
-                });
-                ui.checkbox(&mut self.settings.auto_resolution,"Match display");
+                egui::ComboBox::from_id_salt("native_resolution")
+                    .selected_text(format!(
+                        "{} × {}",
+                        self.settings.resolution[0], self.settings.resolution[1]
+                    ))
+                    .show_ui(ui, |ui| {
+                        for &(w, h) in RESOLUTIONS {
+                            if ui
+                                .selectable_label(
+                                    self.settings.resolution == [w, h],
+                                    format!("{w} × {h}"),
+                                )
+                                .clicked()
+                            {
+                                self.settings.resolution = [w, h];
+                                self.settings.auto_resolution = false;
+                            }
+                        }
+                    });
+                ui.checkbox(&mut self.settings.auto_resolution, "Match display");
             });
-            if self.settings.runtime==Runtime::Toxoid {
+            if self.settings.runtime == Runtime::Toxoid {
                 ui.horizontal(|ui| {
                     ui.label("Renderer");
-                    egui::ComboBox::from_id_salt("render_mode").selected_text(match self.settings.render_mode.as_str() {"classic"=>"Classic", "hd"=>"HD 2D", _=>"3D Resurrect Update"}).show_ui(ui, |ui| {
-                        for (value,label) in [("3d","3D Resurrect Update"),("classic","Classic"),("hd","HD 2D")] { ui.selectable_value(&mut self.settings.render_mode,value.into(),label); }
-                    });
-                    ui.checkbox(&mut self.settings.rt,"Ray tracing").on_hover_text("Optional on supported GPUs. Disabled by default.");
-                    ui.add_enabled_ui(self.settings.rt, |ui| {
-                        egui::ComboBox::from_id_salt("rt_quality").selected_text(&self.settings.rt_quality).show_ui(ui, |ui| {
-                            for tier in ["low","medium","high","ultra"] { ui.selectable_value(&mut self.settings.rt_quality,tier.into(),tier); }
+                    egui::ComboBox::from_id_salt("render_mode")
+                        .selected_text(match self.settings.render_mode.as_str() {
+                            "classic" => "Classic",
+                            "hd" => "HD 2D",
+                            _ => "3D Resurrect Update",
+                        })
+                        .show_ui(ui, |ui| {
+                            for (value, label) in [
+                                ("3d", "3D Resurrect Update"),
+                                ("classic", "Classic"),
+                                ("hd", "HD 2D"),
+                            ] {
+                                ui.selectable_value(
+                                    &mut self.settings.render_mode,
+                                    value.into(),
+                                    label,
+                                );
+                            }
                         });
+                    ui.checkbox(&mut self.settings.rt, "Ray tracing")
+                        .on_hover_text("Optional on supported GPUs. Disabled by default.");
+                    ui.add_enabled_ui(self.settings.rt, |ui| {
+                        egui::ComboBox::from_id_salt("rt_quality")
+                            .selected_text(&self.settings.rt_quality)
+                            .show_ui(ui, |ui| {
+                                for tier in ["low", "medium", "high", "ultra"] {
+                                    ui.selectable_value(
+                                        &mut self.settings.rt_quality,
+                                        tier.into(),
+                                        tier,
+                                    );
+                                }
+                            });
                     });
                 });
             }
-            ui.add_space(10.0); ui.separator(); ui.heading("Gameplay");
-            for (i,(key,label,_)) in TOGGLES.iter().enumerate().filter(|(_, (key, ..))| key.starts_with("Game.") || key.starts_with("Mods.")) {
-                let _=key; ui.checkbox(&mut self.legacy.on[i],*label);
+            ui.add_space(10.0);
+            ui.separator();
+            ui.heading("Gameplay");
+            for (i, (key, label, _)) in TOGGLES
+                .iter()
+                .enumerate()
+                .filter(|(_, (key, ..))| key.starts_with("Game.") || key.starts_with("Mods."))
+            {
+                let _ = key;
+                ui.checkbox(&mut self.legacy.on[i], *label);
             }
-            if self.settings.runtime==Runtime::Classic {
-                ui.separator(); ui.heading("Classic display");
-                for (i,(_,label,_)) in TOGGLES.iter().enumerate().filter(|(_, (key, ..))| key.starts_with("Graphics.")) { ui.checkbox(&mut self.legacy.on[i],*label); }
+            if self.settings.runtime == Runtime::Classic {
+                ui.separator();
+                ui.heading("Classic display");
+                for (i, (_, label, _)) in TOGGLES
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, (key, ..))| key.starts_with("Graphics."))
+                {
+                    ui.checkbox(&mut self.legacy.on[i], *label);
+                }
             }
-            ui.add_space(10.0); ui.separator();
+            ui.add_space(10.0);
+            ui.separator();
             egui::CollapsingHeader::new("Import tools & library locations").show(ui, |ui| {
-                ui.label("D2R conversion uses Python 3.11+ and the included importer. A managed environment installs its Python dependencies.");
-                ui.horizontal(|ui| { ui.label("Python"); path_edit(ui,&mut self.settings.python); if ui.button("Browse interpreter…").clicked() { if let Some(path)=rfd::FileDialog::new().set_title("Select Python 3.11+ executable").pick_file() {self.settings.python=path;} } });
-                ui.checkbox(&mut self.settings.managed_python,"Use a managed Python environment (recommended)");
-                optional_path_picker(ui,"Importer tools",&mut self.settings.importer);
-                optional_path_picker(ui,"Installed D2R",&mut self.settings.d2r_install);
-                ui.weak(format!("HD library: {}",self.paths.hd_dir.display()));
-                ui.weak(format!("D2R library: {}",self.paths.d2r_cache.display()));
-                ui.weak(format!("Settings: {}",self.settings_path.display()));
+                ui.label("D2R conversion uses the included native importer and archive helper.");
+                optional_path_picker(ui, "Importer tools", &mut self.settings.importer);
+                optional_path_picker(ui, "Installed D2R", &mut self.settings.d2r_install);
+                ui.weak(format!("HD library: {}", self.paths.hd_dir.display()));
+                ui.weak(format!("D2R library: {}", self.paths.d2r_cache.display()));
+                ui.weak(format!("Settings: {}", self.settings_path.display()));
             });
-            #[cfg(feature="trainer")]
-            if let Some(trainer)=&self.trainer { if ui.button("Developer trainer").clicked() { if let Err(e)=std::process::Command::new(trainer).spawn() {self.notice=Some((true,e.to_string()));} } }
+            #[cfg(feature = "trainer")]
+            if let Some(trainer) = &self.trainer {
+                if ui.button("Developer trainer").clicked() {
+                    if let Err(e) = std::process::Command::new(trainer).spawn() {
+                        self.notice = Some((true, e.to_string()));
+                    }
+                }
+            }
         });
     }
 }
@@ -1536,12 +1651,12 @@ impl eframe::App for DesktopLauncher {
                     }
                 }
                 let plan=self.ready.as_ref().map(|r|launch_plan(&self.settings,&self.legacy,r));
-                let can_play=self.job.is_none() && plan.as_ref().is_some_and(|r|r.is_ok());
+                let can_play=self.job.is_none() && self.game_process.is_none() && plan.as_ref().is_some_and(|r|r.is_ok());
                 ui.horizontal(|ui| {
                     let response=ui.add_enabled(can_play,egui::Button::new(egui::RichText::new("PLAY").size(22.0).strong().color(GOLD)).min_size(egui::vec2(200.0,48.0)));
-                    if response.clicked() {let ctx=ui.ctx().clone();self.play(&ctx);}
+                    if response.clicked() {self.play();}
                     ui.vertical(|ui| {
-                        ui.label(if can_play {"Ready to enter Tristram"} else if self.job.is_some() {"Finish or cancel setup before playing"} else {"Setup needs attention"});
+                        ui.label(if can_play {"Ready to enter Tristram"} else if self.game_process.is_some() {"Game is running"} else if self.job.is_some() {"Finish or cancel setup before playing"} else {"Setup needs attention"});
                         if let Some(Err(error))=plan {ui.label(egui::RichText::new(error).small().color(MUTED));}
                     });
                 });

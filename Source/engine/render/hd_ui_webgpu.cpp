@@ -1533,7 +1533,7 @@ bool HdUiGpuFetchIndex(std::string &text, bool &failed)
 {
 	return host::HdFetchText("hd/ui.txt", text, failed);
 }
-bool HdUiGpuSheetReady(int) { return host::HdUiAvailable(); }
+bool HdUiGpuSheetReady(int sheet) { return host::HdUiSheetReady(sheet); }
 
 } // namespace devilution
 

@@ -2,9 +2,42 @@
 
 #include "automap.h"
 #include "engine/render/scrollrt.h"
+#include "levels/survivors_exploration.hpp"
 #include "options.h"
 
 using namespace devilution;
+
+TEST(SurvivorsExploration, KeepsWorldCellsAcrossRebasesAndReset)
+{
+	SurvivorsExploration explored;
+	explored.Mark(0, 0, { 56, 56 }, MAP_EXP_SELF);
+	EXPECT_EQ(explored.At(0, 0, { 20, 20 }), MAP_EXP_SELF);
+	EXPECT_EQ(explored.At(32, 0, { 4, 20 }), MAP_EXP_SELF);
+	EXPECT_EQ(explored.At(-32, 0, { 36, 20 }), MAP_EXP_SELF);
+	EXPECT_EQ(explored.At(0, 32, { 20, 4 }), MAP_EXP_SELF);
+	explored.Mark(0, 0, { 57, 57 }, MAP_EXP_OTHERS);
+	EXPECT_EQ(explored.At(0, 0, { 20, 20 }), MAP_EXP_SELF);
+	explored.Mark(-32, -32, { 15, 15 }, MAP_EXP_OTHERS);
+	EXPECT_EQ(explored.At(-32, -32, { -1, -1 }), MAP_EXP_OTHERS);
+	EXPECT_EQ(explored.At(0, 0, { -17, -17 }), MAP_EXP_OTHERS);
+	EXPECT_EQ(explored.At(0, 0, { 0, 0 }), MAP_EXP_NONE);
+	explored.Clear();
+	EXPECT_EQ(explored.At(0, 0, { 20, 20 }), MAP_EXP_NONE);
+	EXPECT_EQ(explored.At(0, 0, { -17, -17 }), MAP_EXP_NONE);
+}
+
+TEST(SurvivorsExploration, DiscardsLeastRecentlySeenCellsAtCapacity)
+{
+	SurvivorsExploration explored;
+	for (size_t i = 0; i < SurvivorsExploration::MaxCells; ++i)
+		explored.Mark(0, 0, { static_cast<int>(16 + 2 * i), 16 }, MAP_EXP_SELF);
+	// Seeing an older cell again protects it from the next eviction.
+	explored.Mark(0, 0, { 16, 16 }, MAP_EXP_OTHERS);
+	explored.Mark(0, 0, { static_cast<int>(16 + 2 * SurvivorsExploration::MaxCells), 16 }, MAP_EXP_SELF);
+	EXPECT_EQ(explored.At(0, 0, { 0, 0 }), MAP_EXP_SELF);
+	EXPECT_EQ(explored.At(0, 0, { 1, 0 }), MAP_EXP_NONE);
+	EXPECT_EQ(explored.At(0, 0, { static_cast<int>(SurvivorsExploration::MaxCells), 0 }), MAP_EXP_SELF);
+}
 
 TEST(Automap, InitAutomap)
 {

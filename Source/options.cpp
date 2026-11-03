@@ -214,6 +214,16 @@ constexpr OptionEntryFlags HybridOptionFlags()
 #endif
 }
 
+/** Immersive cameras are also implemented by the embedding Bevy host. */
+constexpr OptionEntryFlags ImmersiveOptionFlags()
+{
+#ifdef DAMNATIONX_HOST_LIB
+    return OptionEntryFlags::None;
+#else
+    return HybridOptionFlags();
+#endif
+}
+
 /** HD art needs the native WebGPU (Dawn) client; the browser chooses its HD folder on the page (hd-folder.js). */
 constexpr OptionEntryFlags HdArtOptionFlags()
 {
@@ -732,15 +742,26 @@ void OptionEntryQuarterScale::SetValue(int quarters)
 OptionEntryResolution::OptionEntryResolution()
     : OptionEntryListBase("", OptionEntryFlags::CantChangeInGame | OptionEntryFlags::RecreateUI, N_("Resolution"), N_("Affect the game's internal resolution and determine your view area. Note: This can differ from screen resolution, when Upscaling, Integer Scaling or Fit to Screen is used."))
 {
+	setAvailableResolutions({});
 }
 void OptionEntryResolution::LoadFromIni(std::string_view category)
 {
 	size_ = { ini->getInt(category, "Width", DEFAULT_WIDTH), ini->getInt(category, "Height", DEFAULT_HEIGHT) };
+	setAvailableResolutions({});
 }
 void OptionEntryResolution::SaveToIni(std::string_view category) const
 {
 	ini->set(category, "Width", size_.width);
 	ini->set(category, "Height", size_.height);
+}
+
+void OptionEntryResolution::setAvailableResolutions(std::vector<std::pair<Size, std::string>> &&resolutions)
+{
+	// The embedded host has no SDL display to enumerate. Its Graphics menu
+	// still needs a valid value before it formats every option in the category.
+	if (resolutions.empty())
+		resolutions.emplace_back(size_, StrCat(size_.width, "x", size_.height));
+	resolutions_ = std::move(resolutions);
 }
 
 size_t OptionEntryResolution::GetListSize() const
@@ -760,6 +781,8 @@ size_t OptionEntryResolution::GetActiveListIndex() const
 }
 void OptionEntryResolution::SetActiveListIndex(size_t index)
 {
+	if (index >= resolutions_.size())
+		return;
 	size_ = resolutions_[index].first;
 	NotifyValueChanged();
 }
@@ -1018,7 +1041,7 @@ GraphicsOptions::GraphicsOptions()
 #endif
     , showFPS("Show FPS", OptionEntryFlags::None, N_("Show FPS"), N_("Displays the FPS in the upper left corner of the screen."), false)
     , hostFPS("Host FPS", OptionEntryFlags::Invisible, N_("Show FPS"), N_("Displays application rendering frames per second."), true)
-    , cameraMode("Camera Mode", HybridOptionFlags(), N_("Camera Mode"), N_("Isometric, first-person or third-person view over the 3D world (WebGPU builds only). In game, T cycles the modes and G toggles first person."), CameraMode::Isometric,
+    , cameraMode("Camera Mode", ImmersiveOptionFlags(), N_("Camera Mode"), N_("Isometric, first-person or third-person view over the 3D world (WebGPU builds only). In game, T cycles the modes and G toggles first person."), CameraMode::Isometric,
           {
               { CameraMode::Isometric, N_("Isometric") },
               { CameraMode::FirstPerson, N_("First person") },
@@ -1031,16 +1054,16 @@ GraphicsOptions::GraphicsOptions()
               { HostRenderModeOption::Hd2D, N_("HD 2D") },
           })
     , firstPersonView("First Person View", OptionEntryFlags::Invisible, N_("First Person View"), N_("Legacy switch, replaced by Camera Mode."), false)
-    , fpvFieldOfView("First Person Field of View", HybridOptionFlags(), N_("Field of View"), N_("Horizontal field of view of the first- and third-person views, in degrees."), 95, { 60, 65, 70, 75, 80, 85, 90, 95, 100, 105, 110 })
-    , fpvWeapon("First-Person Weapon", HybridOptionFlags(), N_("First-Person Weapon"), N_("Show the 3D weapon and arms in the first-person view. When off (or without the 3D model) a 2D slash shows melee swings."), true)
-    , fpvHeadBob("First Person Head Bob", HybridOptionFlags(), N_("Head Bob"), N_("The first-person camera bobs up and down while walking."), true)
-    , fpvFullBody("First Person Full Body", HybridOptionFlags(), N_("Full-Body Awareness"), N_("See your own legs and shadow when looking down in first person (needs the 3D warrior from the HD pack)."), true)
-    , thirdPersonStyle("Third Person Style", HybridOptionFlags(), N_("Third-Person Camera"), N_("Over the shoulder: close, offset to one side, aim with the crosshair (middle mouse swaps the shoulder). Orbit: centred and further back, swings behind you while you walk to a clicked spot."), ThirdPersonStyle::OverShoulder,
+    , fpvFieldOfView("First Person Field of View", ImmersiveOptionFlags(), N_("Field of View"), N_("Horizontal field of view of the first- and third-person views, in degrees."), 95, { 60, 65, 70, 75, 80, 85, 90, 95, 100, 105, 110 })
+    , fpvWeapon("First-Person Weapon", ImmersiveOptionFlags(), N_("First-Person Weapon"), N_("Show the 3D weapon and arms in the first-person view. When off (or without the 3D model) a 2D slash shows melee swings."), true)
+    , fpvHeadBob("First Person Head Bob", ImmersiveOptionFlags(), N_("Head Bob"), N_("The first-person camera bobs up and down while walking."), true)
+    , fpvFullBody("First Person Full Body", ImmersiveOptionFlags(), N_("Full-Body Awareness"), N_("See your own legs and shadow when looking down in first person (needs the 3D warrior from the HD pack)."), true)
+    , thirdPersonStyle("Third Person Style", ImmersiveOptionFlags(), N_("Third-Person Camera"), N_("Over the shoulder: close, offset to one side, aim with the crosshair (middle mouse swaps the shoulder). Orbit: centred and further back, swings behind you while you walk to a clicked spot."), ThirdPersonStyle::OverShoulder,
           {
               { ThirdPersonStyle::OverShoulder, N_("Over the shoulder") },
               { ThirdPersonStyle::Orbit, N_("Orbit chase") },
           })
-    , thirdPersonDistance("Third Person Distance", HybridOptionFlags(), N_("Third-Person Distance"), N_("How far behind the player the third-person camera sits, in tenths of a tile. The mouse wheel zooms in game."), 22, { 8, 10, 12, 14, 16, 18, 20, 22, 25, 28, 32, 36, 40, 45, 50, 60 })
+    , thirdPersonDistance("Third Person Distance", ImmersiveOptionFlags(), N_("Third-Person Distance"), N_("How far behind the player the third-person camera sits, in tenths of a tile. The mouse wheel zooms in game."), 22, { 8, 10, 12, 14, 16, 18, 20, 22, 25, 28, 32, 36, 40, 45, 50, 60 })
 {
 }
 std::vector<OptionEntryBase *> GraphicsOptions::GetEntries()
@@ -1108,13 +1131,13 @@ GameplayOptions::GameplayOptions()
     , enableRun("Enable Run", OptionEntryFlags::None, N_("Enable Run"), N_("Show the Run button in single-player games. Running uses stamina and speeds up movement, while combat keeps its normal speed."), true)
     , smoothMovement("Smooth Movement", OptionEntryFlags::CantChangeInMultiPlayer, N_("Smooth Movement"), N_("Walk in straight lines at any angle with smooth movement between tiles, like Diablo II. When off, movement follows the classic eight directions."), true)
     , cathedralPortal("Cathedral Portal", OptionEntryFlags::CantChangeInMultiPlayer, N_("Free town portal"), N_("A free portal east of Deckard Cain returns to the entrance of your last visited dungeon section: Cathedral, Catacombs, Caves or Hell."), true)
-    , viewMovement("3D View Movement", HybridOptionFlags(), N_("Movement (3D)"), N_("How WASD and the stick move you in the first- and third-person views. Smooth glides continuously in the direction you look (uses Smooth Movement); Tile steps moves one tile per step."), ViewMovement::Smooth,
+    , viewMovement("3D View Movement", ImmersiveOptionFlags(), N_("Movement (3D)"), N_("How WASD and the stick move you in the first- and third-person views. Smooth glides continuously in the direction you look (uses Smooth Movement); Tile steps moves one tile per step."), ViewMovement::Smooth,
           {
               { ViewMovement::Smooth, N_("Smooth") },
               { ViewMovement::TileSteps, N_("Tile steps") },
           })
-    , fpvMouseSensitivity("First Person Mouse Sensitivity", HybridOptionFlags(), N_("Mouse Sensitivity (3D)"), N_("How fast the mouse turns the camera in the first- and third-person views."), 5, { 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 14, 16, 18, 20 })
-    , fpvInvertMouseY("First Person Invert Mouse Y", HybridOptionFlags(), N_("Invert Mouse Y"), N_("Moving the mouse up looks down in the first- and third-person views."), false)
+    , fpvMouseSensitivity("First Person Mouse Sensitivity", ImmersiveOptionFlags(), N_("Mouse Sensitivity (3D)"), N_("How fast the mouse turns the camera in the first- and third-person views."), 5, { 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 14, 16, 18, 20 })
+    , fpvInvertMouseY("First Person Invert Mouse Y", ImmersiveOptionFlags(), N_("Invert Mouse Y"), N_("Moving the mouse up looks down in the first- and third-person views."), false)
     , grabInput("Grab Input", OptionEntryFlags::None, N_("Grab Input"), N_("When enabled mouse is locked to the game window."), false)
     , pauseOnFocusLoss("Pause Game When Window Loses Focus", OptionEntryFlags::None, N_("Pause Game When Window Loses Focus"), N_("When enabled, the game will pause when focus is lost."), true)
     , theoQuest("Theo Quest", OptionEntryFlags::CantChangeInGame | OptionEntryFlags::OnlyHellfire, N_("Theo Quest"), N_("Enable Little Girl quest."), false)
@@ -1140,7 +1163,7 @@ GameplayOptions::GameplayOptions()
     , autoEquipJewelry("Auto Equip Jewelry", OptionEntryFlags::None, N_("Auto Equip Jewelry"), N_("Jewelry will be automatically equipped on pickup or purchase if enabled."), false)
     , randomizeQuests("Randomize Quests", OptionEntryFlags::CantChangeInGame, N_("Randomize Quests"), N_("Randomly selecting available quests for new games."), true)
     , showMonsterType("Show Monster Type", OptionEntryFlags::None, N_("Show Monster Type"), N_("Hovering over a monster will display the type of monster in the description box in the UI."), false)
-    , showItemLabels("Show Item Labels", OptionEntryFlags::None, N_("Show Item Labels"), N_("Show labels for items on the ground when enabled."), false)
+    , showItemLabels("Show Item Labels", OptionEntryFlags::None, N_("Show Item Labels"), N_("Hover an item to see its label. Hold Alt to show all ground labels, or press Right Ctrl to toggle labels on."), false)
     , autoRefillBelt("Auto Refill Belt", OptionEntryFlags::None, N_("Auto Refill Belt"), N_("Refill belt from inventory when belt item is consumed."), false)
     , disableCripplingShrines("Disable Crippling Shrines", OptionEntryFlags::None, N_("Disable Crippling Shrines"), N_("When enabled Cauldrons, Fascinating Shrines, Goat Shrines, Ornate Shrines, Sacred Shrines and Murphy's Shrines are not able to be clicked on and labeled as disabled."), false)
     , quickCast("Quick Cast", OptionEntryFlags::None, N_("Quick Cast"), N_("Spell hotkeys instantly cast the spell, rather than switching the readied spell."), false)
@@ -1847,9 +1870,11 @@ const PadmapperOptions::Action *PadmapperOptions::findAction(ControllerButton bu
 
 namespace {
 
+bool HostVrSupport = false;
+
 constexpr OptionEntryFlags VrOptionFlags()
 {
-#if DEVILUTIONX_XR
+#if DEVILUTIONX_XR || defined(DAMNATIONX_HOST_LIB)
 	return OptionEntryFlags::None;
 #else
 	return OptionEntryFlags::Invisible;
@@ -1860,7 +1885,12 @@ constexpr OptionEntryFlags VrOptionFlags()
 
 bool VrOptionsVisible()
 {
-	return DEVILUTIONX_XR != 0;
+	return DEVILUTIONX_XR != 0 || HostVrSupport;
+}
+
+void SetHostVrSupport(bool available)
+{
+    HostVrSupport = available;
 }
 
 VrOptions::VrOptions()

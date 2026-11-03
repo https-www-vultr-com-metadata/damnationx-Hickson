@@ -2,7 +2,7 @@
 
 #include <memory>
 
-#if defined(__EMSCRIPTEN__) && (!defined(DEVILUTIONX_BROWSER_SINGLE_THREADED) || defined(__EMSCRIPTEN_PTHREADS__))
+#if defined(__EMSCRIPTEN__) && !defined(__EMSCRIPTEN_PTHREADS__) && !defined(DEVILUTIONX_BROWSER_SINGLE_THREADED)
 #error "Browser thread shims require the single-threaded browser profile"
 #endif
 
@@ -28,7 +28,7 @@ inline SDL_ThreadID get_id()
 inline SDL_threadID get_id()
 #endif
 {
-#if defined(__EMSCRIPTEN__)
+#if defined(__EMSCRIPTEN__) && !defined(__EMSCRIPTEN_PTHREADS__)
 	return 1;
 #else
 	return SDL_GetThreadID(nullptr);
@@ -36,7 +36,7 @@ inline SDL_threadID get_id()
 }
 } // namespace this_sdl_thread
 
-#if defined(__EMSCRIPTEN__)
+#if defined(__EMSCRIPTEN__) && !defined(__EMSCRIPTEN_PTHREADS__)
 class SdlThread final {
 public:
 	SdlThread(int(SDLCALL *handler)(void *), void *data)

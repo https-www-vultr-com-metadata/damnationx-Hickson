@@ -12,6 +12,7 @@
 
 namespace devilution {
 
+
 class DataFileField {
 	GetFieldResult *state_;
 	const char *end_;
@@ -99,7 +100,7 @@ public:
 		std::from_chars_result result {};
 		if (state_->status == GetFieldResult::Status::ReadyToRead) {
 			const char *begin = state_->next;
-			result = std::from_chars(begin, end_, destination);
+			result = ParseDecimal(begin, end_, destination);
 			if (result.ec != std::errc::invalid_argument) {
 				// from_chars was able to consume at least one character, consume the rest of the field
 				*state_ = GetNextField(result.ptr, end_);
@@ -107,7 +108,7 @@ public:
 				state_->value = { begin, (state_->value.data() - begin) + state_->value.size() };
 			}
 		} else {
-			result = std::from_chars(state_->value.data(), end_, destination);
+			result = ParseDecimal(state_->value.data(), end_, destination);
 		}
 
 		return mapError(result.ec);
@@ -135,7 +136,7 @@ public:
 			if (i == n)
 				return std::unexpected(Error::InvalidValue);
 			const std::from_chars_result result
-			    = std::from_chars(part.data(), part.data() + part.size(), destination[i]);
+			    = ParseDecimal(part.data(), part.data() + part.size(), destination[i]);
 			if (result.ec != std::errc())
 				return mapError(result.ec);
 			++i;

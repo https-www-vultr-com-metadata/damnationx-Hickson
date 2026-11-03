@@ -1,0 +1,33 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import {installBrowserPointer} from './browser-pointer.mjs';
+
+test('trusted gestures capture once; denial, modal release and click reacquisition report actual state',async()=>{
+ const documentEvents=new Map(),canvasEvents=new Map();let clock=10,attempts=0,deny=false;
+ const originalPerformance=globalThis.performance;
+ Object.defineProperty(globalThis,'performance',{configurable:true,value:{now:()=>clock}});
+ globalThis.document={pointerLockElement:null,addEventListener:(name,fn)=>documentEvents.set(name,fn),exitPointerLock(){this.pointerLockElement=null;documentEvents.get('pointerlockchange')();}};
+ const canvas={addEventListener:(name,fn)=>canvasEvents.set(name,fn),requestPointerLock(){attempts++;if(deny)return Promise.reject(Error('Denied'));document.pointerLockElement=canvas;documentEvents.get('pointerlockchange')();return Promise.resolve();}};
+ const state=installBrowserPointer(canvas),target={closest:()=>null};
+ const key=(extra={})=>documentEvents.get('keydown')({isTrusted:true,code:'KeyF',target,...extra});
+ state.poll(false,false,true);
+ for(const extra of [{ctrlKey:true},{metaKey:true},{altKey:true},{repeat:true},{isTrusted:false},{target:{closest:()=>({})}}])key(extra);
+ assert.equal(attempts,0);
+ key();await Promise.resolve();assert.equal(attempts,1);
+ assert.equal(state.poll(false,false,true),1,'gesture capture survives the core mode handoff');
+ assert.equal(state.poll(true,true,true),1);
+ assert.equal(state.poll(false,true,true),0,'Escape releases capture');
+ canvasEvents.get('pointerdown')({isTrusted:true,button:0,target});await Promise.resolve();
+ assert.equal(attempts,2);assert.equal(state.poll(false,true,true),1,'click capture survives the input frame handoff');assert.equal(state.poll(true,true,true),1);
+ assert.equal(state.poll(false,false,false),0,'UI/focus loss releases capture');
+ state.poll(false,false,true);deny=true;key();await Promise.resolve();await Promise.resolve();
+ assert.equal(state.poll(true,true,true),0);assert.equal(attempts,3);
+ documentEvents.get('pointerlockerror')({type:'pointerlockerror'});assert.equal(state.error,'Denied','a generic error event preserves the useful denial reason');
+ for(let i=0;i<120;i++)state.poll(true,true,true);
+ assert.equal(attempts,3,'a denied request is never retried by the frame poll');
+ deny=false;canvasEvents.get('pointerdown')({isTrusted:true,button:0,target});await Promise.resolve();
+ assert.equal(attempts,4);assert.equal(state.poll(true,true,true),1);
+ state.poll(false,false,false);clock+=2000;assert.equal(state.poll(false,false,false),0);
+ delete globalThis.damnationxBrowserPointer;delete globalThis.document;
+ Object.defineProperty(globalThis,'performance',{configurable:true,value:originalPerformance});
+});

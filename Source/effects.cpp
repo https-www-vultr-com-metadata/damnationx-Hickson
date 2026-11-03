@@ -22,6 +22,7 @@
 #include "game_mode.hpp"
 #include "options.h"
 #include "player.h"
+#include "survivors.h"
 #include "utils/is_of.hpp"
 
 namespace devilution {
@@ -99,7 +100,8 @@ void PlaySfxPriv(TSFX *pSFX, bool loc, Point position)
 
 	const auto id = static_cast<SfxID>(pSFX - sgSFX.data());
 	const bool useCuesVolume = (id >= SfxID::AccessibilityWeapon && id <= SfxID::AccessibilityInteract);
-	const int userVolume = useCuesVolume ? *GetOptions().Audio.audioCuesVolume : *GetOptions().Audio.soundVolume;
+	const int userVolume = (useCuesVolume ? *GetOptions().Audio.audioCuesVolume : *GetOptions().Audio.soundVolume)
+	    + SurvivorsSpellSfxAttenuation(id);
 	snd_play_snd(pSFX->pSnd.get(), lVolume, lPan, userVolume);
 }
 
@@ -183,6 +185,42 @@ void PrivSoundInit(uint8_t bLoadMask)
 }
 
 } // namespace
+
+int SurvivorsSpellSfxAttenuation(SfxID id)
+{
+	if (!IsSurvivorsMode())
+		return 0;
+	// Automatic arsenals can stack several native spell impacts each second.
+	// Leave voices, melee swings, monsters, UI and the player's master slider alone.
+	switch (id) {
+	case SfxID::CastSpell:
+	case SfxID::CastFire:
+	case SfxID::CastLightning:
+	case SfxID::CastSkill:
+	case SfxID::SpellEnd:
+	case SfxID::SpellApocalypse:
+	case SfxID::SpellBloodStar:
+	case SfxID::SpellBloodStarHit:
+	case SfxID::SpellBoneSpirit:
+	case SfxID::SpellBoneSpiritHit:
+	case SfxID::SpellChargedBolt:
+	case SfxID::SpellLightningHit:
+	case SfxID::SpellElemental:
+	case SfxID::SpellFirebolt:
+	case SfxID::SpellFireHit:
+	case SfxID::SpellFlameWave:
+	case SfxID::SpellGuardian:
+	case SfxID::SpellHolyBolt:
+	case SfxID::SpellLightning:
+	case SfxID::SpellNova:
+	case SfxID::SpellInferno:
+	case SfxID::SpellFireWall:
+	case SfxID::SpellLightningWall:
+		return -900; // About 35% of the normal linear amplitude.
+	default:
+		return 0;
+	}
+}
 
 bool effect_is_playing(SfxID nSFX)
 {

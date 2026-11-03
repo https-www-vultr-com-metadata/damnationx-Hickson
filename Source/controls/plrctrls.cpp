@@ -53,6 +53,7 @@
 #include "qol/stash.h"
 #include "qol/visual_store.h"
 #include "stores.h"
+#include "survivors.h"
 #include "towners.h"
 #include "track.h"
 #include "utils/is_of.hpp"
@@ -1757,7 +1758,7 @@ void WalkInDir(Player &player, AxisDirection dir)
 	if (!player.isWalking() && player.CanChangeAction())
 		player._pdir = pdir;
 
-	if (IsStandingGround()) {
+	if (IsStandingGround() && !IsSurvivorsMode()) {
 		if (player._pmode == PM_STAND)
 			StartStand(player, pdir);
 		return;
@@ -2411,6 +2412,8 @@ bool TryDropItem()
 	if (myPlayer.HoldItem.isEmpty()) {
 		return false;
 	}
+	// The item stays on the cursor; the level is about to be discarded.
+	if (SurvivorsGroundTransferBlocked()) return false;
 
 	if (leveltype == DTYPE_TOWN) {
 		if (UseItemOpensHive(myPlayer.HoldItem, myPlayer.position.tile)) {

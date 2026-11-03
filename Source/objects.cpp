@@ -31,6 +31,7 @@
 #include "levels/crypt.h"
 #include "levels/drlg_l4.h"
 #include "levels/setmaps.h"
+#include "levels/survivors_rolling_runtime.hpp"
 #include "levels/themes.h"
 #include "levels/tile_properties.hpp"
 #include "lighting.h"
@@ -40,6 +41,7 @@
 #include "options.h"
 #include "qol/stash.h"
 #include "stores.h"
+#include "survivors.h"
 #include "tables/objdat.h"
 #include "towners.h"
 #include "track.h"
@@ -1271,6 +1273,13 @@ void AddObjectLight(Object &object)
 	const uint8_t radius = GetObjectLightRadius(object._otype);
 	if (radius == 0)
 		return;
+	if (SurvivorsRollingActive()) {
+		// Rolling props are created and evicted during play. A one-off stamp
+		// into dLight would be lost (or linger) on the next relight, so they
+		// use a dynamic light that UpdateObjectLight adds near a hunter.
+		object._oVar1 = 0;
+		return;
+	}
 
 	DoLighting(object.position, radius, {});
 	if (LoadingMapObjects) {
@@ -1286,6 +1295,10 @@ void AddBarrel(Object &barrel)
 	barrel._oRndSeed = AdvanceRndSeed();
 	barrel._oVar2 = barrel.isExplosive() ? 0 : GenerateRnd(10);
 	barrel._oVar3 = GenerateRnd(3);
+	// Survivors' wave director owns the monster slots; a barrel skeleton would
+	// reserve one for as long as the barrel exists. Such barrels drop loot.
+	if (IsSurvivorsMode() && barrel._oVar2 >= 8)
+		barrel._oVar2 -= 8;
 
 	if (barrel._oVar2 >= 8) {
 		Monster *skeleton = PreSpawnSkeleton();
@@ -1460,8 +1473,16 @@ void UpdateObjectLight(Object &light, int lightRadius)
 	}
 
 	if (IsObjectLightInRange(light, lightRadius)) {
-		if (light._oVar1 == 0)
+		if (light._oVar1 == 0) {
+			// Generated Survivors scenery has many light sources; leave engine
+			// slots for hunters, spells and monsters (the 3D host draws every
+			// prop's light itself, independent of these slots).
+			if (SurvivorsRollingActive() && ActiveLightCount >= MAXLIGHTS - 12)
+				return;
 			light._olid = AddLight(light.position, lightRadius);
+			if (light._olid == NO_LIGHT)
+				return;
+		}
 		light._oVar1 = 1;
 	} else {
 		if (light._oVar1 == 1)
@@ -3600,6 +3621,12 @@ void UpdateState(Object &object, int frame)
 
 } // namespace
 
+void RemoveSurvivorsRollingObject(size_t activeIndex)
+{
+	if (activeIndex >= static_cast<size_t>(ActiveObjectCount)) return;
+	DeleteObject(ActiveObjects[activeIndex], static_cast<int>(activeIndex));
+}
+
 bool IsObjectLightInRange(const Object &light, int lightRadius)
 {
 #ifdef _DEBUG
@@ -3739,6 +3766,13 @@ std::expected<void, std::string> InitObjectGFX()
 			filesWidths[objectData.ofindex] = objectData.animWidth;
 		}
 	}
+	if (SurvivorsRollingRequested() && leveltype != DTYPE_TOWN) {
+		// The rolling world generates its own themed scenery during play.
+		for (const _object_id id : SurvivorsRollingSceneryObjects()) {
+			const ObjectData &obj = AllObjects[id];
+			filesWidths[obj.ofindex] = obj.animWidth;
+		}
+	}
 
 	return LoadLevelObjects(filesWidths);
 }
@@ -3811,10 +3845,28 @@ void AddSlainHero()
 	AddObject(OBJ_SLAINHERO, rndObjLoc + Displacement { 2, 2 });
 }
 
+void ClearObjects()
+{
+	ClrAllObjects();
+}
+
 void InitObjects()
 {
 	ClrAllObjects();
 	NaKrulTomeSequence = 0;
+	if (SurvivorsRollingRequested()) return;
+	if (IsSurvivorsMode()) {
+		// Keep native wall objects, without campaign props, traps or sarcophagi
+		// that reserve monster slots needed by the wave director.
+		if (leveltype == DTYPE_CATHEDRAL)
+			AddL1Objs(0, 0, MAXDUNX, MAXDUNY);
+		else if (leveltype == DTYPE_CATACOMBS) {
+			AddL2Objs(0, 0, MAXDUNX, MAXDUNY);
+			AddL2Torches();
+		} else if (leveltype == DTYPE_CAVES)
+			AddL3Objs(0, 0, MAXDUNX, MAXDUNY);
+		return;
+	}
 	if (currlevel == 16) {
 		AddDiabObjs();
 	} else {

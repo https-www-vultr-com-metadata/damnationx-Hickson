@@ -1,4 +1,5 @@
 #include "engine/render/hd_sprites_core.hpp"
+#include "utils/parse_int.hpp"
 
 #include <algorithm>
 #include <charconv>
@@ -37,7 +38,7 @@ std::vector<std::string_view> SplitFields(std::string_view line)
 bool ParseInt(std::string_view field, int &out)
 {
 	const char *end = field.data() + field.size();
-	const auto result = std::from_chars(field.data(), end, out);
+	const auto result = ParseDecimal(field.data(), end, out);
 	return result.ec == std::errc() && result.ptr == end;
 }
 

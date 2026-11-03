@@ -15,6 +15,9 @@
 #include "dvlnet/abstract_net.h"
 #include "engine/demomode.h"
 #include "headless_mode.hpp"
+#ifdef DAMNATION_S1_BRIDGE
+#include "s1_headless.hpp"
+#endif
 #include "menu.h"
 #include "multi.h"
 #include "options.h"
@@ -138,6 +141,9 @@ bool SNetInitializeProvider(uint32_t provider, struct GameData *gameData)
 	std::lock_guard<SdlMutex> lg(storm_net_mutex);
 #endif
 	dvlnet_inst = net::abstract_net::MakeNet(provider);
+#ifdef DAMNATION_S1_BRIDGE
+	if (s1_headless::Rendered()) return true;
+#endif
 	return (HeadlessMode && !demo::IsRunning()) || mainmenu_select_hero_dialog(gameData);
 }
 

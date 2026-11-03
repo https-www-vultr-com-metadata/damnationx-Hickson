@@ -22,6 +22,7 @@
 #include "engine/render/primitive_render.hpp"
 #include "engine/render/text_render.hpp"
 #include "engine/render/ui_scale.hpp"
+#include "host/host_hooks.hpp"
 #include "inv.h"
 #include "qol/chatlog.h"
 #include "qol/stash.h"
@@ -112,7 +113,8 @@ void DrawPlrMsg(const Surface &out)
 		return;
 
 	int x = 10;
-	int y = GetMainPanel().position.y - 13;
+	// The host's replacement HUD starts slightly above the native panel boundary.
+	int y = GetMainPanel().position.y - (host::HideHud ? 38 : 13);
 	int width = GetUiWidth() - 20;
 
 	if (!ChatFlag && IsLeftPanelOpen()) {

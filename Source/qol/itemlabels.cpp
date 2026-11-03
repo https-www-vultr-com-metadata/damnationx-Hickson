@@ -103,9 +103,14 @@ bool IsHighlightingLabelsEnabled()
 	return !IsPlayerInStore() && highlightKeyPressed != *GetOptions().Gameplay.showItemLabels;
 }
 
+bool ShouldShowItemLabel(int id)
+{
+	return !IsPlayerInStore() && (IsHighlightingLabelsEnabled() || pcursitem == id);
+}
+
 void AddItemToLabelQueue(int id, Point position)
 {
-	if (!IsHighlightingLabelsEnabled())
+	if (!ShouldShowItemLabel(id))
 		return;
 	Item &item = Items[id];
 
@@ -136,7 +141,7 @@ void AddItemToLabelQueue(int id, Point position)
 
 void AddItemToLabelQueueAt(int id, Point uiAnchor)
 {
-	if (!IsHighlightingLabelsEnabled())
+	if (!ShouldShowItemLabel(id))
 		return;
 	const Item &item = Items[id];
 	StringOrView textOnGround;

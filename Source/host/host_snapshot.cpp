@@ -1,3 +1,5 @@
+#include "fpv/fpv_state.hpp"
+#include "dvlnet/async_runtime.h"
 /**
  * @file host/host_snapshot.cpp
  *
@@ -22,6 +24,7 @@
 #include "items.h"
 #include "levels/dun_tile_data.hpp"
 #include "levels/gendung.h"
+#include "levels/survivors_rolling_runtime.hpp"
 #include "levels/tile_properties.hpp"
 #include "lighting.h"
 #include "missiles.h"
@@ -116,7 +119,11 @@ void AddPlayers()
 		if (!player.plractive || !player.isOnActiveLevel())
 			continue;
 		HostEntity &entity = Entities.emplace_back();
-		FillCommon(entity, HostEntityKind::Player, static_cast<uint32_t>(i), FeetOf(player.position, player.isWalking(), player._pdir, player.AnimInfo), 0.0F);
+		auto renderedFeet = FeetOf(player.position, player.isWalking(), player._pdir, player.AnimInfo);
+		const auto offset = AsyncNetRenderOffset(player);
+		renderedFeet.x += static_cast<float>(offset.deltaX) / 64.0F + static_cast<float>(offset.deltaY) / 32.0F;
+		renderedFeet.z += static_cast<float>(offset.deltaY) / 32.0F - static_cast<float>(offset.deltaX) / 64.0F;
+		FillCommon(entity, HostEntityKind::Player, static_cast<uint32_t>(i), renderedFeet, 0.0F);
 		entity.facing = static_cast<uint8_t>(player._pdir);
 		entity.typeId = static_cast<uint32_t>(player._pClass);
 		entity.variant = player._pgfxnum;
@@ -135,9 +142,17 @@ void AddPlayers()
 				}
 			}
 		}
-		entity.frame = ClampU16(player.AnimInfo.currentFrame);
-		entity.frameCount = ClampU16(player.AnimInfo.numberOfFrames);
-		entity.animProgress = AnimProgress(player.AnimInfo);
+		// Survivors attacks and casts play over stand/walk without a player mode;
+		// report them as the playing animation so 3D models swing too.
+		const bool action = player.survivorsActionActive;
+		const AnimationInfo &shown = action ? player.survivorsActionAnim : player.AnimInfo;
+		if (action) {
+			entity.anim = static_cast<uint16_t>(player.survivorsActionGraphic);
+			entity.facing = static_cast<uint8_t>(player.survivorsActionDirection);
+		}
+		entity.frame = ClampU16(shown.currentFrame);
+		entity.frameCount = ClampU16(shown.numberOfFrames);
+		entity.animProgress = AnimProgress(shown);
 		entity.lightRadius = ClampU16(player._pLightRad);
 		if (&player == MyPlayer)
 			entity.flags |= kEntityLocalPlayer;
@@ -158,7 +173,11 @@ void AddMonsters()
 		if (!InDungeonBounds(monster.position.tile))
 			continue;
 		HostEntity &entity = Entities.emplace_back();
-		FillCommon(entity, HostEntityKind::Monster, id, FeetOf(monster.position, monster.isWalking(), monster.direction, monster.animInfo), 0.0F);
+		auto renderedFeet = FeetOf(monster.position, monster.isWalking(), monster.direction, monster.animInfo);
+		const auto offset = AsyncNetRenderOffset(monster);
+		renderedFeet.x += static_cast<float>(offset.deltaX) / 64.0F + static_cast<float>(offset.deltaY) / 32.0F;
+		renderedFeet.z += static_cast<float>(offset.deltaY) / 32.0F - static_cast<float>(offset.deltaX) / 64.0F;
+		FillCommon(entity, HostEntityKind::Monster, id, renderedFeet, 0.0F);
 		entity.facing = static_cast<uint8_t>(monster.direction);
 		entity.typeId = static_cast<uint32_t>(monster.type().type);
 		entity.variant = monster.isUnique() ? static_cast<uint32_t>(monster.uniqueType) + 1 : 0;
@@ -230,6 +249,13 @@ void AddObjects()
 		// frame number also encodes an art variant, not opening animation time.
 		if (object.IsChest())
 			entity.anim = object.canInteractWith() ? 0 : 2;
+        if (object._otype == OBJ_SARC || object._otype == OBJ_L5SARC) {
+            const float progress = ((static_cast<float>(object._oAnimFrame) - 1.0F)
+                + static_cast<float>(object._oAnimCnt) / std::max(object._oAnimDelay, 1))
+                / static_cast<float>(std::max(object._oAnimLen, 2U) - 1U);
+            entity.anim = object.canInteractWith() ? 0 : (object._oAnimFrame >= object._oAnimLen ? 2 : 1);
+            entity.animProgress = std::clamp(progress, 0.0F, 1.0F);
+        }
 		if (object.isDoor()) {
 			entity.anim = object._oVar4 == 0 ? 0 : 2;
 			const bool left = IsAnyOf(object._otype, OBJ_L1LDOOR, OBJ_L2LDOOR, OBJ_L3LDOOR, OBJ_L5LDOOR);
@@ -342,6 +368,33 @@ void LightColor(const Missile *missile, bool object, uint8_t &r, uint8_t &g, uin
 	r = 242, g = 219, b = 178;
 }
 
+struct SceneryLight {
+	float radius = 0;
+	uint8_t r = 0, g = 0, b = 0;
+};
+
+// Pools for generated rolling-world props. Fires are warm (the host adds a
+// flame emitter to warm object lights); unused shrines glow cool.
+SceneryLight RollingSceneryLight(const Object &object)
+{
+	switch (object._otype) {
+	case OBJ_L1LIGHT:
+	case OBJ_SKFIRE:
+		return { 7.5F, 255, 165, 85 };
+	case OBJ_BOOKCANDLE:
+		return { 6.5F, 255, 170, 90 };
+	case OBJ_CANDLE1:
+	case OBJ_CANDLE2:
+		return { 5.5F, 255, 180, 100 };
+	case OBJ_SHRINEL:
+	case OBJ_SHRINER:
+		if (object.canInteractWith()) return { 4.0F, 120, 160, 255 };
+		return {};
+	default:
+		return {};
+	}
+}
+
 void AddLights()
 {
 	// Who each light belongs to.
@@ -382,10 +435,15 @@ void AddLights()
 		owner[lightId] = MakeEntityId(HostEntityKind::Object, static_cast<uint32_t>(ActiveObjects[i]));
 	}
 
+	const bool rolling = SurvivorsRollingActive();
 	for (int i = 0; i < ActiveLightCount; ++i) {
 		const uint8_t lightId = ActiveLights[i];
 		const Light &light = ::devilution::Lights[lightId];
 		if (light.isInvalid || light.radius == 0 || !InDungeonBounds(light.position.tile))
+			continue;
+		// Rolling scenery props are emitted below, uniformly, whether or not
+		// they currently hold one of the engine's few light slots.
+		if (rolling && objectLight[lightId])
 			continue;
 		HostLight &out = FrameLights.emplace_back();
 		out = {};
@@ -396,6 +454,32 @@ void AddLights()
 		LightColor(missileOf[lightId], objectLight[lightId], out.r, out.g, out.b);
 		out.entityId = owner[lightId];
 		out.flags = owner[lightId] != 0 ? 1 : 0;
+	}
+
+	// Rolling Survivors scenery has more braziers and fires than the engine has
+	// light slots, and co-op replicas never simulate object lights. The open
+	// field has no walls to bounce light, so every lit prop casts a broad pool
+	// in the 3D view (flag 2), and shrines glow so they read from a distance.
+	if (!rolling)
+		return;
+	for (int i = 0; i < ActiveObjectCount; ++i) {
+		const Object &object = Objects[ActiveObjects[i]];
+		if (object._oDelFlag || object.IsBroken() || !InDungeonBounds(object.position))
+			continue;
+		const SceneryLight scenery = RollingSceneryLight(object);
+		if (scenery.radius == 0)
+			continue;
+		HostLight &out = FrameLights.emplace_back();
+		out = {};
+		out.x = static_cast<float>(object.position.x) + 0.5F;
+		out.z = static_cast<float>(object.position.y) + 0.5F;
+		out.y = render3d::FloorHeightOf(Level, out.x, out.z) + 0.6F;
+		out.radius = scenery.radius;
+		out.r = scenery.r;
+		out.g = scenery.g;
+		out.b = scenery.b;
+		out.entityId = MakeEntityId(HostEntityKind::Object, static_cast<uint32_t>(ActiveObjects[i]));
+		out.flags = 1 | 2;
 	}
 }
 
@@ -451,13 +535,35 @@ void HostSetWorldView(const float *screenFromWorld)
 	std::copy_n(screenFromWorld, 16, WorldView->begin());
 }
 
+bool ProjectWorldTile(Point tile, float lift, Point &screen)
+{
+	if (!WorldView)
+		return false;
+	const std::array<float, 16> &m = *WorldView;
+	const float x = static_cast<float>(tile.x) + 0.5F;
+	const float z = static_cast<float>(tile.y) + 0.5F;
+	const float y = render3d::FloorHeightOf(Level, x, z) + lift;
+	const float w = m[3] * x + m[7] * y + m[11] * z + m[15];
+	if (!(w > 1e-4F))
+		return false;
+	const float sx = (m[0] * x + m[4] * y + m[8] * z + m[12]) / w;
+	const float sy = (m[1] * x + m[5] * y + m[9] * z + m[13]) / w;
+	// Off-screen marks are dropped by the caller's clipping; keep the int conversion defined.
+	if (!(std::abs(sx) < 1e6F && std::abs(sy) < 1e6F))
+		return false;
+	screen = { static_cast<int>(sx), static_cast<int>(sy) };
+	return true;
+}
+
 void QueueWorldItemLabels(int width, int height)
 {
-	if (!WorldView || !IsHighlightingLabelsEnabled())
+	if (!WorldView || (!IsHighlightingLabelsEnabled() && pcursitem < 0))
 		return;
 	const std::array<float, 16> &m = *WorldView;
 	for (uint8_t i = 0; i < ActiveItemCount; ++i) {
 		const int id = ActiveItems[i];
+		if (!ShouldShowItemLabel(id))
+			continue;
 		const Item &item = Items[id];
 		// As the isometric pass: items it does not leave in the dark, once their drop animation has landed.
 		if (!InDungeonBounds(item.position) || (leveltype != DTYPE_TOWN && !IsTileLit(item.position))
@@ -476,6 +582,53 @@ void QueueWorldItemLabels(int width, int height)
 			continue;
 		AddItemToLabelQueueAt(id, ScreenToUi({ static_cast<int>(sx), static_cast<int>(sy) }));
 	}
+}
+
+void HostSetVrSupport(bool available)
+{
+    SetHostVrSupport(available);
+}
+
+HostViewFeedback HostViewFeedbackSnapshot()
+{
+    if (!InGame()) return {};
+    const auto &hud = fpv::GetHud();
+    const uint32_t now = fpv::NowMs();
+    const uint32_t age = now - hud.slashStart;
+    const auto remaining = static_cast<int32_t>(hud.hitMarkerUntil - now);
+    return { age, remaining > 0 ? static_cast<uint32_t>(remaining) : 0U,
+        (hud.slashActive && age <= 400 ? 1U : 0U) | (hud.slashMirrored ? 2U : 0U) };
+}
+
+HostVrSettings HostVrSettingsSnapshot()
+{
+    const auto &vr = GetOptions().Vr;
+    return {
+        *vr.enabled ? 1U : 0U,
+        static_cast<uint32_t>(*vr.turnMode),
+        static_cast<float>(*vr.snapTurnAngle),
+        static_cast<float>(*vr.smoothTurnSpeed),
+        static_cast<uint32_t>(*vr.vignette),
+        static_cast<float>(*vr.worldScale) / 100.0F,
+        static_cast<float>(*vr.renderScale) / 100.0F,
+        *vr.seated ? 1U : 0U,
+        static_cast<uint32_t>(*vr.moveDirection),
+        static_cast<uint32_t>(*vr.dominantHand),
+        static_cast<float>(*vr.panelDistance) / 100.0F,
+    };
+}
+
+HostCameraSettings HostCameraSettingsSnapshot()
+{
+	const auto &options = GetOptions();
+	return {
+		static_cast<float>(*options.Graphics.fpvFieldOfView),
+		static_cast<float>(*options.Gameplay.fpvMouseSensitivity),
+		static_cast<float>(*options.Graphics.thirdPersonDistance) / 10.0F,
+		static_cast<uint32_t>(*options.Graphics.thirdPersonStyle),
+		(*options.Graphics.fpvHeadBob ? 1U : 0U) | (*options.Graphics.fpvFullBody ? 2U : 0U)
+		    | (*options.Gameplay.fpvInvertMouseY ? 4U : 0U) | (*options.Graphics.fpvWeapon ? 8U : 0U),
+	};
 }
 
 const HostFrame &BuildSnapshot()

@@ -861,7 +861,7 @@ void ResetCursorInfo()
 
 bool CheckPlayerState(const Point currentTile, const Player &myPlayer)
 {
-	if (myPlayer._pInvincible) {
+	if (myPlayer._pInvincible && !IsVisualStoreOpen) {
 		return true;
 	}
 	if (!myPlayer.HoldItem.isEmpty() || SpellSelectFlag) {

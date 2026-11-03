@@ -1,3 +1,4 @@
+#include "dvlnet/async_runtime.h"
 /**
  * @file minitext.cpp
  *
@@ -137,6 +138,7 @@ void InitQuestText()
 
 void InitQTextMsg(_speech_id m)
 {
+	if (AsyncNetIsRemoteInteraction()) return;
 	SfxID sfxnr = Speeches[m].sfxnr;
 	switch (sfxnr) {
 	case SfxID::Warrior1:

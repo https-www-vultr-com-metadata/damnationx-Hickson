@@ -15,7 +15,7 @@ using ::testing::UnorderedElementsAre;
 
 void TestArrowRotatesUniformly(Missile &missile, int startingFrame, int leftFrame, int rightFrame)
 {
-	ankerl::unordered_dense::map<int, unsigned> observed {};
+	ankerl::unordered_dense::map<int, unsigned> observed { };
 	for (auto i = 0; i < 100; i++) {
 		missile._miAnimFrame = startingFrame;
 		TestRotateBlockedMissile(missile);
@@ -27,7 +27,7 @@ void TestArrowRotatesUniformly(Missile &missile, int startingFrame, int leftFram
 
 void TestAnimatedMissileRotatesUniformly(Missile &missile, int startingDir, int leftDir, int rightDir)
 {
-	ankerl::unordered_dense::map<int, unsigned> observed {};
+	ankerl::unordered_dense::map<int, unsigned> observed { };
 	for (auto i = 0; i < 100; i++) {
 		missile.setFrameGroupRaw(startingDir);
 		TestRotateBlockedMissile(missile);
@@ -42,7 +42,7 @@ TEST(Missiles, RotateBlockedMissileArrow)
 	Players.resize(1);
 	MyPlayerId = 0;
 	MyPlayer = &Players[MyPlayerId];
-	*MyPlayer = {};
+	*MyPlayer = { };
 	LoadMissileData();
 
 	const devilution::Player &player = Players[0];
@@ -148,4 +148,62 @@ TEST(Missiles, GetDirection16)
 	EXPECT_EQ(Direction16::South_SouthEast, GetDirection16({ 2, 2 }, { 4, 3 }));
 
 	EXPECT_EQ(Direction16::South_SouthWest, GetDirection16({ 0, 0 }, { 0, 0 })) << "GetDirection16 is expected to default to Direction16::South_SouthWest when the points occupy the same tile";
+}
+// Exercises the production wire encoder/decoder without sprite assets.
+namespace devilution {
+bool AsyncNetRoundTripMissileForTesting(const Missile &input, Missile &output);
+bool AsyncNetRoundTripMissileBudgetForTesting(unsigned count);
+bool AsyncNetDenseBuybackSnapshotForTesting();
+bool AsyncNetWorldVersionForTesting();
+bool AsyncNetRollingInputEpochForTesting();
+} // namespace devilution
+
+TEST(Missiles, AsyncWorldEncoderAndValidatorShareTheSameVersion)
+{
+	EXPECT_TRUE(AsyncNetWorldVersionForTesting());
+}
+
+TEST(Missiles, AsyncRollingInputTranslatesPriorOriginAndRejectsStaleAdmission)
+{
+	EXPECT_TRUE(AsyncNetRollingInputEpochForTesting());
+}
+
+TEST(Missiles, AsyncRhinoKeepsMonsterAnimationWithNoMissileGraphic)
+{
+	Missile source { };
+	source._mitype = MissileID::Rhino;
+	source._miAnimType = MissileGraphicID::None;
+	source.setFrameGroupRaw(7);
+	source._miAnimFlags = MissileGraphicsFlags::None;
+	source._miAnimDelay = 2;
+	source._miAnimLen = 8;
+	source._miAnimWidth = 128;
+	source._miAnimWidth2 = 64;
+	source._miAnimFrame = 4;
+	source._miAnimCnt = 1;
+	Missile restored { };
+	ASSERT_TRUE(AsyncNetRoundTripMissileForTesting(source, restored));
+	EXPECT_EQ(restored.getFrameGroupRaw(), 7);
+	EXPECT_EQ(restored._miAnimLen, 8);
+	EXPECT_EQ(restored._miAnimDelay, 2);
+	EXPECT_EQ(restored._miAnimFrame, 4);
+	EXPECT_EQ(restored._miAnimCnt, 1);
+	EXPECT_EQ(restored._miAnimWidth, 128);
+	EXPECT_EQ(restored._miAnimWidth2, 64);
+	source.setFrameGroupRaw(8);
+	EXPECT_FALSE(AsyncNetRoundTripMissileForTesting(source, restored));
+	source.setFrameGroupRaw(16);
+	EXPECT_FALSE(AsyncNetRoundTripMissileForTesting(source, restored));
+}
+
+TEST(Missiles, AsyncWorldAcceptsFourPlayerEffectBudgetAndRejectsOverflow)
+{
+	EXPECT_TRUE(AsyncNetRoundTripMissileBudgetForTesting(1870));
+	EXPECT_TRUE(AsyncNetRoundTripMissileBudgetForTesting(2048));
+	EXPECT_FALSE(AsyncNetRoundTripMissileBudgetForTesting(2049));
+}
+
+TEST(Missiles, AsyncDenseWorldWithFourFullBuybackListsFitsSnapshotTransport)
+{
+	EXPECT_TRUE(AsyncNetDenseBuybackSnapshotForTesting());
 }

@@ -5,9 +5,14 @@
  */
 #pragma once
 
+#include "utils/attributes.h"
+
 #include <cstdint>
+#include <array>
+#include <span>
 #include <expected>
 #include <string>
+#include <vector>
 
 #include "DiabloUI/diabloui.h"
 #include "player.h"
@@ -123,6 +128,38 @@ uint32_t pfile_ui_get_first_unused_save_num();
 bool pfile_ui_save_create(_uiheroinfo *heroinfo);
 bool pfile_delete_save(_uiheroinfo *heroInfo);
 void pfile_read_player_from_save(uint32_t saveNum, Player &player);
+DVL_API_FOR_TEST bool pfile_save_survivors_inventory();
+DVL_API_FOR_TEST bool pfile_survivors_inventory_available();
+DVL_API_FOR_TEST void pfile_load_survivors_inventory(Player &player);
+
+using SurvivorsIdentity = std::array<uint8_t, 32>;
+enum class SurvivorsLedgerLoad { Missing, Loaded, Corrupt };
+// Optional cross-host authority. When configured, hold the exclusive shared
+// lease across journal recovery and all commits, until the hunt ends.
+DVL_API_FOR_TEST bool pfile_begin_survivors_shared_authority();
+DVL_API_FOR_TEST void pfile_end_survivors_shared_authority();
+// The host owns these records. A corrupt primary is never replaced by a stale
+// backup automatically, since doing so could replay an acknowledged purchase.
+DVL_API_FOR_TEST std::optional<SurvivorsIdentity> pfile_survivors_identity(const Player &player);
+DVL_API_FOR_TEST SurvivorsLedgerLoad pfile_load_survivors_ledger(Player &player, const SurvivorsIdentity &identity, uint64_t &committed);
+DVL_API_FOR_TEST bool pfile_save_survivors_ledger(Player &player, const SurvivorsIdentity &identity, uint64_t committed);
+// Portable copies are validated against the hero identity before replacing the
+// local checkpoint. Equal revisions with different bytes are a conflict.
+enum class SurvivorsLedgerImport { Imported, Unchanged, Older, Conflict, Invalid };
+DVL_API_FOR_TEST std::optional<std::vector<std::byte>> pfile_export_survivors_ledger(const SurvivorsIdentity &identity);
+DVL_API_FOR_TEST SurvivorsLedgerImport pfile_import_survivors_ledger(const Player &player, const SurvivorsIdentity &identity, std::span<const std::byte> bytes, uint64_t expectedRevision = 0);
+struct SurvivorsLedgerEntry { Player *player; SurvivorsIdentity identity; uint64_t committed; };
+// A committed journal must be replayed before admission or ACK publication.
+DVL_API_FOR_TEST bool pfile_recover_survivors_ledger_journal();
+DVL_API_FOR_TEST bool pfile_commit_survivors_ledgers(std::span<const SurvivorsLedgerEntry> entries, std::optional<std::span<const Item>> ground = std::nullopt);
+DVL_API_FOR_TEST SurvivorsLedgerLoad pfile_load_survivors_ground(std::vector<Item> &items);
+#ifdef BUILD_TESTING
+// Verify the same bounded member preflight used before importing peer data.
+DVL_API_FOR_TEST bool pfile_test_survivors_portable_members(const std::string &path);
+DVL_API_FOR_TEST bool pfile_test_survivors_portable_header(std::span<const std::byte> bytes);
+// Simulate a power loss after this many committed archive replacements.
+DVL_API_FOR_TEST void pfile_test_survivors_ledger_interrupt_after(unsigned replacements);
+#endif
 void pfile_save_level();
 std::expected<void, std::string> pfile_convert_levels();
 void pfile_remove_temp_files();

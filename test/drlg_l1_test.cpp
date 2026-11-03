@@ -1,10 +1,133 @@
 #include <gtest/gtest.h>
 
 #include "drlg_test.hpp"
+#include "survivors.h"
+#include "levels/survivors_layout.hpp"
+#include <queue>
 
 using namespace devilution;
 
 namespace {
+
+class SurvivorsArena : public testing::Test {
+protected:
+	void SetUp() override
+	{
+		SetSurvivorsMode(true);
+		currlevel = 1;
+		leveltype = DTYPE_CATHEDRAL;
+		pMegaTiles = std::make_unique<MegaTile[]>(206);
+		// Synthetic nonzero pieces verify the normal mega-to-world conversion
+		// without requiring owned Diablo archives for this geometry test.
+		for (unsigned tile = 0; tile < 206; ++tile) {
+			const auto piece = static_cast<uint16_t>(tile + 1);
+			pMegaTiles[tile] = { piece, piece, piece, piece };
+		}
+	}
+
+	void TearDown() override
+	{
+		SetSurvivorsMode(false);
+	}
+};
+
+TEST_F(SurvivorsArena, EntryHasContinuousFloorAndAnEnclosedExteriorAcrossSeeds)
+{
+	for (const uint32_t seed : { 2588U, 743271966U, 0U }) {
+		CreateDungeon(seed, ENTRY_MAIN);
+		EXPECT_EQ(ViewPosition, Point(56, 56));
+		const auto room = dTransVal[56][56];
+		ASSERT_NE(room, 0);
+		// A wide clear area around entry accommodates the entire spawn ring.
+		for (int y = 44; y <= 68; ++y) {
+			for (int x = 44; x <= 68; ++x) {
+				ASSERT_EQ(dTransVal[x][y], room) << seed << " at " << x << "," << y;
+				ASSERT_NE(dPiece[x][y], 0) << seed << " at " << x << "," << y;
+			}
+		}
+		for (int edge = 0; edge < MAXDUNX; ++edge) {
+			EXPECT_EQ(dTransVal[edge][0], 0);
+			EXPECT_EQ(dTransVal[edge][MAXDUNY - 1], 0);
+			EXPECT_EQ(dTransVal[0][edge], 0);
+			EXPECT_EQ(dTransVal[MAXDUNX - 1][edge], 0);
+		}
+		EXPECT_EQ(SetPieceRoom.size.width, 0);
+		EXPECT_EQ(SetPieceRoom.size.height, 0);
+	}
+}
+
+TEST_F(SurvivorsArena, AllFiveActsUseClearNativeArenasAcrossSeeds)
+{
+	for (unsigned act = 0; act < SurvivorsActCount; ++act) {
+		currlevel = static_cast<uint8_t>(SurvivorsActLevel(act));
+		leveltype = GetLevelType(currlevel);
+		for (const uint32_t seed : { 2588U, 743271966U }) {
+			CreateDungeon(seed, ENTRY_MAIN);
+			ASSERT_EQ(ViewPosition, Point(56, 56)) << act;
+			const auto room = dTransVal[56][56];
+			ASSERT_NE(room, 0) << act;
+			// Each biome must keep a clear spawn ring around the central entry.
+			for (int y = 44; y <= 68; ++y) {
+				for (int x = 44; x <= 68; ++x) {
+					ASSERT_EQ(dTransVal[x][y], room) << act << " at " << x << "," << y;
+					ASSERT_NE(dPiece[x][y], 0) << act << " at " << x << "," << y;
+				}
+			}
+			// Each transition threshold must have an outward walking step in
+			// the converted native floor region, not just in the input mask.
+			for (int direction = 0; direction < 4; ++direction) {
+				bool reachable = false;
+				for (int lateral = 44; lateral <= 68; ++lateral) {
+					const Point a = direction == 0 ? Point { 42, lateral } : direction == 1 ? Point { 70, lateral } : direction == 2 ? Point { lateral, 36 } : Point { lateral, 76 };
+					const Displacement step = direction == 0 ? Displacement { -1, 0 } : direction == 1 ? Displacement { 1, 0 } : direction == 2 ? Displacement { 0, -1 } : Displacement { 0, 1 };
+					const Point b = a + step;
+					if (dTransVal[a.x][a.y] == room && dTransVal[b.x][b.y] == room && dPiece[a.x][a.y] != 0 && dPiece[b.x][b.y] != 0) reachable = true;
+				}
+				EXPECT_TRUE(reachable) << "act " << act << ", seed " << seed << ", direction " << direction;
+			}
+			EXPECT_EQ(SetPieceRoom.size.width, 0);
+			EXPECT_EQ(SetPieceRoom.size.height, 0);
+		}
+	}
+}
+
+TEST(SurvivorsLayout, SeedsProduceRepeatableConnectedExplorableClearings)
+{
+	const auto first = GenerateSurvivorsLayout(2588);
+	EXPECT_EQ(first, GenerateSurvivorsLayout(2588));
+	EXPECT_NE(first, GenerateSurvivorsLayout(743271966));
+	for (uint32_t seed = 0; seed < 128; ++seed) {
+		const auto layout = GenerateSurvivorsLayout(seed);
+		for (const auto direction : { std::array { -1, 0 }, std::array { 1, 0 }, std::array { 0, -1 }, std::array { 0, 1 } }) {
+			const auto tile = SurvivorsArrivalMega(layout, direction[0], direction[1]);
+			for (int x = tile[0] - 2; x <= tile[0] + 2; ++x)
+				for (int y = tile[1] - 2; y <= tile[1] + 2; ++y)
+					EXPECT_TRUE(layout[x][y]) << "arrival seed " << seed;
+		}
+		std::array<std::array<bool, 40>, 40> reached {};
+		std::queue<Point> open;
+		ASSERT_TRUE(layout[20][20]);
+		open.push({ 20, 20 });
+		reached[20][20] = true;
+		unsigned count = 0;
+		while (!open.empty()) {
+			const Point p = open.front();
+			open.pop();
+			++count;
+			for (const Displacement d : { Displacement { 1, 0 }, Displacement { -1, 0 }, Displacement { 0, 1 }, Displacement { 0, -1 } }) {
+				const Point n = p + d;
+				if (n.x < 0 || n.x >= 40 || n.y < 0 || n.y >= 40 || !layout[n.x][n.y] || reached[n.x][n.y]) continue;
+				reached[n.x][n.y] = true;
+				open.push(n);
+			}
+		}
+		unsigned area = 0;
+		for (int x = 0; x < 40; ++x)
+			for (int y = 0; y < 40; ++y)
+				if (layout[x][y]) { ++area; EXPECT_TRUE(reached[x][y]) << seed; }
+		EXPECT_GE(area, 600U) << seed;
+	}
+}
 
 TEST(Drlg_l1, CreateL5Dungeon_diablo_1_2588)
 {

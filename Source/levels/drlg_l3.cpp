@@ -8,12 +8,14 @@
 #include "engine/point.hpp"
 #include "engine/points_in_rectangle_range.hpp"
 #include "engine/random.hpp"
+#include "levels/survivors_layout.hpp"
 #include "levels/dun_tile_data.hpp"
 #include "levels/gendung.h"
 #include "levels/gendung_defs.hpp"
 #include "lighting.h"
 #include "objects.h"
 #include "tables/questdat.hpp"
+#include "survivors.h"
 #include "utils/is_of.hpp"
 #include "utils/status_macros.hpp"
 
@@ -1987,6 +1989,22 @@ bool PlaceStairs(lvl_entry entry)
 
 void GenerateLevel(lvl_entry entry)
 {
+	if (IsSurvivorsMode()) {
+		// Keep native cave conversion while using the same seeded connected layout.
+		InitDungeonFlags();
+		DRLG_InitTrans();
+		const auto layout = GenerateSurvivorsLayout(GetLCGEngineState());
+		for (int y = 0; y < DMAXY; ++y)
+			for (int x = 0; x < DMAXX; ++x)
+				if (layout[x][y]) dungeon[x][y] = 1;
+		MakeMegas();
+		FloodTransparencyValues(7);
+		SetPiece = {};
+		SetPieceRoom = {};
+		ViewPosition = { 56, 56 };
+		memcpy(pdungeon, dungeon, sizeof(pdungeon));
+		return;
+	}
 	if (LevelSeeds[currlevel])
 		SetRndSeed(*LevelSeeds[currlevel]);
 

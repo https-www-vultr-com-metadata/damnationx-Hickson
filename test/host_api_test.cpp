@@ -486,6 +486,19 @@ TEST(HostApi, ExplicitHdOffClearsAnInstalledPackAndItsAssetMapping)
 	EXPECT_TRUE(GetHdAssetDirectory().empty());
 }
 
+TEST(HostOptions, ResolutionDescriptionWithoutSdlDisplay)
+{
+	OptionEntryResolution resolution;
+	EXPECT_EQ(resolution.GetListSize(), 1U);
+	EXPECT_FALSE(resolution.GetValueDescription().empty());
+	resolution.setAvailableResolutions({ { { 1280, 720 }, "1280x720" } });
+	resolution.SetActiveListIndex(0);
+	resolution.setAvailableResolutions({});
+	EXPECT_EQ(resolution.GetValueDescription(), "1280x720");
+	resolution.SetActiveListIndex(99);
+	EXPECT_EQ(resolution.GetValueDescription(), "1280x720");
+}
+
 TEST(HostApi, HundredTicksInTheCathedral)
 {
 	const std::string dataDir = FindDataDir();
@@ -618,6 +631,30 @@ TEST(HostApi, HundredTicksInTheCathedral)
 		HostTick(50);
 		ASSERT_TRUE(dxp_menu_snapshot(&menu, sizeof(menu)));
 		ASSERT_NE(menu.flags & DxpMenuOpen, 0U);
+		// The D2R menu edits the same native bindings as classic Padmapping.
+		ASSERT_GT(dxp_pad_count(), 0U);
+		DxpPadBinding originalBinding {};
+		ASSERT_TRUE(dxp_pad_binding(0, &originalBinding, sizeof(originalBinding)));
+		EXPECT_FALSE(dxp_pad_binding(dxp_pad_count(), &originalBinding, sizeof(originalBinding)));
+		EXPECT_FALSE(dxp_pad_set(0, 1, 0));
+		EXPECT_FALSE(dxp_pad_set(0, 4, 4));
+		if (originalBinding.enabled) {
+			ASSERT_TRUE(dxp_pad_set(0, 4, 2));
+			DxpPadBinding changed {};
+			ASSERT_TRUE(TickUntil([&](const HostTickResult &, const HostFrame &) {
+				return dxp_pad_binding(0, &changed, sizeof(changed)) && changed.button == 4 && changed.modifier == 2;
+			}, 20, soundEvents));
+			std::ifstream padOptions(saveDir / "diablo.ini");
+			std::string padPersisted((std::istreambuf_iterator<char>(padOptions)), {});
+			std::erase_if(padPersisted, [](char c) { return c == ' ' || c == '\t' || c == '\r'; });
+			std::string key(GetOptions().Padmapper.actions.front().key);
+			std::erase_if(key, [](char c) { return c == ' ' || c == '\t' || c == '\r'; });
+			EXPECT_NE(padPersisted.find(key + "=LT+A"), std::string::npos);
+			ASSERT_TRUE(dxp_pad_set(0, originalBinding.button, originalBinding.modifier));
+			ASSERT_TRUE(TickUntil([&](const HostTickResult &, const HostFrame &) {
+				return dxp_pad_binding(0, &changed, sizeof(changed)) && changed.button == originalBinding.button && changed.modifier == originalBinding.modifier;
+			}, 20, soundEvents));
+		}
 		EXPECT_FALSE(dxp_menu_action(0));
 		EXPECT_FALSE(dxp_menu_action(6));
 		EXPECT_FALSE(dxp_menu_audio(2, 50));

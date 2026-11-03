@@ -41,6 +41,7 @@ namespace {
 std::string HdDir;
 uint32_t Packs = 0;
 bool UiIndexPresent = false;
+std::unordered_map<int, bool> IndexedSheetsReady;
 
 // The tile manifest of the current world pass (HdUseTileManifest).
 int TileSet = -1;
@@ -319,6 +320,7 @@ void InitHdPack()
 	HdDir.clear();
 	Packs = 0;
 	UiIndexPresent = false;
+	IndexedSheetsReady.clear();
 	SetHdAssetDirectory({});
 	if (Options.hdDisabled) {
 		LogInfo("Host: HD packs explicitly disabled");
@@ -386,6 +388,27 @@ bool HdTilesAvailable()
 bool HdUiAvailable()
 {
 	return Hd2DDrawing() && UiIndexPresent;
+}
+
+bool HdUiSheetReady(int sheet)
+{
+	if (!HdUiAvailable())
+		return false;
+	const auto &sheets = HdUiIndex().sheets;
+	if (sheet < 0 || static_cast<size_t>(sheet) >= sheets.size())
+		return false;
+	if (!sheets[sheet].indexed)
+		return true;
+	if (const auto found = IndexedSheetsReady.find(sheet); found != IndexedSheetsReady.end())
+		return found->second;
+	std::string bytes;
+	bool failed;
+	const bool ready = HdFetchText(AssetPathOf(sheets[sheet].png).c_str(), bytes, failed, true)
+	    && hd_ui::IndexedSheetEncodingPreservesIndices(bytes);
+	IndexedSheetsReady.emplace(sheet, ready);
+	if (!ready)
+		LogWarn("HD indexed sheet {} is missing or uses lossy compression; using classic text. Rebuild indexed sheets as PNG or lossless WebP.", sheets[sheet].png);
+	return ready;
 }
 
 bool HdUiWanted()

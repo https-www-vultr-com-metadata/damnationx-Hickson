@@ -603,7 +603,7 @@ std::array<YawState, MAX_PLRS> Yaws;
 
 float SmoothedYaw(const Player &player)
 {
-	const float target = DirectionYaw(player.getSpriteDirection());
+	const float target = DirectionYaw(player.getDisplayedDirection());
 	const size_t id = player.getId();
 	if (id >= Yaws.size())
 		return target;
@@ -628,7 +628,7 @@ float SmoothedYaw(const Player &player)
 /** The action of the player's current game animation. */
 Action ActionOf(const Player &player, bool inTown)
 {
-	switch (player.getGraphic()) {
+	switch (player.getDisplayedGraphic()) {
 	case player_graphic::Stand: return inTown ? Action::TownStand : Action::Stand;
 	case player_graphic::Walk: return inTown ? Action::TownWalk : Action::Walk;
 	case player_graphic::Attack: return Action::Attack;
@@ -673,7 +673,7 @@ bool BuildPose(const Player &player, Pose &pose)
 	Cur = character;
 	const GltfModel &model = character->model;
 	const bool inTown = leveltype == DTYPE_TOWN;
-	const float progress = AnimationProgress(player.AnimInfo);
+	const float progress = AnimationProgress(player.getDisplayedAnimation());
 	const Action action = ActionOf(player, inTown);
 	const int clip = ClipFor(*character, action, FamilyOf(player));
 	if (clip < 0)
@@ -686,7 +686,7 @@ bool BuildPose(const Player &player, Pose &pose)
 		pose.time = progress * source.duration;
 	} else if (action == Action::Attack && source.duration > AttackHitTime) {
 		// Align the game's action frame (the hit, AnimInfo frame _pAFNum - 1) with the clip's hit at 0.4 s.
-		const float frames = static_cast<float>(std::max<int>(player.AnimInfo.numberOfFrames, 2));
+		const float frames = static_cast<float>(std::max<int>(player.getDisplayedAnimation().numberOfFrames, 2));
 		const float hitFrame = std::clamp(static_cast<float>(player._pAFNum - 1), 1.0F, frames - 1.0F);
 		const float frame = progress * frames;
 		pose.time = frame < hitFrame
@@ -2455,8 +2455,8 @@ struct ViewModelState {
 ViewModelState ViewModelForPlayer(const Player &player, bool mirroredSwing)
 {
 	ViewModelState state;
-	float p = AnimationProgress(player.AnimInfo);
-	player_graphic graphic = player.getGraphic();
+	float p = AnimationProgress(player.getDisplayedAnimation());
+	player_graphic graphic = player.getDisplayedGraphic();
 	std::optional<SpellElement> forcedElement;
 	// Developer knob: DVL_VM_POSE=attack|backhand|block|hit|cast|cast_fire|cast_lightning|death|idle loops that
 	// viewmodel action every DVL_VM_PERIOD seconds (default 1.6); DVL_VM_PROGRESS=<p>[,<p>...] holds it at those
@@ -2505,7 +2505,7 @@ ViewModelState ViewModelForPlayer(const Player &player, bool mirroredSwing)
 	switch (graphic) {
 	case player_graphic::Attack: {
 		// The blade crosses the screen centre exactly at the hit (AnimInfo frame _pAFNum - 1).
-		const float frames = static_cast<float>(std::max<int>(player.AnimInfo.numberOfFrames, 2));
+		const float frames = static_cast<float>(std::max<int>(player.getDisplayedAnimation().numberOfFrames, 2));
 		const float hit = player._pmode == PM_ATTACK || player._pmode == PM_RATTACK ? std::clamp(static_cast<float>(player._pAFNum - 1) / frames, 0.25F, 0.8F) : 0.5F;
 		state.sword = SwordAttackPose(p, hit, mirroredSwing);
 		state.shield = Animate({ { 0.0F, ShieldIdle }, { hit, ShieldLowered }, { 1.0F, ShieldIdle } }, p);

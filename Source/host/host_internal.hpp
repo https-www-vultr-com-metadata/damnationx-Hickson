@@ -32,6 +32,7 @@ struct HostOptions {
 	std::string assetsDir; // --host-assets-dir: the game's own assets (devilutionx.mpq contents)
 	std::string hdDir;     // --host-hd-dir: the HD pack folder (default: found like the game finds it)
 	bool hdDisabled = false; // --host-no-hd: suppress every HD pack discovery path for this run
+	bool hideCursor = false; // --host-hide-cursor: never draw the game's cursor (clean recordings)
 };
 
 extern DVL_API_FOR_TEST HostOptions Options;

@@ -30,7 +30,9 @@
 #endif
 #include <windows.h>
 #else
+#if !defined(__ANDROID__) && !defined(__EMSCRIPTEN__)
 #include <execinfo.h>
+#endif
 #include <pthread.h>
 #endif
 
@@ -43,6 +45,7 @@
 #include "DiabloUI/diabloui.h"
 #include "appfat.h"
 #include "diablo.h"
+#include "dvlnet/async_runtime.h"
 #include "effects.h"
 #include "engine/dx.h"
 #include "engine/palette.h"
@@ -105,7 +108,7 @@ std::vector<HostSoundEvent> PendingSounds;
 int GameArgc = 0;
 char **GameArgv = nullptr;
 
-#ifdef _WIN32
+#if defined(_WIN32)
 HANDLE GameThread = nullptr;
 #else
 pthread_t GameThread {};
@@ -144,7 +147,7 @@ void RunGame()
 	FinishGameThread(status, /*abandoned=*/false);
 }
 
-#ifdef _WIN32
+#if defined(_WIN32)
 DWORD WINAPI GameThreadEntry(LPVOID)
 {
 	RunGame();
@@ -163,7 +166,7 @@ constexpr size_t GameThreadStackSize = 64U * 1024U * 1024U;
 
 bool CreateGameThread()
 {
-#ifdef _WIN32
+#if defined(_WIN32)
 	GameThread = CreateThread(nullptr, GameThreadStackSize, GameThreadEntry, nullptr, STACK_SIZE_PARAM_IS_A_RESERVATION, nullptr);
 	return GameThread != nullptr;
 #else
@@ -483,7 +486,8 @@ float VolumeGain(int volume)
 
 bool InGame()
 {
-	return gbRunGame && MyPlayer != nullptr && !MyPlayer->_pLvlChanging && ThreadRunning && !Finished;
+	return gbRunGame && MyPlayer != nullptr && !MyPlayer->_pLvlChanging && ThreadRunning && !Finished
+	    && !AsyncNetAwaitingInitialSnapshot();
 }
 
 // ---- hooks (game thread) ----
@@ -560,13 +564,16 @@ void OnGameQuit(int exitStatus)
 
 bool ShowFatalDialogs()
 {
-#ifndef _WIN32
+#if !defined(_WIN32) && !defined(__ANDROID__) && !defined(__EMSCRIPTEN__)
 	// Called when the game hits a fatal error (app_fatal, a failed assertion): log where it came from, the host keeps
 	// running and the player only sees the game's error dialog.
 	void *frames[64];
 	const int count = backtrace(frames, 64);
 	LogError("Embedded game: fatal error, stack:");
 	backtrace_symbols_fd(frames, count, 2);
+#elif defined(__ANDROID__)
+    // Bionic backtrace()/backtrace_symbols_fd() require API 33; Quest's supported floor is API 29.
+    LogError("Embedded game: fatal error (Android host)");
 #endif
 	return PresentedOnce;
 }
@@ -579,10 +586,22 @@ void QueueSfx(int16_t sfxId, bool positional, Point position)
 		return;
 	const bool cue = sfxId >= static_cast<int16_t>(SfxID::AccessibilityWeapon) && sfxId <= static_cast<int16_t>(SfxID::AccessibilityInteract);
 	const int userVolume = cue ? *GetOptions().Audio.audioCuesVolume : *GetOptions().Audio.soundVolume;
+	const int survivorsSpellAttenuation = SurvivorsSpellSfxAttenuation(static_cast<SfxID>(sfxId));
+	if (survivorsSpellAttenuation < 0 && static_cast<size_t>(sfxId) < 4096) {
+		// The host can otherwise layer many identical automatic impact samples
+		// in one frame. Audio-only admission does not change combat simulation.
+		static std::array<uint32_t, 4096> nextSpellSoundAt { };
+		const uint32_t now = GameClockMs();
+		uint32_t &next = nextSpellSoundAt[static_cast<size_t>(sfxId)];
+		if (now < next)
+			return;
+		next = now + 90;
+	}
 	int attenuation = 0;
 	if (positional && !PositionalAttenuation(position, attenuation))
 		return;
-	HostSoundEvent event = MakeSound(static_cast<uint32_t>(sfxId), GainOf(attenuation + userVolume));
+	HostSoundEvent event = MakeSound(static_cast<uint32_t>(sfxId),
+	    GainOf(attenuation + userVolume + survivorsSpellAttenuation));
 	if (positional) {
 		event.x = static_cast<float>(position.x) + 0.5F;
 		event.y = static_cast<float>(position.y) + 0.5F;
@@ -658,6 +677,11 @@ void StopStream(int16_t sfxId)
 	HostSoundEvent event = MakeSound(static_cast<uint32_t>(sfxId), 0.0F);
 	event.stop = 1;
 	PushSound(event);
+}
+
+bool HideGameCursor()
+{
+	return Options.hideCursor;
 }
 
 bool TakeAutoStart()

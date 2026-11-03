@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <cstdlib>
+#include <cmath>
 #include <cstring>
 #include <string_view>
 #include <deque>
@@ -32,6 +33,7 @@
 #include "levels/tile_properties.hpp"
 #include "monster.h"
 #include "objects.h"
+#include "options.h"
 #include "player.h"
 #include "towners.h"
 #include "utils/log.hpp"
@@ -364,6 +366,51 @@ bool SelectTownerNear(Point tile)
 
 } // namespace
 
+void HostSetChaseSettings(float distance, uint32_t style)
+{
+	if (!IsActive() || !std::isfinite(distance))
+		return;
+	auto &graphics = GetOptions().Graphics;
+	graphics.thirdPersonDistance.SetValue(static_cast<int>(std::lround(std::clamp(distance, 0.8F, 6.0F) * 10.0F)));
+	graphics.thirdPersonStyle.SetValue(style == 1 ? ThirdPersonStyle::Orbit : ThirdPersonStyle::OverShoulder);
+}
+
+void HostSetCameraSettings(const HostCameraSettings &settings)
+{
+	if (!IsActive() || !std::isfinite(settings.horizontalFov) || !std::isfinite(settings.sensitivity)
+	    || !std::isfinite(settings.thirdPersonDistance))
+		return;
+	auto &options = GetOptions();
+	options.Graphics.fpvFieldOfView.SetValue(static_cast<int>(std::lround(std::clamp(settings.horizontalFov, 60.0F, 110.0F))));
+	options.Gameplay.fpvMouseSensitivity.SetValue(static_cast<int>(std::lround(std::clamp(settings.sensitivity, 1.0F, 20.0F))));
+	options.Graphics.fpvHeadBob.SetValue((settings.flags & 1) != 0);
+	options.Graphics.fpvFullBody.SetValue((settings.flags & 2) != 0);
+	options.Gameplay.fpvInvertMouseY.SetValue((settings.flags & 4) != 0);
+	options.Graphics.fpvWeapon.SetValue((settings.flags & 8) != 0);
+	HostSetChaseSettings(settings.thirdPersonDistance, settings.thirdPersonStyle);
+}
+
+void HostSetCameraMode(uint32_t mode)
+{
+	if (IsActive())
+		GetOptions().Graphics.cameraMode.SetValue(static_cast<CameraMode>(std::min(mode, 2U)));
+}
+
+uint32_t HostBoundKey(uint32_t action)
+{
+	if (action == 0)
+		return SDLK_ESCAPE;
+	constexpr std::string_view Names[] = { "Inventory", "FirstPersonInteract", "Character", "SpellBook",
+		"UseHealthPotion", "UseManaPotion", "ToggleAutomap", "DisplaySpells" };
+	return action <= std::size(Names) ? GetOptions().Keymapper.KeyForAction(Names[action - 1]) : 0;
+}
+
+void HostSetViewControl(const HostViewControl &control)
+{
+	if (IsActive() && HostApiVersionInUse() >= 6)
+		fpv::SetHostViewControl(control);
+}
+
 void ApplyInput(const HostInputFrame &input)
 {
 	// DAMNATIONX_TRACE_INPUT=1: log every key, button and text the host sends (debugging hosts).
@@ -390,6 +437,8 @@ void ApplyInput(const HostInputFrame &input)
 		HostToggleRun();
 	if (HostApiVersionInUse() >= 5 && (input.inputFlags & kInputToggleFirstPerson) != 0 && InGame())
 		fpv::ToggleFirstPerson();
+	if (HostApiVersionInUse() >= 6 && (input.inputFlags & kInputCycleCameraMode) != 0 && InGame())
+		fpv::CycleCameraMode();
 
 	if (input.pointerX != LastPointerX || input.pointerY != LastPointerY) {
 		PushMouseMotion(input.pointerX, input.pointerY);
@@ -440,6 +489,7 @@ void ApplyInput(const HostInputFrame &input)
 
 void ReleaseInput()
 {
+	fpv::SetHostViewControl({});
 	ReleaseGamepad();
 	Pick = {};
 	NoWorldPick = false;

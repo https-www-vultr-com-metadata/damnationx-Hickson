@@ -193,6 +193,8 @@ void CheckInvSwap(Player &player, const Item &item, int invGridIndex);
 void CheckInvRemove(Player &player, int invGridIndex);
 void TransferItemToStash(Player &player, int location);
 void CheckInvItem(bool isShiftHeld = false, bool isCtrlHeld = false);
+/** Execute the ordinary inventory-to-equipment swap for an authority-validated item. */
+bool SurvivorsEquipInventoryItem(Player &player, unsigned index, uint32_t seed);
 
 /**
  * Check for interactions with belt

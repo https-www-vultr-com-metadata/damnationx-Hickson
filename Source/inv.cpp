@@ -1,3 +1,4 @@
+#include "dvlnet/async_runtime.h"
 /**
  * @file inv.cpp
  *
@@ -24,6 +25,7 @@
 #include "engine/backbuffer_state.hpp"
 #include "engine/clx_sprite.hpp"
 #include "engine/load_cel.hpp"
+#include "engine/path.h"
 #include "engine/render/hd_ui_hooks.hpp"
 #include "engine/palette.h"
 #include "engine/render/clx_render.hpp"
@@ -41,6 +43,7 @@
 #include "qol/stash.h"
 #include "qol/visual_store.h"
 #include "stores.h"
+#include "survivors.h"
 #include "towners.h"
 #include "utils/display.h"
 #include "utils/format.hpp"
@@ -618,7 +621,7 @@ void CheckInvPaste(Player &player, Point cursorPosition)
 
 	CalcPlrInv(player, true);
 	if (&player == MyPlayer) {
-		NewCursor(player.HoldItem);
+		if (&player == MyPlayer) NewCursor(player.HoldItem);
 	}
 }
 
@@ -1647,10 +1650,33 @@ void TransferItemToStash(Player &player, int location)
 		player.RemoveSpdBarItem(location - INVITEM_BELT_FIRST);
 }
 
+bool SurvivorsEquipInventoryItem(Player &player, unsigned index, uint32_t seed)
+{
+	if (index >= static_cast<unsigned>(player._pNumInv) || !player.HoldItem.isEmpty()
+	    || player.InvList[index]._iSeed != seed || !player.InvList[index].isEquipment()) return false;
+	// Eligibility belongs to the authoritative player, not a stale UI flag
+	// from the client's last inventory snapshot.
+	player.InvList[index]._iStatFlag = player.CanUseItem(player.InvList[index]);
+	if (!player.InvList[index]._iStatFlag) return false;
+	for (unsigned cell = 0; cell < InventoryGridCells; ++cell) {
+		if (std::abs(player.InvGrid[cell]) != static_cast<int>(index + 1)) continue;
+		const Point point = GetRightPanel().position + Displacement { InvRect[SLOTXY_INV_FIRST + cell].position.x + 1, InvRect[SLOTXY_INV_FIRST + cell].position.y + 1 };
+		CheckInvCut(player, point, true, false);
+		return true;
+	}
+	return false;
+}
+
 void CheckInvItem(bool isShiftHeld, bool isCtrlHeld)
 {
 	if (IsInspectingPlayer())
 		return;
+	if (IsSurvivorsMode() && IsVisualStoreOpen && isShiftHeld && MyPlayer->HoldItem.isEmpty()
+	    && pcursinvitem >= INVITEM_INV_FIRST && pcursinvitem <= INVITEM_INV_LAST) {
+		const int index = pcursinvitem - INVITEM_INV_FIRST;
+		if (index < MyPlayer->_pNumInv) SellItemToVisualStore(index);
+		return;
+	}
 	if (!MyPlayer->HoldItem.isEmpty()) {
 		CheckInvPaste(*MyPlayer, MousePosition);
 	} else if (IsStashOpen && isCtrlHeld) {
@@ -1671,6 +1697,7 @@ void CheckInvScrn(bool isShiftHeld, bool isCtrlHeld)
 
 void InvGetItem(Player &player, int ii)
 {
+	if (!SurvivorsCanTransferCoopGround(player.getId())) return;
 	Item &item = Items[ii];
 	CloseGoldDrop();
 
@@ -1689,6 +1716,16 @@ void InvGetItem(Player &player, int ii)
 		}
 	} else {
 		// The item needs to go into the players hand
+		if (IsSurvivorsMode() && AsyncNetEnabled() && AsyncNetIsAuthority() && !player.HoldItem.isEmpty()) {
+			// The authority owns both sides of this swap. Async networking does
+			// not relay CMD_SYNCPUTITEM, so drop the old held item here before
+			// replacing it; the next ledger barrier journals both ground changes.
+			if (ActiveItemCount >= MAXITEMS) return;
+			const auto tile = FindClosestValidPosition(ItemSpaceOk, player.position.tile, 1, 50);
+			if (!tile) return;
+			PlaceItemInWorld(std::move(player.HoldItem), *tile);
+			player.HoldItem.clear();
+		}
 		if (MyPlayer == &player && !player.HoldItem.isEmpty()) {
 			// drop whatever the player is currently holding
 			NetSendCmdPItem(true, CMD_SYNCPUTITEM, player.position.tile, player.HoldItem);
@@ -1696,7 +1733,7 @@ void InvGetItem(Player &player, int ii)
 
 		// need to copy here instead of move so CleanupItems still has access to the position
 		player.HoldItem = item;
-		NewCursor(player.HoldItem);
+		if (&player == MyPlayer) NewCursor(player.HoldItem);
 	}
 
 	// This potentially moves items in memory so must be done after we've made a copy
@@ -1741,6 +1778,7 @@ std::optional<Point> FindAdjacentPositionForItem(Point origin, Direction facing)
 
 void AutoGetItem(Player &player, Item *itemPointer, int ii)
 {
+	if (!SurvivorsCanTransferCoopGround(player.getId())) return;
 	Item &item = *itemPointer;
 
 	CloseGoldDrop();
@@ -2093,6 +2131,8 @@ Item &GetInventoryItem(Player &player, int location)
 
 bool UseInvItem(int cii)
 {
+	if (AsyncNetUseInventoryItem(static_cast<unsigned>(cii)))
+		return true;
 	if (IsInspectingPlayer())
 		return false;
 
@@ -2246,7 +2286,7 @@ void CloseStash()
 
 	Player &myPlayer = *MyPlayer;
 	if (!myPlayer.HoldItem.isEmpty()) {
-		std::optional<Point> itemTile = FindAdjacentPositionForItem(myPlayer.position.future, myPlayer._pdir);
+		std::optional<Point> itemTile = SurvivorsGroundTransferBlocked() ? std::nullopt : FindAdjacentPositionForItem(myPlayer.position.future, myPlayer._pdir);
 		if (itemTile) {
 			NetSendCmdPItem(true, CMD_PUTITEM, *itemTile, myPlayer.HoldItem);
 		} else {

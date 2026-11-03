@@ -1,3 +1,4 @@
+#include "host/host_frontend.hpp"
 #include "DiabloUI/hero/selhero.h"
 
 #include <algorithm>
@@ -19,6 +20,7 @@
 #include "DiabloUI/diabloui.h"
 #include "DiabloUI/dialogs.h"
 #include "DiabloUI/multi/selgame.h"
+#include "survivors.h"
 #include "DiabloUI/scrollbar.h"
 #include "DiabloUI/selok.h"
 #include "DiabloUI/selyesno.h"
@@ -97,6 +99,7 @@ void SelheroFree()
 
 void SelheroSetStats()
 {
+	host::SetFrontendHero(static_cast<uint32_t>(selhero_heroInfo.heroclass), selhero_heroInfo.level, selhero_heroInfo.name);
 	SELHERO_DIALOG_HERO_IMG->setSprite(UiGetHeroDialogSprite(static_cast<size_t>(selhero_heroInfo.heroclass)));
 	CopyUtf8(textStats[0], StrCat(selhero_heroInfo.level), sizeof(textStats[0]));
 	CopyUtf8(textStats[1], StrCat(selhero_heroInfo.strength), sizeof(textStats[1]));
@@ -369,7 +372,7 @@ void SelheroLoadSelect(size_t value)
 		return;
 	}
 
-	if (!selhero_isMultiPlayer) {
+	if (!selhero_isMultiPlayer && !IsSurvivorsMode()) {
 		// This is part of a dangerous hack to enable difficulty selection in single-player.
 		// FIXME: Dialogs should not refer to each other's variables.
 
@@ -578,6 +581,7 @@ static void UiSelHeroDialog(
     uint32_t *saveNumber,
     bool (*autoContinue)())
 {
+	host::FrontendScope frontendScope(2);
 	do {
 		gfnHeroInfo = fninfo;
 		gfnHeroCreate = fncreate;

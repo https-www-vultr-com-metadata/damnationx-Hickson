@@ -1,3 +1,4 @@
+#include "dvlnet/async_runtime.h"
 /**
  * @file diablo.cpp
  *
@@ -44,6 +45,8 @@
 #include "DiabloUI/diabloui.h"
 #include "controls/control_mode.hpp"
 #include "controls/keymapper.hpp"
+#include "controls/padmapper.hpp"
+#include "controls/controller_motion.h"
 #include "controls/plrctrls.h"
 #include "controls/remap_keyboard.h"
 #include "diablo.h"
@@ -113,6 +116,7 @@
 #include "panels/spell_book.hpp"
 #include "panels/spell_list.hpp"
 #include "pfile.h"
+#include "survivors.h"
 #include "plrmsg.h"
 #include "qol/chatlog.h"
 #include "qol/floatingnumbers.h"
@@ -201,7 +205,7 @@ constexpr auto ZoomWheelModifiers = SDL_KMOD_CTRL | SDL_KMOD_GUI;
 constexpr auto ZoomWheelModifiers = SDL_KMOD_CTRL;
 #endif
 
-#ifdef __EMSCRIPTEN__
+#if defined(__EMSCRIPTEN__) && !defined(DAMNATIONX_HOST_LIB)
 // The browser bootstrap owns asynchronous WebGPU/import gates. Keep the game
 // thread cooperative until it reports that play is safe to begin.
 bool BrowserLaunchReady()
@@ -290,9 +294,19 @@ void FreeGame()
 
 bool ProcessInput()
 {
+	ProcessSurvivorsPlaytestInput();
 	if (CompanionHeadless()) return PauseMode != 2; // Bridge commands drive headless clients; no empty-device movement cancellation.
+#ifdef DAMNATION_S1_BRIDGE
+	if (s1_headless::Rendered()) return PauseMode != 2;
+#endif
 	if (PauseMode == 2) {
 		return false;
+	}
+
+	// Modal run choices freeze all movement, including held freeform WASD input.
+	if (!IsVisualStoreOpen && (IsSurvivorsUpgradePending() || IsSurvivorsRunFinished() || IsSurvivorsTransitionPending())) {
+		RedrawViewport();
+		return gbIsMultiplayer || !gmenu_is_active();
 	}
 
 	plrctrls_every_frame();
@@ -418,7 +432,7 @@ void LeftMouseDown(uint16_t modState)
 	if (sgnTimeoutCurs != CURSOR_NONE)
 		return;
 
-	if (MyPlayerIsDead) {
+	if (MyPlayerIsDead && !IsVisualStoreOpen) {
 		CheckMainPanelButtonDead();
 		return;
 	}
@@ -477,7 +491,7 @@ void LeftMouseDown(uint16_t modState)
 					// First person: dropped items land in front of the camera, whatever the cursor points at.
 					const Direction dropDirection = fpv::DropDirection().value_or(GetDirection(currentPosition, cursPosition));
 					std::optional<Point> itemTile = FindAdjacentPositionForItem(currentPosition, dropDirection);
-					if (itemTile) {
+					if (itemTile && !SurvivorsGroundTransferBlocked()) {
 						NetSendCmdPItem(true, CMD_PUTITEM, *itemTile, MyPlayer->HoldItem);
 						NewCursor(CURSOR_HAND);
 					}
@@ -521,7 +535,7 @@ void RightMouseDown(bool isShiftHeld)
 {
 	LastPlayerAction = PlayerActionType::None;
 
-	if (gmenu_is_active() || sgnTimeoutCurs != CURSOR_NONE || PauseMode == 2 || MyPlayer->_pInvincible) {
+	if (gmenu_is_active() || sgnTimeoutCurs != CURSOR_NONE || PauseMode == 2 || (MyPlayer->_pInvincible && !IsVisualStoreOpen)) {
 		return;
 	}
 
@@ -545,6 +559,19 @@ void RightMouseDown(bool isShiftHeld)
 		return;
 	if (TryIconCurs())
 		return;
+	// Survivors uses right-click to equip inventory gear. Reuse the regular
+	// shift-click swap path, which checks room for displaced equipment first.
+	// The authoritative multiplayer inventory protocol does not yet support
+	// this shortcut, so leave its existing command path untouched.
+	if (IsSurvivorsMode() && (!gbIsMultiplayer || AsyncNetEnabled()) && invflag && pcurs == CURSOR_HAND
+	    && pcursinvitem >= INVITEM_INV_FIRST && pcursinvitem <= INVITEM_INV_LAST) {
+		const int index = pcursinvitem - INVITEM_INV_FIRST;
+		if (index < MyPlayer->_pNumInv && MyPlayer->InvList[index].isEquipment()) {
+			if (AsyncNetSurvivorsEquip(index, MyPlayer->InvList[index]._iSeed)) return;
+			CheckInvItem(true, false);
+			return;
+		}
+	}
 	if (pcursinvitem != -1 && UseInvItem(pcursinvitem))
 		return;
 	if (pcursstashitem != StashStruct::EmptyCell && UseStashItem(pcursstashitem))
@@ -590,12 +617,78 @@ void PressKey(SDL_Keycode vkey, uint16_t modState)
 
 	if (vkey == SDLK_UNKNOWN)
 		return;
+	if (vkey == SDLK_N && !gmenu_is_active() && !IsSurvivorsUpgradePending() && RequestSurvivorsSectorTravel()) return;
+	if (vkey == SDLK_B && IsSurvivorsMode() && (!gbIsMultiplayer || AsyncNetEnabled()) && IsVisualStoreOpen) {
+		ToggleSurvivorsBuyback();
+		RedrawEverything();
+		return;
+	}
+	if (IsSurvivorsMode() && (!gbIsMultiplayer || AsyncNetEnabled()) && !IsSurvivorsUpgradePending()
+	    && !IsSurvivorsTransitionPending() && !gmenu_is_active()
+	    && vkey == SDLK_V && MyPlayer != nullptr && (MyPlayer->_pHitPoints > 0 || (!gbIsMultiplayer && IsSurvivorsRunFinished()))) {
+		if (IsVisualStoreOpen) {
+			if (MyPlayer->HoldItem.isEmpty()) {
+				CloseVisualStore();
+				if (IsSurvivorsCampShop()) {
+					ReturnToMainMenu = true;
+					gamemenu_exit_game(false);
+				}
+			}
+		} else if (MyPlayer->HoldItem.isEmpty()) {
+			if (!gbIsMultiplayer && (!pfile_survivors_inventory_available() || !pfile_save_survivors_inventory())) {
+				EventPlrMsg("Survivors gear could not be saved. Check the save files before shopping.");
+				return;
+			}
+			CloseCharPanel();
+			CloseStash();
+			QuestLogIsOpen = false;
+			SpellbookFlag = false;
+			OpenVisualStore(VisualStoreVendor::Smith);
+		}
+		RedrawEverything();
+		return;
+	}
+	if (IsSurvivorsCampShop() && IsVisualStoreOpen && vkey == SDLK_ESCAPE) {
+		if (MyPlayer->HoldItem.isEmpty()) {
+			CloseVisualStore();
+			ReturnToMainMenu = true;
+			gamemenu_exit_game(false);
+		}
+		return;
+	}
+
+	if (!gmenu_is_active() && !IsVisualStoreOpen && (IsSurvivorsUpgradePending() || IsSurvivorsRunFinished())) {
+		if (IsSurvivorsRunFinished() && vkey == SDLK_ESCAPE) {
+			ReturnToMainMenu = true;
+			gamemenu_exit_game(false);
+			return;
+		}
+		if (IsSurvivorsUpgradePending() && vkey >= SDLK_1 && vkey <= SDLK_3) {
+			const unsigned choice = static_cast<unsigned>(vkey - SDLK_1);
+			if ((modState & SDL_KMOD_SHIFT) != 0)
+				BanishSurvivorsUpgrade(choice);
+			else
+				ChooseSurvivorsUpgrade(choice);
+			return;
+		}
+		if (IsSurvivorsUpgradePending() && vkey == SDLK_R) {
+			RerollSurvivorsUpgrades();
+			return;
+		}
+		if (IsSurvivorsUpgradePending() && vkey == SDLK_SPACE) {
+			SkipSurvivorsUpgrade();
+			return;
+		}
+		// The overlay is modal; Escape still opens the game menu.
+		if (vkey != SDLK_ESCAPE)
+			return;
+	}
 
 	if (gmenu_presskeys(vkey) || CheckKeypress(vkey)) {
 		return;
 	}
 
-	if (MyPlayerIsDead) {
+	if (MyPlayerIsDead && !IsVisualStoreOpen) {
 		if (vkey == SDLK_ESCAPE) {
 			if (!gbIsMultiplayer) {
 				if (gbValidSaveFile)
@@ -760,6 +853,23 @@ void PressKey(SDL_Keycode vkey, uint16_t modState)
 
 void HandleMouseButtonDown(Uint8 button, uint16_t modState)
 {
+	if (!gmenu_is_active() && !IsVisualStoreOpen && (IsSurvivorsUpgradePending() || IsSurvivorsRunFinished())) {
+		LastPlayerAction = PlayerActionType::None;
+		sgbMouseDown = CLICK_NONE;
+		if (button == SDL_BUTTON_LEFT && IsSurvivorsUpgradePending()) {
+			const int action = static_cast<int>(SurvivorsUpgradeActionAt(MousePosition, { GetUiWidth(), GetUiHeight() }));
+			if (action >= 0 && action < 3) ChooseSurvivorsUpgrade(static_cast<unsigned>(action));
+			else if (action == 3) RerollSurvivorsUpgrades();
+			else if (action == 4) SkipSurvivorsUpgrade();
+			else if (action >= 5 && action <= 7) BanishSurvivorsUpgrade(static_cast<unsigned>(action - 5));
+		}
+		if (button == SDL_BUTTON_RIGHT && IsSurvivorsUpgradePending()) {
+			const int choice = SurvivorsUpgradeChoiceAt(MousePosition, { GetUiWidth(), GetUiHeight() });
+			if (choice >= 0)
+				BanishSurvivorsUpgrade(static_cast<unsigned>(choice));
+		}
+		return;
+	}
 	if (IsPlayerInStore() && (button == SDL_BUTTON_X1
 #if !SDL_VERSION_ATLEAST(2, 0, 0)
 	        || button == 8
@@ -790,6 +900,11 @@ void HandleMouseButtonDown(Uint8 button, uint16_t modState)
 
 void HandleMouseButtonUp(Uint8 button, uint16_t modState)
 {
+	if (!gmenu_is_active() && !IsVisualStoreOpen && (IsSurvivorsUpgradePending() || IsSurvivorsRunFinished())) {
+		LastPlayerAction = PlayerActionType::None;
+		sgbMouseDown = CLICK_NONE;
+		return;
+	}
 	if (sgbMouseDown == CLICK_LEFT && button == SDL_BUTTON_LEFT) {
 		LastPlayerAction = PlayerActionType::None;
 		sgbMouseDown = CLICK_NONE;
@@ -824,6 +939,38 @@ void GameEventHandler(const SDL_Event &event, uint16_t modState)
 {
 	[[maybe_unused]] const Options &options = GetOptions();
 	StaticVector<ControllerButtonEvent, 4> ctrlEvents = ToControllerButtonEvents(event);
+	if (!gmenu_is_active() && !IsVisualStoreOpen && (IsSurvivorsUpgradePending() || IsSurvivorsRunFinished())) {
+		LastPlayerAction = PlayerActionType::None;
+		ControllerActionHeld = GameActionType_NONE;
+		sgbMouseDown = CLICK_NONE;
+		for (const ControllerButtonEvent ctrlEvent : ctrlEvents) {
+			if (ctrlEvent.button == ControllerButton_NONE)
+				continue;
+			if (ctrlEvent.up) {
+				PadmapperRelease(ctrlEvent.button, /*invokeAction=*/false);
+			} else if (ctrlEvent.button == ControllerButton_BUTTON_START
+			    || (IsSurvivorsRunFinished() && (ctrlEvent.button == ControllerButton_BUTTON_A || ctrlEvent.button == ControllerButton_BUTTON_B))) {
+				PressKey(SDLK_ESCAPE, modState);
+			} else if (ctrlEvent.button == ControllerButton_BUTTON_A) {
+				ChooseSurvivorsUpgrade(0);
+			} else if (ctrlEvent.button == ControllerButton_BUTTON_X) {
+				ChooseSurvivorsUpgrade(1);
+			} else if (ctrlEvent.button == ControllerButton_BUTTON_Y) {
+				ChooseSurvivorsUpgrade(2);
+			} else if (ctrlEvent.button == ControllerButton_BUTTON_B) {
+				SkipSurvivorsUpgrade();
+			} else if (ctrlEvent.button == ControllerButton_BUTTON_RIGHTSHOULDER) {
+				RerollSurvivorsUpgrades();
+			}
+			return;
+		}
+		if (IsControllerMotion(event))
+			return;
+#if SDL_VERSION_ATLEAST(2, 0, 0)
+		if (event.type == SDL_EVENT_MOUSE_WHEEL)
+			return;
+#endif
+	}
 	for (const ControllerButtonEvent ctrlEvent : ctrlEvents) {
 		GameAction action;
 		if (HandleControllerButtonEvent(event, ctrlEvent, action) && action.type == GameActionType_SEND_KEY) {
@@ -863,13 +1010,22 @@ void GameEventHandler(const SDL_Event &event, uint16_t modState)
 
 	switch (event.type) {
 	case SDL_EVENT_KEY_DOWN:
+		if (IsSurvivorsUpgradePending()) {
+			// A queued Shift release may already have changed SDL_GetModState.
+			// Draft shortcuts use the modifiers belonging to this key event.
+#ifdef USE_SDL3
+			modState = event.key.mod;
+#else
+			modState = event.key.keysym.mod;
+#endif
+		}
 		PressKey(SDLC_EventKey(event), modState);
 		return;
 	case SDL_EVENT_KEY_UP:
 		ReleaseKey(SDLC_EventKey(event));
 		return;
 	case SDL_EVENT_MOUSE_MOTION:
-		if (fpv::HandleMouseMotion(event))
+		if (!IsSurvivorsUpgradePending() && !IsSurvivorsRunFinished() && fpv::HandleMouseMotion(event))
 			return; // first-person mouselook turns the camera; the cursor stays on the crosshair
 		if (ControlMode == ControlTypes::KeyboardAndMouse && invflag)
 			InvalidateInventorySlot();
@@ -877,14 +1033,14 @@ void GameEventHandler(const SDL_Event &event, uint16_t modState)
 		gmenu_on_mouse_move();
 		return;
 	case SDL_EVENT_MOUSE_BUTTON_DOWN:
-		if (!fpv::IsMouseLook())
+		if (!fpv::IsMouseLook() || IsSurvivorsUpgradePending() || IsSurvivorsRunFinished())
 			SetMousePositionFromScreen({ SDLC_EventButtonIntX(event), SDLC_EventButtonIntY(event) });
-		if (fpv::HandleMouseDown(MousePosition))
+		if (!IsSurvivorsUpgradePending() && !IsSurvivorsRunFinished() && fpv::HandleMouseDown(MousePosition))
 			return; // browser: this click only takes the pointer lock back
 		HandleMouseButtonDown(event.button.button, modState);
 		return;
 	case SDL_EVENT_MOUSE_BUTTON_UP:
-		if (!fpv::IsMouseLook())
+		if (!fpv::IsMouseLook() || IsSurvivorsUpgradePending() || IsSurvivorsRunFinished())
 			SetMousePositionFromScreen({ SDLC_EventButtonIntX(event), SDLC_EventButtonIntY(event) });
 		HandleMouseButtonUp(event.button.button, modState);
 		return;
@@ -982,7 +1138,7 @@ void RunGameLoop(interface_mode uMsg)
 #endif
 
 	while (gbRunGame) {
-#ifdef __EMSCRIPTEN__
+#if defined(__EMSCRIPTEN__) && !defined(DAMNATIONX_HOST_LIB)
 		if (!BrowserLaunchReady()) {
 			emscripten_sleep(16);
 			continue;
@@ -1056,6 +1212,17 @@ void RunGameLoop(interface_mode uMsg)
 #endif
 	}
 
+	if (IsSurvivorsMode() && gbIsMultiplayer && AsyncNetEnabled() && AsyncNetIsAuthority()
+	    && !SurvivorsCommitCoopLedgers()) {
+		EventPlrMsg("Cooperative gear could not be saved before leaving. Check the shared save folder.");
+	}
+	if (IsSurvivorsMode() && !gbIsMultiplayer && MyPlayer != nullptr) {
+		// The native hero archive has no cursor-item field. Put it back before
+		// writing rather than silently leaving it out of the saved inventory.
+		if (!MyPlayer->HoldItem.isEmpty() && AutoPlaceItemInInventory(*MyPlayer, MyPlayer->HoldItem))
+			MyPlayer->HoldItem.clear();
+		pfile_save_survivors_inventory();
+	}
 	fpv::OnGameEnd();
 	TransitionTo(ApplicationState::Shutdown);
 	demo::NotifyGameLoopEnd();
@@ -1640,7 +1807,9 @@ std::expected<void, std::string> LoadAllGFX()
  */
 void CreateLevel(lvl_entry entry)
 {
-	CreateDungeon(DungeonSeeds[currlevel], entry);
+	const uint32_t levelSeed = SurvivorsLevelSeed(DungeonSeeds[currlevel]);
+	CreateDungeon(levelSeed, entry);
+	ViewPosition = SurvivorsSectorArrival(ViewPosition, levelSeed);
 
 	switch (leveltype) {
 	case DTYPE_TOWN:
@@ -1722,7 +1891,37 @@ void UpdateMonsterLights()
 
 void GameLogic()
 {
+	AsyncNetBeforeTick();
 	if (!ProcessInput()) {
+		return;
+	}
+	if (IsSurvivorsCampShop()) {
+		if (!IsVisualStoreOpen && MyPlayer != nullptr) {
+			if (!pfile_survivors_inventory_available() || !pfile_save_survivors_inventory()) {
+				EventPlrMsg("Survivors gear could not be saved. Check the save files before shopping.");
+				ReturnToMainMenu = true;
+				gamemenu_exit_game(false);
+			} else {
+				OpenVisualStore(VisualStoreVendor::Smith);
+				RedrawEverything();
+			}
+		}
+		RedrawViewport();
+		return;
+	}
+	if (IsSurvivorsMode() && !gbIsMultiplayer && IsVisualStoreOpen) {
+		RedrawViewport();
+		return;
+	}
+	ProcessSurvivorsMode();
+	if (!AsyncNetSimulateWorld()) {
+		AsyncNetPredictLocalPlayer();
+		RedrawViewport();
+		return;
+	}
+	if (ShouldPauseSurvivorsSimulation()) {
+		AsyncNetAfterTick();
+		RedrawViewport();
 		return;
 	}
 	if (gbProcessPlayers) {
@@ -1760,12 +1959,15 @@ void GameLogic()
 #endif
 
 	sound_update();
-	CheckTriggers();
-	CheckQuests();
+	if (!IsSurvivorsMode()) {
+		CheckTriggers();
+		CheckQuests();
+	}
 	RedrawViewport();
 	pfile_update(false);
 
 	if (!CompanionHeadless()) plrctrls_after_game_logic();
+	AsyncNetAfterTick();
 }
 
 void TimeoutCursor(bool bTimeout)
@@ -3008,7 +3210,19 @@ bool StartGame(bool bNewGame, bool bSinglePlayer)
 		if (gbValidSaveFile && gbLoadGame) {
 			uMsg = WM_DIABLOADGAME;
 		}
+		if (IsSurvivorsMode()) {
+			// Enter the cathedral directly with a fresh, unsaved hero.
+			gbLoadGame = false;
+			gbValidSaveFile = false;
+			uMsg = WM_DIABNEWGAME;
+			currlevel = 1;
+			leveltype = DTYPE_CATHEDRAL;
+			MyPlayer->setLevel(currlevel);
+		}
 		RunGameLoop(uMsg);
+		FinalizeSurvivorsRun();
+		if (IsSurvivorsMode() && gbRunGameResult)
+			ReturnToMainMenu = true;
 		NetClose();
 		UnloadFonts();
 
@@ -3216,12 +3430,12 @@ int DiabloMain(int argc, char **argv)
 	if (!demo::IsRunning()) SaveOptions();
 
 #ifdef DAMNATION_S1_BRIDGE
-	if (HeadlessMode) {
+	if (HeadlessMode || s1_headless::Rendered()) {
 		if (!s1_headless::PrepareHero()) {
 			DiabloDeinit();
 			return 1;
 		}
-		StartGame(true, false);
+		StartGame(true, s1_headless::Solo());
 		if (!s1_headless::ConnectionEstablished()) {
 			DiabloDeinit();
 			return 1;
@@ -3548,7 +3762,7 @@ void LoadGameLevelFirstFlagEntry()
 
 void LoadGameLevelStores()
 {
-	if (leveltype == DTYPE_TOWN) {
+	if (leveltype == DTYPE_TOWN || (IsSurvivorsMode() && (!gbIsMultiplayer || AsyncNetIsAuthority()))) {
 		SetupTownStores();
 	} else {
 		FreeStoreMem();
@@ -3662,6 +3876,9 @@ void LoadGameLevelSetVisited()
 
 std::expected<void, std::string> LoadGameLevelTown(bool firstflag, lvl_entry lvldir, const Player &myPlayer)
 {
+	// Town has no objects. Without this the previous level's (dungeon or Survivors
+	// scenery) stay active and the host snapshot reads their freed graphics.
+	ClearObjects();
 	for (int i = 0; i < MAXDUNX; i++) { // NOLINT(modernize-loop-convert)
 		for (int j = 0; j < MAXDUNY; j++) {
 			dFlags[i][j] |= DungeonFlag::Lit;
@@ -3743,6 +3960,11 @@ std::expected<void, std::string> LoadGameLevelSetLevel(bool firstflag, lvl_entry
 
 std::expected<void, std::string> LoadGameLevelStandardLevel(bool firstflag, lvl_entry lvldir, const Player &myPlayer)
 {
+	if (IsSurvivorsMode()) {
+		// Act arenas have their own guardians and no campaign quest set pieces.
+		for (Quest &quest : Quests)
+			quest._qactive = QUEST_NOTAVAIL;
+	}
 	CreateLevel(lvldir);
 
 	IncProgress();
@@ -3881,7 +4103,8 @@ std::expected<void, std::string> LoadGameLevel(bool firstflag, lvl_entry lvldir)
 	}
 
 	// Full loads restore saved missiles/lights first, then rebuild the free endpoint once.
-	SyncPortals(lvldir != ENTRY_LOAD);
+	if (!IsSurvivorsMode())
+		SyncPortals(lvldir != ENTRY_LOAD);
 	LoadGameLevelSyncPlayerEntry(lvldir);
 
 	IncProgress();
@@ -3914,6 +4137,7 @@ std::expected<void, std::string> LoadGameLevel(bool firstflag, lvl_entry lvldir)
 	CompleteProgress();
 
 	LoadGameLevelCalculateCursor();
+	SurvivorsLevelLoaded();
 	return {};
 }
 

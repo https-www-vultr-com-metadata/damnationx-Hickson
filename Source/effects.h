@@ -29,6 +29,8 @@ bool effect_is_playing(SfxID nSFX);
 void stream_stop();
 void PlaySFX(SfxID psfx);
 void PlaySfxLoc(SfxID psfx, Point position, bool randomizeByCategory = true);
+/** Extra hundredths-of-dB attenuation for repeated Survivors spell effects. */
+int SurvivorsSpellSfxAttenuation(SfxID id);
 void sound_stop();
 void sound_update();
 void effects_cleanup_sfx(bool fullUnload = true);

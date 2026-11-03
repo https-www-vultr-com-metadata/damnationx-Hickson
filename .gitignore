@@ -75,6 +75,7 @@ x64/
 x86/
 bld/
 [Bb]in/
+!tools/d2r-converter/src/bin/
 [Oo]bj/
 [Ll]og/
 WinDebug/

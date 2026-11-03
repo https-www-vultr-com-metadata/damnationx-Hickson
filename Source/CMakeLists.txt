@@ -30,6 +30,10 @@ set(libdevilutionx_SRCS
   portal.cpp
   restrict.cpp
   sync.cpp
+  survivors.cpp
+  survivors_arsenal.cpp
+  survivors_encircle.cpp
+  survivors_progression.cpp
   tmsg.cpp
   towners.cpp
   track.cpp
@@ -70,6 +74,8 @@ set(libdevilutionx_SRCS
   dvlnet/loopback.cpp
   dvlnet/packet.cpp
   dvlnet/session.cpp
+  dvlnet/async_session.cpp
+  dvlnet/async_runtime.cpp
 
   engine/actor_position.cpp
   engine/animationinfo.cpp
@@ -103,6 +109,8 @@ set(libdevilutionx_SRCS
   items/validation.cpp
 
   levels/setmaps.cpp
+  levels/survivors_rolling_runtime.cpp
+  levels/survivors_rolling_world.cpp
   levels/themes.cpp
   levels/tile_properties.cpp
   levels/town.cpp
@@ -1256,11 +1264,16 @@ if(DEVILUTIONX_SCREENSHOT_FORMAT STREQUAL DEVILUTIONX_SCREENSHOT_FORMAT_PNG)
 endif()
 
 add_devilutionx_object_library(libdevilutionx ${libdevilutionx_SRCS})
+
+if(DAMNATION_S1_BRIDGE AND WIN32)
+  target_link_libraries(libdevilutionx PUBLIC ws2_32)
+endif()
 target_include_directories(libdevilutionx PUBLIC ${CMAKE_CURRENT_BINARY_DIR})
 # render3d/placement_runtime.cpp checks the sha256 pins of placed meshes.
 target_include_directories(libdevilutionx PRIVATE ${PROJECT_SOURCE_DIR}/3rdParty/PicoSHA2)
 target_link_dependencies(libdevilutionx PUBLIC
   DevilutionX::SDL
+  ZLIB::ZLIB
   libdevilutionx_freeform_movement
   libdevilutionx_fpv_math
   libsmackerdec
@@ -1463,7 +1476,17 @@ if(NOT NONET)
         # Host packages ship one executable; a static OpenSSL adds no dylib to sign or notarize.
         set(OPENSSL_USE_STATIC_LIBS ON)
       endif()
-      find_package(OpenSSL REQUIRED)
+      # Package-manager upgrades delete the cached Cellar paths; FindOpenSSL then reports
+      # success without creating its imported targets.
+      foreach(_openssl_cache_var IN ITEMS OPENSSL_SSL_LIBRARY OPENSSL_CRYPTO_LIBRARY OPENSSL_INCLUDE_DIR
+                                          pkgcfg_lib__OPENSSL_ssl pkgcfg_lib__OPENSSL_crypto)
+        if(${_openssl_cache_var} AND NOT EXISTS "${${_openssl_cache_var}}")
+          unset(${_openssl_cache_var} CACHE)
+        endif()
+      endforeach()
+      # Without components FindOpenSSL only requires the crypto path to be set, not to exist,
+      # and silently skips OpenSSL::SSL when libssl is missing.
+      find_package(OpenSSL REQUIRED COMPONENTS SSL Crypto)
       if(DAMNATIONX_HOST_LIB)
         # The host link manifest is written from the top directory; imported targets are directory-scoped.
         set_target_properties(OpenSSL::SSL OpenSSL::Crypto PROPERTIES IMPORTED_GLOBAL TRUE)

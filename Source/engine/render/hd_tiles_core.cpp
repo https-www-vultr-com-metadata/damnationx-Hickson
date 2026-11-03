@@ -1,4 +1,5 @@
 #include "engine/render/hd_tiles_core.hpp"
+#include "utils/parse_int.hpp"
 #include "engine/render/hd_view_transform.hpp"
 
 #include <algorithm>
@@ -42,7 +43,7 @@ std::vector<std::string_view> SplitFields(std::string_view line)
 std::optional<int> ParseInt(std::string_view field)
 {
 	int value = 0;
-	const auto [ptr, ec] = std::from_chars(field.data(), field.data() + field.size(), value);
+	const auto [ptr, ec] = ParseDecimal(field.data(), field.data() + field.size(), value);
 	if (ec != std::errc() || ptr != field.data() + field.size())
 		return std::nullopt;
 	return value;

@@ -4,6 +4,7 @@
  * Implementation of monster functionality, AI, actions, spawning, loading, etc.
  */
 #include "monster.h"
+#include "dvlnet/async_runtime.h"
 
 #include <algorithm>
 #include <array>
@@ -66,6 +67,7 @@
 #include "levels/dun_tile.hpp"
 #include "levels/gendung.h"
 #include "levels/gendung_defs.hpp"
+#include "levels/survivors_rolling_runtime.hpp"
 #include "levels/themes.h"
 #include "levels/tile_properties.hpp"
 #include "levels/trigs.h"
@@ -79,6 +81,7 @@
 #include "objects.h"
 #include "options.h"
 #include "player.h"
+#include "survivors.h"
 #include "quests.h"
 #include "sound_effect_enums.h"
 #include "storm/storm_net.hpp"
@@ -1252,7 +1255,7 @@ void MonsterAttackPlayer(Monster &monster, Player &player, int hit, int minDam, 
 	if (blkper < blk) {
 		const Direction dir = GetDirection(player.position.tile, monster.position.tile);
 		StartPlrBlock(player, dir);
-		if (&player == MyPlayer && player.wReflections > 0) {
+		if (AsyncNetOwnsPlayer(player) && player.wReflections > 0) {
 			int dam = GenerateRnd(((maxDam - minDam) << 6) + 1) + (minDam << 6);
 			dam = std::max(dam + (player._pIGetHit << 6), 64);
 			CheckReflect(monster, player, dam);
@@ -1265,7 +1268,7 @@ void MonsterAttackPlayer(Monster &monster, Player &player, int hit, int minDam, 
 	// New method fixes a bug which caused the maximum possible damage value to be 63/64ths too low.
 	int dam = RandomIntBetween(minDam << 6, maxDam << 6);
 	dam = std::max(dam + (player._pIGetHit << 6), 64);
-	if (&player == MyPlayer) {
+	if (AsyncNetOwnsPlayer(player)) {
 		if (player.wReflections > 0) {
 			const int reflectedDamage = CheckReflect(monster, player, dam);
 			dam = std::max(dam - reflectedDamage, 0);
@@ -1291,7 +1294,7 @@ void MonsterAttackPlayer(Monster &monster, Player &player, int hit, int minDam, 
 		return;
 	}
 	StartPlrHit(player, dam, false);
-	if ((monster.flags & MFLAG_KNOCKBACK) != 0) {
+	if (!IsSurvivorsMode() && (monster.flags & MFLAG_KNOCKBACK) != 0) {
 		if (player._pmode != PM_GOTHIT)
 			StartPlrHit(player, 0, true);
 
@@ -3991,6 +3994,8 @@ void AddDoppelganger(Monster &monster)
 
 void ApplyMonsterDamage(DamageType damageType, Monster &monster, int damage)
 {
+	if (AsyncNetEnabled() && !AsyncNetIsAuthority())
+		return;
 	lua::OnMonsterTakeDamage(&monster, damage, static_cast<int>(damageType));
 
 	monster.hitPoints -= damage;
@@ -4007,7 +4012,7 @@ void ApplyMonsterDamage(DamageType damageType, Monster &monster, int damage)
 
 void MonsterReducePlayerAttribute(Monster &monster, Player &player)
 {
-	if (&player != MyPlayer)
+	if (!AsyncNetOwnsPlayer(player))
 		return;
 
 	if (monster.reducePlayerStrength > 0) {
@@ -4344,6 +4349,7 @@ void DeleteMonsterList()
 {
 	for (int i = 0; i < ReservedMonsterSlotsForGolems; i++) {
 		Monster &golem = Monsters[i];
+		if (SurvivorsRollingMonsterParked(i)) continue;
 		if (!golem.isInvalid)
 			continue;
 
@@ -4355,6 +4361,7 @@ void DeleteMonsterList()
 	}
 
 	for (size_t i = ReservedMonsterSlotsForGolems; i < ActiveMonsterCount;) {
+		if (SurvivorsRollingMonsterParked(ActiveMonsters[i])) { ++i; continue; }
 		if (Monsters[ActiveMonsters[i]].isInvalid) {
 			if (pcursmonst == static_cast<int>(ActiveMonsters[i])) // Unselect monster if player highlighted it
 				pcursmonst = -1;
@@ -4399,6 +4406,7 @@ void ProcessMonsters()
 	assert(ActiveMonsterCount <= MaxMonsters);
 	for (size_t i = 0; i < ActiveMonsterCount; i++) {
 		Monster &monster = Monsters[ActiveMonsters[i]];
+		if (SurvivorsRollingMonsterParked(ActiveMonsters[i])) continue;
 		FollowTheLeader(monster);
 		if (gbIsMultiplayer) {
 			SetRndSeed(monster.aiSeed);
@@ -4748,6 +4756,8 @@ void MissToMonst(Missile &missile, Point position)
 			return;
 
 		MonsterAttackPlayer(monster, *player, 500, monster.minDamageSpecial, monster.maxDamageSpecial);
+		if (IsSurvivorsMode())
+			return;
 
 		if (IsAnyOf(monster.type().type, MT_NSNAKE, MT_RSNAKE, MT_BSNAKE, MT_GSNAKE))
 			return;

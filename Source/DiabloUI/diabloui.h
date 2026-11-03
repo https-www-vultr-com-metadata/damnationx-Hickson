@@ -41,6 +41,7 @@ enum _mainmenu_selections : uint8_t {
 	MAINMENU_SHOW_CREDITS,
 	MAINMENU_EXIT_DIABLO,
 	MAINMENU_ATTRACT_MODE,
+	MAINMENU_SURVIVORS,
 };
 
 enum _selhero_selections : uint8_t {

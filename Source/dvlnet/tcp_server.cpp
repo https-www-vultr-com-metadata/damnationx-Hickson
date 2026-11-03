@@ -25,17 +25,11 @@ tcp_server::tcp_server(asio::io_context &ioc, const std::string &bindaddr,
 
 std::string tcp_server::LocalhostSelf()
 {
-	auto addr = acceptor->local_endpoint().address();
-	if (addr.is_unspecified()) {
-		if (addr.is_v4()) {
-			return asio::ip::address_v4::loopback().to_string();
-		}
-		if (addr.is_v6()) {
-			return asio::ip::address_v6::loopback().to_string();
-		}
-		ABORT();
-	}
-	return addr.to_string();
+	auto address = acceptor->local_endpoint().address();
+	if (address.is_unspecified())
+		address = address.is_v4() ? asio::ip::address(asio::ip::address_v4::loopback()) : asio::ip::address(asio::ip::address_v6::loopback());
+	const auto port = acceptor->local_endpoint().port();
+	return address.is_v6() ? "[" + address.to_string() + "]:" + std::to_string(port) : address.to_string() + ":" + std::to_string(port);
 }
 
 tcp_server::scc tcp_server::MakeConnection()
@@ -69,6 +63,8 @@ void tcp_server::StartReceive(const scc &con)
 void tcp_server::HandleReceive(const scc &con, const asio::error_code &ec,
     size_t bytesRead)
 {
+	if (con->closed)
+		return;
 	if (ec || bytesRead == 0) {
 		DropConnection(con);
 		return;
@@ -209,6 +205,8 @@ std::expected<void, PacketError> tcp_server::StartSend(const scc &con, buffer_t 
 void tcp_server::HandleSend(const scc &con, const asio::error_code &ec,
     size_t /*bytesSent*/)
 {
+	if (con->closed)
+		return;
 	if (ec) {
 		Log("Network error: {}", ec.message());
 		DropConnection(con);
@@ -254,6 +252,10 @@ void tcp_server::StartTimeout(const scc &con)
 
 void tcp_server::HandleTimeout(const scc &con, const asio::error_code &ec)
 {
+	// A tick already queued when the timer was cancelled still arrives with a
+	// success code; never restart the countdown of a closed connection.
+	if (con->closed)
+		return;
 	if (ec) {
 		DropConnection(con);
 		return;
@@ -270,10 +272,16 @@ void tcp_server::HandleTimeout(const scc &con, const asio::error_code &ec)
 
 void tcp_server::DropConnection(const scc &con)
 {
+	if (con->closed)
+		return;
+	con->closed = true;
 	const plr_t plr = con->plr;
 	con->timer.cancel();
 	con->socket.close();
-	if (plr == PLR_BROADCAST) {
+	// Only the connection that currently owns the slot may release it and
+	// announce the departure; a late handler of a replaced connection would
+	// otherwise disconnect the peer that rejoined into the same player id.
+	if (plr == PLR_BROADCAST || connections[plr] != con) {
 		return;
 	}
 	connections[plr] = nullptr;
@@ -307,6 +315,7 @@ void tcp_server::DisconnectNet(plr_t plr)
 	scc &con = connections[plr];
 	if (con == nullptr)
 		return;
+	con->closed = true;
 	con->timer.cancel();
 	con->socket.close();
 	con = nullptr;

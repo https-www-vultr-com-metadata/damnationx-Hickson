@@ -4,6 +4,7 @@
  * Implementation of functionality for stores and towner dialogs.
  */
 #include "stores.h"
+#include "dvlnet/async_runtime.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -32,6 +33,7 @@
 #include "panels/quest_log.hpp"
 #include "qol/stash.h"
 #include "qol/visual_store.h"
+#include "survivors.h"
 #include "tables/townerdat.hpp"
 #include "towners.h"
 #include "utils/format.hpp"
@@ -1825,6 +1827,38 @@ void StorytellerIdentifyItem(Item &item)
 
 void ConfirmEnter(Item &item)
 {
+	if (AsyncNetEnabled() && CurrentTextLine == 18) {
+		const unsigned row = OldScrollPos + ((OldTextLine - PreviousScrollPos) / 4);
+		AsyncStoreAction action;
+		unsigned index = row;
+		switch (OldActiveStore) {
+		case TalkID::SmithBuy: action = AsyncStoreAction::SmithBuy; break;
+		case TalkID::SmithPremiumBuy: action = AsyncStoreAction::PremiumBuy; break;
+		case TalkID::WitchBuy: action = AsyncStoreAction::WitchBuy; break;
+		case TalkID::HealerBuy: action = AsyncStoreAction::HealerBuy; break;
+		case TalkID::BoyBuy:
+			action = AsyncStoreAction::BoyBuy;
+			index = 0;
+			break;
+		case TalkID::SmithSell: action = AsyncStoreAction::SmithSell; break;
+		case TalkID::WitchSell: action = AsyncStoreAction::WitchSell; break;
+		case TalkID::SmithRepair: action = AsyncStoreAction::Repair; break;
+		case TalkID::WitchRecharge: action = AsyncStoreAction::Recharge; break;
+		case TalkID::StorytellerIdentify: action = AsyncStoreAction::Identify; break;
+		default: return;
+		}
+		if (OldActiveStore == TalkID::SmithSell || OldActiveStore == TalkID::WitchSell) {
+			const int slot = PlayerItemIndexes[row];
+			index = slot >= 0 ? INVITEM_INV_FIRST + slot : INVITEM_BELT_FIRST - slot - 1;
+		} else if (OldActiveStore == TalkID::SmithRepair || OldActiveStore == TalkID::StorytellerIdentify || OldActiveStore == TalkID::WitchRecharge) {
+			const int slot = PlayerItemIndexes[row];
+			constexpr unsigned body[] = { INVLOC_HEAD, INVLOC_CHEST, INVLOC_HAND_LEFT, INVLOC_HAND_RIGHT, INVLOC_RING_LEFT, INVLOC_RING_RIGHT, INVLOC_AMULET };
+			index = slot >= 0 ? INVITEM_INV_FIRST + slot : (OldActiveStore == TalkID::WitchRecharge ? INVLOC_HAND_LEFT : body[-slot - 1]);
+		}
+		AsyncNetStoreTransaction(action, index, item._iSeed);
+		StartStore(OldActiveStore);
+		return;
+	}
 	if (CurrentTextLine == 18) {
 		switch (OldActiveStore) {
 		case TalkID::SmithBuy:
@@ -2144,6 +2178,9 @@ void AddStoreHoldRepair(Item *itm, int8_t i)
 
 void InitStores()
 {
+	// A Survivors hunt loads its buyback from the isolated gear archive before
+	// entering the first level; keep it across subsequent act transitions.
+	if (!IsSurvivorsMode()) ResetSurvivorsBuyback();
 	ClearSText(0, NumStoreLines);
 	ActiveStore = TalkID::None;
 	IsTextFullSize = false;
@@ -2287,6 +2324,7 @@ void ClearSText(int s, int e)
 
 void StartStore(TalkID s)
 {
+	if (AsyncNetIsRemoteInteraction()) return;
 	if (*GetOptions().Gameplay.storeUi == StoreUi::ListWithItemGraphics) {
 		CreateHalfSizeItemSprites();
 	}
@@ -2458,7 +2496,6 @@ void RefreshStorePanelRows()
 	}
 
 	CalculateLineHeights();
-
 }
 
 std::vector<StorePanelRow> ExportStorePanelRows()
@@ -2955,6 +2992,169 @@ bool WitchWillBuy(const Item &item)
 		rv = false;
 
 	return rv;
+}
+
+bool ApplyAsyncStoreTransaction(Player &player, AsyncStoreAction action, unsigned index, uint32_t seed)
+{
+	if (!AsyncNetIsAuthority() || player.hasNoLife()) return false;
+	const bool survivorsShop = IsSurvivorsMode() && player.isOnActiveLevel() && leveltype != DTYPE_TOWN;
+	if (survivorsShop) {
+		// Only the Survivors smith is available outside town. Never let an
+		// arena request invoke another town vendor's services.
+		if (action != AsyncStoreAction::SmithBuy && action != AsyncStoreAction::PremiumBuy
+		    && action != AsyncStoreAction::SmithSell && action != AsyncStoreAction::SellHeldSmith
+		    && action != AsyncStoreAction::Repair && action != AsyncStoreAction::RepairAll
+		    && action != AsyncStoreAction::SurvivorsBuyback) return false;
+	} else if (!player.isOnLevel(0) || action == AsyncStoreAction::SurvivorsBuyback) {
+		return false;
+	}
+	_talker_id vendor = TOWN_SMITH;
+	if (action == AsyncStoreAction::WitchBuy || action == AsyncStoreAction::WitchSell || action == AsyncStoreAction::SellHeldWitch || action == AsyncStoreAction::Recharge) vendor = TOWN_WITCH;
+	if (action == AsyncStoreAction::HealerBuy) vendor = TOWN_HEALER;
+	if (action == AsyncStoreAction::BoyBuy) vendor = TOWN_PEGBOY;
+	if (action == AsyncStoreAction::Identify) vendor = TOWN_STORY;
+	if (!survivorsShop) {
+		const Towner *npc = GetTowner(vendor);
+		if (npc == nullptr || player.position.tile.WalkingDistance(npc->position) > 3) return false;
+	}
+	if (action == AsyncStoreAction::SurvivorsBuyback) {
+		const unsigned peer = player.getId();
+		const auto items = GetSurvivorsBuybackItems(peer);
+		const auto prices = GetSurvivorsBuybackPrices(peer);
+		if (index >= items.size() || index >= prices.size() || items[index]._iSeed != seed
+		    || prices[index] <= 0 || prices[index] > player._pGold) return false;
+		Item purchased = items[index];
+		const int price = prices[index];
+		Player *saved = MyPlayer;
+		MyPlayer = &player;
+		if (!StoreAutoPlace(purchased, false)) { MyPlayer = saved; return false; }
+		std::vector<Item> remaining(items.begin(), items.end());
+		std::vector<int> remainingPrices(prices.begin(), prices.end());
+		remaining.erase(remaining.begin() + index);
+		remainingPrices.erase(remainingPrices.begin() + index);
+		if (!SetSurvivorsBuyback(peer, remaining, remainingPrices)) { MyPlayer = saved; return false; }
+		TakeGold(player, price, false);
+		StoreAutoPlace(purchased, true);
+		player._pGold = CalculateGold(player);
+		CalcPlrInv(player, false);
+		MyPlayer = saved;
+		return true;
+	}
+	Item *item = nullptr;
+	bool buying = true;
+	switch (action) {
+	case AsyncStoreAction::SmithBuy:
+		if (index < SmithItems.size()) item = &SmithItems[index];
+		break;
+	case AsyncStoreAction::PremiumBuy:
+		if (index < PremiumItems.size()) item = &PremiumItems[index];
+		break;
+	case AsyncStoreAction::WitchBuy:
+		if (index < WitchItems.size()) item = &WitchItems[index];
+		break;
+	case AsyncStoreAction::HealerBuy:
+		if (index < HealerItems.size()) item = &HealerItems[index];
+		break;
+	case AsyncStoreAction::BoyBuy: item = &BoyItem; break;
+	default:
+		buying = false;
+		if (action == AsyncStoreAction::SellHeldSmith || action == AsyncStoreAction::SellHeldWitch)
+			item = &player.HoldItem;
+		else if (index < NUM_INVLOC)
+			item = &player.InvBody[index];
+		else if (index <= INVITEM_INV_LAST)
+			item = &player.InvList[index - INVITEM_INV_FIRST];
+		else if (index <= INVITEM_BELT_LAST)
+			item = &player.SpdList[index - INVITEM_BELT_FIRST];
+		break;
+	}
+	if (action == AsyncStoreAction::RepairAll) {
+		int cost = 0;
+		auto due = [](const Item &i) { if (i.isEmpty() || i._iMaxDur == DUR_INDESTRUCTIBLE || i._iMaxDur <= i._iDurability) return 0; return std::max(1, i._ivalue * (i._iMaxDur - i._iDurability) / std::max(1, i._iMaxDur * 2)); };
+		for (const auto &i : player.InvBody)
+			cost += due(i);
+		for (int i = 0; i < player._pNumInv; ++i)
+			cost += due(player.InvList[i]);
+		if (cost <= 0 || cost > player._pGold) return false;
+		TakeGold(player, cost, false);
+		player._pGold = CalculateGold(player);
+		for (auto &i : player.InvBody)
+			if (!i.isEmpty() && i._iMaxDur != DUR_INDESTRUCTIBLE) i._iDurability = i._iMaxDur;
+		for (int i = 0; i < player._pNumInv; ++i)
+			if (player.InvList[i]._iMaxDur != DUR_INDESTRUCTIBLE) player.InvList[i]._iDurability = player.InvList[i]._iMaxDur;
+		return true;
+	}
+	if (item == nullptr || item->isEmpty() || item->_iSeed != seed) return false;
+	if (buying) {
+		int price = item->_iIvalue;
+		if (action == AsyncStoreAction::BoyBuy) price += gbIsHellfire ? -price / 4 : price / 2;
+		if (price <= 0 || price > player._pGold) return false;
+		Player *saved = MyPlayer;
+		MyPlayer = &player;
+		Item purchased = *item;
+		const bool fits = StoreAutoPlace(purchased, false);
+		if (!fits) {
+			MyPlayer = saved;
+			return false;
+		}
+		TakeGold(player, price, false);
+		if ((action == AsyncStoreAction::WitchBuy && index < 3) || (action == AsyncStoreAction::HealerBuy && index < 3)) purchased._iSeed = AdvanceRndSeed();
+		StoreAutoPlace(purchased, true);
+		switch (action) {
+		case AsyncStoreAction::SmithBuy: SmithItems.erase(SmithItems.begin() + index); break;
+		case AsyncStoreAction::PremiumBuy: ReplacePremium(player, index); break;
+		case AsyncStoreAction::WitchBuy:
+			if (index >= 3) WitchItems.erase(WitchItems.begin() + index);
+			break;
+		case AsyncStoreAction::HealerBuy:
+			if (index >= 3) HealerItems.erase(HealerItems.begin() + index);
+			break;
+		case AsyncStoreAction::BoyBuy: BoyItem.clear(); break;
+		default: break;
+		}
+		player._pGold = CalculateGold(player);
+		CalcPlrInv(player, false);
+		MyPlayer = saved;
+		return true;
+	}
+	if (action == AsyncStoreAction::SmithSell || action == AsyncStoreAction::WitchSell || action == AsyncStoreAction::SellHeldSmith || action == AsyncStoreAction::SellHeldWitch) {
+		const bool smith = action == AsyncStoreAction::SmithSell || action == AsyncStoreAction::SellHeldSmith;
+		if (!(smith ? SmithWillBuy(*item) : WitchWillBuy(*item))) return false;
+		const int price = std::max(1, (item->_iMagical != ITEM_QUALITY_NORMAL && item->_iIdentified ? item->_iIvalue : item->_ivalue) / 4);
+		if (survivorsShop) {
+			int64_t room = 0;
+			for (int i = 0; i < player._pNumInv; ++i)
+				if (player.InvList[i]._itype == ItemType::Gold) room += std::max(0, MaxGold - player.InvList[i]._ivalue);
+			const int sold = index >= INVITEM_INV_FIRST && index <= INVITEM_INV_LAST ? static_cast<int>(index - INVITEM_INV_FIRST) : -1;
+			for (const int cell : player.InvGrid)
+				if (cell == 0 || (sold >= 0 && std::abs(cell) == sold + 1)) room += MaxGold;
+			if (room < price) return false;
+			RememberSurvivorsSale(player.getId(), *item, price);
+		}
+		if (item == &player.HoldItem)
+			player.HoldItem.clear();
+		else if (index >= INVITEM_BELT_FIRST)
+			player.RemoveSpdBarItem(index - INVITEM_BELT_FIRST);
+		else if (index >= INVITEM_INV_FIRST)
+			player.RemoveInvItem(index - INVITEM_INV_FIRST);
+		else
+			return false;
+		AddGoldToInventory(player, price);
+		player._pGold = CalculateGold(player);
+		return true;
+	}
+	int cost = 0;
+	if (action == AsyncStoreAction::Identify && !item->_iIdentified) cost = 100;
+	if (action == AsyncStoreAction::Repair && item->_iMaxDur != DUR_INDESTRUCTIBLE && item->_iMaxDur > item->_iDurability) cost = item->_iMagical != ITEM_QUALITY_NORMAL && item->_iIdentified ? 30 * item->_iIvalue * (item->_iMaxDur - item->_iDurability) / std::max(1, item->_iMaxDur * 200) : std::max(1, item->_ivalue * (item->_iMaxDur - item->_iDurability) / std::max(1, item->_iMaxDur * 2));
+	if (action == AsyncStoreAction::Recharge && item->_iMaxCharges > item->_iCharges) cost = (item->_ivalue + GetSpellData(item->_iSpell).staffCost()) * (item->_iMaxCharges - item->_iCharges) / std::max(1, item->_iMaxCharges * 2);
+	if (cost <= 0 || cost > player._pGold) return false;
+	TakeGold(player, cost, false);
+	player._pGold = CalculateGold(player);
+	if (action == AsyncStoreAction::Identify) item->_iIdentified = true;
+	if (action == AsyncStoreAction::Repair) item->_iDurability = item->_iMaxDur;
+	if (action == AsyncStoreAction::Recharge) item->_iCharges = item->_iMaxCharges;
+	CalcPlrInv(player, false);
+	return true;
 }
 
 } // namespace devilution

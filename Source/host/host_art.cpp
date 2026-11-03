@@ -234,10 +234,10 @@ void AddClip(const HostEntity &entity, const Player &player)
 	const size_t family = std::min<size_t>(player._pgfxnum & 0xF, FamilyNames.size() - 1);
 	HostModelClip clip {};
 	clip.entityId = entity.id;
-	clip.progress = AnimationProgress(player.AnimInfo);
+	clip.progress = AnimationProgress(player.getDisplayedAnimation());
 	clip.hitProgress = -1.0F;
 	std::string names;
-	switch (player.getGraphic()) {
+	switch (player.getDisplayedGraphic()) {
 	case player_graphic::Stand:
 		names = inTown ? ClipCandidates({ "town_stand", "stand" }, family) : ClipCandidates({ "stand" }, family);
 		clip.loop = 1;
@@ -248,7 +248,7 @@ void AddClip(const HostEntity &entity, const Player &player)
 		break;
 	case player_graphic::Attack: {
 		names = ClipCandidates({ "attack" }, family);
-		const float frames = static_cast<float>(std::max<int>(player.AnimInfo.numberOfFrames, 2));
+		const float frames = static_cast<float>(std::max<int>(player.getDisplayedAnimation().numberOfFrames, 2));
 		clip.hitProgress = std::clamp(static_cast<float>(player._pAFNum - 1), 1.0F, frames - 1.0F) / frames;
 		break;
 	}

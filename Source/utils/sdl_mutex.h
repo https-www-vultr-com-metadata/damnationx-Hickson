@@ -2,7 +2,7 @@
 
 #include <memory>
 
-#if defined(__EMSCRIPTEN__) && (!defined(DEVILUTIONX_BROWSER_SINGLE_THREADED) || defined(__EMSCRIPTEN_PTHREADS__))
+#if defined(__EMSCRIPTEN__) && !defined(__EMSCRIPTEN_PTHREADS__) && !defined(DEVILUTIONX_BROWSER_SINGLE_THREADED)
 #error "Browser mutex shims require the single-threaded browser profile"
 #endif
 
@@ -25,7 +25,7 @@ namespace devilution {
  * RAII wrapper for SDL_mutex. Satisfies std's "Lockable" (SDL 2) or "BasicLockable" (SDL 1)
  * requirements so it can be used with std::lock_guard and friends.
  */
-#if defined(__EMSCRIPTEN__)
+#if defined(__EMSCRIPTEN__) && !defined(__EMSCRIPTEN_PTHREADS__)
 class SdlMutex final {
 public:
 	SdlMutex() noexcept { }

@@ -19,6 +19,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -35,6 +36,7 @@
 #include "levels/dun_tile.hpp"
 #include "levels/dun_tile_data.hpp"
 #include "levels/gendung.h"
+#include "levels/survivors_rolling_runtime.hpp"
 #include "levels/tile_geometry.hpp"
 #include "levels/trigs.h"
 #include "render3d/placement_runtime.hpp"
@@ -105,6 +107,12 @@ uint64_t ComputeStateHash()
 	hash = Mix(hash, setlevel ? 1 : 0);
 	hash = Mix(hash, static_cast<uint64_t>(reinterpret_cast<uintptr_t>(pDungeonCels.get())));
 	hash = Mix(hash, ArtPaletteHash);
+	// Even an identical repeated floor needs a new host revision: the D2R
+	// presenter uses world origin to anchor texture coordinates and decoration.
+	if (SurvivorsRollingActive()) {
+		hash = Mix(hash, static_cast<uint64_t>(SurvivorsRollingOriginX()));
+		hash = Mix(hash, static_cast<uint64_t>(SurvivorsRollingOriginY()));
+	}
 	for (int i = 0; i < ActiveObjectCount; ++i) {
 		const Object &object = Objects[ActiveObjects[i]];
 		if (!object.isDoor())
@@ -2076,6 +2084,7 @@ float OccluderTopAt(const LevelGeometry &geometry, int x, int y)
 
 bool UpdateLevelGeometry(LevelGeometry &geometry)
 {
+	const auto started = std::chrono::steady_clock::now();
 	if (pDungeonCels == nullptr || MicroTileLen == 0)
 		return false;
 	if (PollLevelPlacements())
@@ -2129,6 +2138,10 @@ bool UpdateLevelGeometry(LevelGeometry &geometry)
 		DumpAtlas(geometry, dump);
 	Log("render3d: level mesh {} vertices, {} triangles, atlas {}x{} ({} squares, {} walls)", geometry.vertices.size(), geometry.indices.size() / 3,
 	    geometry.atlasWidth, geometry.atlasHeight, Atlas.squares.size(), Atlas.walls.size());
+	if (SurvivorsRollingActive() && std::getenv("DAMNATIONX_TRACE_ROLLING") != nullptr) {
+		const auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - started).count();
+		Log("rolling-render: origin {},{} mesh rebuild {} us", SurvivorsRollingOriginX(), SurvivorsRollingOriginY(), elapsed);
+	}
 	return true;
 }
 

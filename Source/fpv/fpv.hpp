@@ -32,6 +32,8 @@
 #include "engine/surface.hpp"
 #include "render3d/fpv_contract.hpp"
 
+namespace devilution::host { struct HostViewControl; }
+
 namespace devilution::fpv {
 
 /**
@@ -85,6 +87,8 @@ void SetHudWantsCursorQuery(HudWantsCursorQuery query);
 
 /** Per input poll (diablo.cpp ProcessInput, before CheckCursMove): mode changes, mouse mode, WASD movement. */
 void ProcessInput();
+/** Embedded host controls gameplay without activating the legacy renderer or SDL pointer lock. */
+void SetHostViewControl(const host::HostViewControl &control);
 
 /** Per drawn frame (DrawAndBlit, after the game tick progress is updated): camera interpolation. */
 void UpdateFrame();

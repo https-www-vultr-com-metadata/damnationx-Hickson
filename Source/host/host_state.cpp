@@ -1,3 +1,7 @@
+#include "survivors.h"
+#include "survivors_arsenal.h"
+#include "host/host_survivors_ui.hpp"
+#include "utils/utf8.hpp"
 /**
  * @file host/host_state.cpp
  *
@@ -12,9 +16,11 @@
 #include <array>
 #include <chrono>
 #include <cmath>
+#include <cstddef>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
+#include <iterator>
 #include <optional>
 #include <string>
 #include <system_error>
@@ -46,6 +52,7 @@
 #include "help.h"
 #include "inv.h"
 #include "items.h"
+#include "levels/survivors_rolling_runtime.hpp"
 #include "loadsave.h"
 #include "minitext.h"
 #include "options.h"
@@ -148,6 +155,86 @@ std::optional<bool> PendingFreePortalEnabled;
 std::optional<int32_t> PendingUiScale;
 std::optional<std::pair<bool, int32_t>> PendingOutlines;
 std::optional<bool> PendingHostFPS;
+struct PadChange { uint32_t index, button, modifier; };
+std::optional<PadChange> PendingPadChange;
+
+struct DraftCommand { uint32_t revision, action, index; };
+std::optional<DraftCommand> PendingDraftCommand;
+
+DxpSurvivorsUiSnapshot SurvivorsUiSnapshot()
+{
+	DxpSurvivorsUiSnapshot result {};
+	result.version = 6;
+	if (!IsActive() || !InGame() || !IsSurvivorsMode()) return result;
+	const auto run = GetSurvivorsRunStatus();
+	result.act = run.act;
+	result.difficulty = run.difficulty;
+	result.actSeconds = run.actSeconds;
+	result.totalSeconds = run.totalSeconds;
+	result.kills = run.kills;
+	result.bossPending = run.bossPending;
+	result.statPoints = MyPlayer != nullptr ? std::max(0, MyPlayer->_pStatPts) : 0;
+	result.gearSync = SurvivorsCoopGearSyncStatus();
+	result.worldOriginX = SurvivorsRollingOriginX();
+	result.worldOriginY = SurvivorsRollingOriginY();
+	result.worldSeed = SurvivorsRollingSeed();
+	const auto arsenal = GetSurvivorsArsenalSnapshot();
+	result.flags = 1 | (IsSurvivorsUpgradePending() ? 2U : 0U) | (IsSurvivorsRunFinished() ? 4U : 0U);
+	if (SurvivorsRollingActive()) result.flags |= 16U;
+	result.level = run.level;
+	result.rerolls = arsenal.rerolls;
+	result.skips = arsenal.skips;
+	result.banishes = arsenal.banishes;
+	uint32_t revision = 2166136261U;
+	const auto mix = [&](unsigned value) { revision = (revision ^ value) * 16777619U; };
+	mix(run.level); mix(arsenal.rerolls); mix(arsenal.skips); mix(arsenal.banishes); mix(result.flags);
+	for (unsigned rank : arsenal.ranks) mix(rank);
+	for (unsigned rank : arsenal.passives) mix(rank);
+	for (unsigned offer : arsenal.offers) mix(offer);
+	for (bool banished : arsenal.banished) mix(banished);
+	result.revision = revision == 0 ? 1 : revision;
+	if (IsSurvivorsDraftRequestPending() || PendingDraftCommand)
+		result.flags |= 8;
+	const auto offers = SurvivorsArsenalOfferDetails();
+	for (unsigned index = 0; index < 3; ++index) {
+		const auto &offer = offers[index];
+		auto &card = result.offers[index];
+		card.rank = offer.nextRank; card.maxRank = offer.maxRank;
+		card.kind = offer.isWeapon ? 0 : (offer.item < SurvivorsArsenalFirstFallback ? 1 : 2);
+		card.enabled = offer.enabled; card.evolved = offer.evolution; card.item = offer.item;
+		CopyUtf8(card.name, offer.name, sizeof(card.name));
+		CopyUtf8(card.description, offer.description, sizeof(card.description));
+		CopyUtf8(card.requirements, offer.requirements, sizeof(card.requirements));
+	}
+	for (unsigned item = 0; item < SurvivorsArsenalFirstFallback; ++item) {
+		const unsigned rank = item < SurvivorsWeaponCount ? arsenal.ranks[item] : arsenal.passives[item - SurvivorsWeaponCount];
+		if (rank == 0) continue;
+		auto &slot = result.loadout[result.loadoutCount++];
+		slot.rank = rank; slot.kind = item < SurvivorsWeaponCount ? 0 : 1;
+		slot.maxRank = slot.kind == 0 ? SurvivorsWeaponMaxRank : SurvivorsPassiveMaxRank;
+		slot.evolved = slot.kind == 0 && rank == SurvivorsWeaponMaxRank;
+		CopyUtf8(slot.name, SurvivorsArsenalItemName(item), sizeof(slot.name));
+	}
+	return result;
+}
+
+void ProcessDraftCommand()
+{
+	const auto command = std::exchange(PendingDraftCommand, std::nullopt);
+	if (!command || !InGame() || !IsSurvivorsUpgradePending() || gmenu_is_active()) return;
+	const auto snapshot = SurvivorsUiSnapshot();
+	if (snapshot.revision != command->revision || IsSurvivorsDraftRequestPending()) return;
+	bool accepted = false;
+	switch (command->action) {
+	case 1: accepted = ChooseSurvivorsUpgrade(command->index); break;
+	case 2: accepted = RerollSurvivorsUpgrades(); break;
+	case 3: accepted = SkipSurvivorsUpgrade(); break;
+	case 4: accepted = BanishSurvivorsUpgrade(command->index); break;
+	default: break;
+	}
+	if (accepted) RedrawEverything();
+}
+
 
 DxpMenuSnapshot MenuSnapshot()
 {
@@ -169,9 +256,9 @@ DxpMenuSnapshot MenuSnapshot()
 	if (IsFreeTownPortalEnabled()) result.flags |= DxpMenuFreePortal;
 	if (gmenu_is_active()) result.flags |= DxpMenuOpen;
 	if (gbIsMultiplayer) result.flags |= DxpMenuMultiplayer;
-	if (!MenuActionInProgress && !gbIsMultiplayer && !MyPlayerIsDead && MyPlayer->_pmode != PM_DEATH && pcurs == CURSOR_HAND)
+	if (!MenuActionInProgress && !gbIsMultiplayer && !IsSurvivorsMode() && !MyPlayerIsDead && MyPlayer->_pmode != PM_DEATH && pcurs == CURSOR_HAND)
 		result.flags |= DxpMenuCanSave;
-	if (!MenuActionInProgress && !gbIsMultiplayer && gbValidSaveFile) result.flags |= DxpMenuCanLoad;
+	if (!MenuActionInProgress && !gbIsMultiplayer && !IsSurvivorsMode() && gbValidSaveFile) result.flags |= DxpMenuCanLoad;
 	if (MyPlayer->running) result.flags |= DxpMenuRunning;
 	if (!gbIsMultiplayer && !MyPlayerIsDead && *GetOptions().Gameplay.enableRun)
 		result.flags |= DxpMenuCanRun;
@@ -235,6 +322,7 @@ uint32_t Mix(uint32_t hash, uint32_t value)
 
 void ResetHostMenu()
 {
+	PendingDraftCommand.reset();
 	HideGameMenu = false;
 	PendingMenuAction = 0;
 	MenuActionInProgress = false;
@@ -244,12 +332,14 @@ void ResetHostMenu()
 	PendingUiScale.reset();
 	PendingOutlines.reset();
 	PendingHostFPS.reset();
+	PendingPadChange.reset();
 }
 
 void ProcessMenuCommands()
 {
 	if (!OnGameThread() || MenuActionInProgress)
 		return;
+	ProcessDraftCommand();
 	// Clear before calling native handlers: save/load can present a frame and
 	// recursively pump events while this call is still on the game-thread stack.
 	const uint32_t action = std::exchange(PendingMenuAction, 0);
@@ -259,6 +349,7 @@ void ProcessMenuCommands()
 	const auto uiScale = std::exchange(PendingUiScale, std::nullopt);
 	const auto outlines = std::exchange(PendingOutlines, std::nullopt);
 	const auto hostFPS = std::exchange(PendingHostFPS, std::nullopt);
+	const auto padChange = std::exchange(PendingPadChange, std::nullopt);
 	if (!InGame() || !gmenu_is_active())
 		return;
 	for (size_t channel = 0; channel < audio.size(); ++channel) {
@@ -296,6 +387,15 @@ void ProcessMenuCommands()
 	}
 	if (hostFPS.has_value())
 		GetOptions().Graphics.hostFPS.SetValue(*hostFPS);
+	if (padChange) {
+		auto &actions = GetOptions().Padmapper.actions;
+		auto it = actions.begin();
+		for (uint32_t i = 0; i < padChange->index && it != actions.end(); ++i) ++it;
+		if (it != actions.end() && it->isEnabled()) {
+			it->SetValue({ static_cast<ControllerButton>(padChange->modifier), static_cast<ControllerButton>(padChange->button) });
+			SaveOptions();
+		}
+	}
 	const uint32_t flags = MenuSnapshot().flags;
 	MenuActionInProgress = action != 0;
 	switch (action) {
@@ -333,7 +433,9 @@ const HostUiState &BuildUiState()
 				towner = TownerOfStore(OldActiveStore);
 		}
 		if (qtextflag) flags |= kUiQuestText;
-		if (gmenu_is_active()) flags |= kUiGameMenu;
+		// Draft cards and run results use the same modal world-panel routing as
+		// menus, including cooperative drafts that do not pause simulation.
+		if (gmenu_is_active() || IsSurvivorsUpgradePending() || IsSurvivorsRunFinished()) flags |= kUiGameMenu;
 		if (DropGoldFlag) flags |= kUiGoldDrop;
 		if (IsWithdrawGoldOpen) flags |= kUiGoldWithdraw;
 		if (HelpFlag) flags |= kUiHelp;
@@ -457,7 +559,7 @@ namespace {
 
 bool CanCheckpoint()
 {
-	return IsActive() && InGame() && !gbIsMultiplayer && MyPlayer != nullptr && MyPlayer->plractive;
+	return IsActive() && InGame() && !gbIsMultiplayer && !IsSurvivorsMode() && MyPlayer != nullptr && MyPlayer->plractive;
 }
 
 bool ReadWholeFile(const std::string &path, std::vector<uint8_t> &out)
@@ -607,6 +709,48 @@ bool LoadState(const uint8_t *data, uint32_t size)
 
 } // namespace devilution::host
 
+extern "C" uint32_t dxp_pad_count()
+{
+	if (!devilution::host::IsActive())
+		return 0;
+	const auto &actions = devilution::GetOptions().Padmapper.actions;
+	return static_cast<uint32_t>(std::distance(actions.begin(), actions.end()));
+}
+
+extern "C" bool dxp_pad_binding(uint32_t index, DxpPadBinding *output, uint32_t size)
+{
+	using namespace devilution;
+	if (!host::IsActive() || output == nullptr || size != sizeof(*output))
+		return false;
+	const auto &actions = GetOptions().Padmapper.actions;
+	auto it = actions.begin();
+	for (uint32_t i = 0; i < index && it != actions.end(); ++i)
+		++it;
+	if (it == actions.end())
+		return false;
+	*output = {};
+	CopyUtf8(output->name, it->GetName(), sizeof(output->name));
+	output->button = static_cast<uint32_t>(it->boundInput.button);
+	output->modifier = static_cast<uint32_t>(it->boundInput.modifier);
+	output->enabled = it->isEnabled();
+	return true;
+}
+
+extern "C" bool dxp_pad_set(uint32_t index, uint32_t button, uint32_t modifier)
+{
+	using namespace devilution;
+	if ((host::MenuSnapshot().flags & DxpMenuOpen) == 0 || index >= dxp_pad_count()
+	    || button == 1 || modifier == 1 || button > ControllerButton_BUTTON_DPAD_RIGHT
+	    || modifier > ControllerButton_BUTTON_DPAD_RIGHT || (button == 0 && modifier != 0)
+	    || (button != 0 && button == modifier) || host::PendingPadChange)
+		return false;
+	DxpPadBinding binding {};
+	if (!dxp_pad_binding(index, &binding, sizeof(binding)) || binding.enabled == 0)
+		return false;
+	host::PendingPadChange = host::PadChange { index, button, modifier };
+	return true;
+}
+
 extern "C" bool dxp_menu_snapshot(DxpMenuSnapshot *output, uint32_t size)
 {
 	if (output == nullptr || size != sizeof(DxpMenuSnapshot))
@@ -704,5 +848,28 @@ extern "C" bool dxp_menu_set_fps(bool enabled)
 	if ((host::MenuSnapshot().flags & DxpMenuOpen) == 0)
 		return false;
 	host::PendingHostFPS = enabled;
+	return true;
+}
+
+
+extern "C" bool dxp_survivors_ui_snapshot(DxpSurvivorsUiSnapshot *output, uint32_t size)
+{
+	constexpr uint32_t LegacySize = offsetof(DxpSurvivorsUiSnapshot, worldSeed);
+	if (output == nullptr || (size != sizeof(*output) && size != LegacySize)) return false;
+	auto snapshot = devilution::host::SurvivorsUiSnapshot();
+	if (size == LegacySize) snapshot.version = 5;
+	std::memcpy(output, &snapshot, size);
+	return devilution::host::IsActive();
+}
+extern "C" bool dxp_survivors_ui_command(uint32_t revision, uint32_t action, uint32_t index)
+{
+	using namespace devilution;
+	using namespace devilution::host;
+	const auto snapshot = SurvivorsUiSnapshot();
+	if (!IsActive() || !InGame() || gmenu_is_active() || (snapshot.flags & 2) == 0 || (snapshot.flags & 8) != 0
+	    || snapshot.revision != revision || action < 1 || action > 4) return false;
+	if ((action == 1 || action == 4) && (index >= 3 || !snapshot.offers[index].enabled)) return false;
+	if ((action == 2 && snapshot.rerolls == 0) || (action == 3 && snapshot.skips == 0) || (action == 4 && snapshot.banishes == 0)) return false;
+	PendingDraftCommand = DraftCommand { revision, action, index };
 	return true;
 }

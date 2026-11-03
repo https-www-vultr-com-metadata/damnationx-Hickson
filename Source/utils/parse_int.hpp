@@ -5,8 +5,77 @@
 #include <expected>
 #include <string_view>
 #include <system_error>
+#ifdef __EMSCRIPTEN__
+#include <limits>
+#include <type_traits>
+#endif
 
 namespace devilution {
+
+#ifdef __EMSCRIPTEN__
+/** Decimal from_chars equivalent for the browser simulation core.
+ * Avoid libc++'s optimized charconv implementation, which has produced incorrect
+ * narrow and 32-bit results in optimized WASM. Scan every digit on overflow and
+ * leave the destination unchanged on any error, as std::from_chars requires. */
+template <typename T>
+std::from_chars_result ParseBrowserDecimal(const char *begin, const char *end, T &destination)
+{
+	static_assert(std::is_integral_v<T> && !std::is_same_v<T, bool>);
+	const char *cursor = begin;
+	bool negative = false;
+	if constexpr (std::is_signed_v<T>) {
+		if (cursor != end && *cursor == '-') {
+			negative = true;
+			++cursor;
+		}
+	}
+	const char *digits = cursor;
+	uint64_t limit = static_cast<uint64_t>(std::numeric_limits<T>::max());
+	if constexpr (std::is_signed_v<T>) {
+		if (negative)
+			limit = static_cast<uint64_t>(-(std::numeric_limits<T>::min() + int64_t { 1 })) + 1;
+	}
+	const uint64_t cutoff = limit / 10;
+	const unsigned lastDigit = static_cast<unsigned>(limit % 10);
+	uint64_t value = 0;
+	bool overflow = false;
+	while (cursor != end) {
+		const unsigned digit = static_cast<unsigned char>(*cursor) - static_cast<unsigned>('0');
+		if (digit > 9)
+			break;
+		if (!overflow) {
+			if (value > cutoff || (value == cutoff && digit > lastDigit))
+				overflow = true;
+			else
+				value = value * 10 + digit;
+		}
+		++cursor;
+	}
+	if (cursor == digits)
+		return { begin, std::errc::invalid_argument };
+	if (overflow)
+		return { cursor, std::errc::result_out_of_range };
+	if constexpr (std::is_signed_v<T>) {
+		if (negative) {
+			destination = value == limit ? std::numeric_limits<T>::min() : static_cast<T>(-static_cast<int64_t>(value));
+			return { cursor, {} };
+		}
+	}
+	destination = static_cast<T>(value);
+	return { cursor, {} };
+}
+#endif
+
+/** Decimal-only charconv entry point shared by tables, INI and imported manifests. */
+template <typename T>
+std::from_chars_result ParseDecimal(const char *begin, const char *end, T &destination)
+{
+#ifdef __EMSCRIPTEN__
+	return ParseBrowserDecimal(begin, end, destination);
+#else
+	return std::from_chars(begin, end, destination);
+#endif
+}
 
 enum class ParseIntError {
 	ParseError = 1,
@@ -22,7 +91,7 @@ ParseIntResult<IntT> ParseInt(
     IntT max = std::numeric_limits<IntT>::max(), const char **endOfParse = nullptr)
 {
 	IntT value;
-	const std::from_chars_result result = std::from_chars(str.data(), str.data() + str.size(), value);
+	const std::from_chars_result result = ParseDecimal(str.data(), str.data() + str.size(), value);
 	if (endOfParse != nullptr) {
 		*endOfParse = result.ptr;
 	}

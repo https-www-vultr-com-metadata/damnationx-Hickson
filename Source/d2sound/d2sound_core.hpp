@@ -67,8 +67,20 @@ inline constexpr std::string_view Diablo2ResurrectedAdvancedSoundsModName = "d2r
 
 /** @brief Whether `path` is a Diablo II folder (it has `d2sfx.mpq`). */
 bool IsDiablo2InstallDir(const std::string &path);
-/** @brief Whether `path` is a Diablo II: Resurrected folder (it has `.build.info` and `Data/indices`). */
+/**
+ * @brief Whether `path` is a Diablo II: Resurrected folder: a Battle.net install (`.build.info` and
+ * `Data/indices`) or a Steam install (`Data/.build.config`, without `.build.info`).
+ */
 bool IsDiablo2ResurrectedInstallDir(const std::string &path);
+
+/**
+ * @brief The path to give `CascOpenStorage` for a Diablo II: Resurrected folder: the folder itself
+ * for Battle.net, or its `Data/.build.config` file for Steam.
+ */
+std::string D2rStoragePath(const std::string &path);
+
+/** @brief The `"path"` values of a Steam `libraryfolders.vdf`: every Steam library folder. */
+std::vector<std::string> SteamLibraryPaths(std::string_view vdf);
 
 /** @brief Finds a file in a directory, ignoring case. Returns the full path or an empty string. */
 std::string FindD2FileIgnoringCase(const std::string &dir, std::string_view lowercaseName);

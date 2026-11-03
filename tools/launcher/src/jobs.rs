@@ -19,6 +19,9 @@ const MAX_BYTES: u64 = 256 * 1024 * 1024 * 1024;
 const MAX_LINE: usize = 4096;
 const LOG_TAIL: usize = 64;
 const MAX_REFERENCE_DEPTH: usize = 64;
+/// Shown when the chosen folder is not a D2R install the importers can read.
+const D2R_INSTALL_REQUIRED: &str = "Choose your Diablo II: Resurrected install folder. \
+     A Battle.net install has .build.info and Data/indices; a Steam install has Data/.build.config.";
 
 #[derive(Clone, Debug)]
 pub struct D2rImportRequest {
@@ -27,8 +30,6 @@ pub struct D2rImportRequest {
     /// from the published glb tree until the whole import validates.
     pub cache_dir: PathBuf,
     pub importer_dir: PathBuf,
-    pub python: PathBuf,
-    pub create_venv: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -964,89 +965,6 @@ fn run(
     Ok(lines)
 }
 
-fn python_prefix(path: &Path) -> Vec<OsString> {
-    if path.file_name().is_some_and(|n| {
-        n.to_string_lossy().eq_ignore_ascii_case("py.exe")
-            || n.to_string_lossy().eq_ignore_ascii_case("py")
-    }) {
-        vec!["-3".into()]
-    } else {
-        vec![]
-    }
-}
-
-fn python_call(
-    program: &Path,
-    prefix: &[OsString],
-    args: &[&str],
-    cwd: &Path,
-    env: &[(OsString, OsString)],
-    reporter: &Reporter,
-) -> Result<Vec<String>, String> {
-    let mut argv = prefix.to_vec();
-    argv.extend(args.iter().map(|arg| OsString::from(*arg)));
-    run(program, &argv, cwd, env, reporter)
-}
-
-const PYTHON_PROBE: &str = "import sys; sys.version_info >= (3,11) or sys.exit('Python 3.11 or newer is required'); print(sys.executable); print(sys.version)";
-
-fn python_environment_name(program: &Path, identity: &[String]) -> String {
-    // Include the actual runtime identity: upgrading Python in place or
-    // changing py.exe's default must not reuse an obsolete environment.
-    let mut hash = 14695981039346656037u64;
-    for byte in format!("{}\n{}", program.display(), identity.join("\n")).as_bytes() {
-        hash = (hash ^ *byte as u64).wrapping_mul(1099511628211);
-    }
-    format!(".launcher-python-{hash:016x}")
-}
-
-fn managed_python_healthy(
-    program: &Path,
-    cwd: &Path,
-    environment: &[(OsString, OsString)],
-    reporter: &Reporter,
-) -> bool {
-    // An interrupted venv creation can leave a runnable interpreter without
-    // pip. Rebuild that environment before trying to install dependencies.
-    program.is_file()
-        && python_call(
-            program,
-            &[],
-            &["-c", &format!("{PYTHON_PROBE}; import pip")],
-            cwd,
-            environment,
-            reporter,
-        )
-        .is_ok()
-}
-
-fn select_python(
-    preferred: &Path,
-    candidates: Vec<PathBuf>,
-    mut probe: impl FnMut(&Path) -> Result<Vec<String>, String>,
-) -> Result<(PathBuf, Vec<String>), String> {
-    let mut tried = BTreeSet::new();
-    let mut failures = Vec::new();
-    for path in std::iter::once(preferred.to_path_buf()).chain(candidates) {
-        if !tried.insert(path.clone()) {
-            continue;
-        }
-        if path.components().any(|part| {
-            part.as_os_str()
-                .to_string_lossy()
-                .eq_ignore_ascii_case("WindowsApps")
-        }) {
-            failures.push(format!("{}: Windows Store execution alias", path.display()));
-            continue;
-        }
-        match probe(&path) {
-            Ok(identity) => return Ok((path, identity)),
-            Err(error) => failures.push(format!("{}: {error}", path.display())),
-        }
-    }
-    Err(format!("No working Python 3.11+ found. Install Python from python.org, then retry or select it under Launch options > Python. Windows Store execution aliases are not an installed Python.\n{}", failures.join("\n")))
-}
-
 fn copy_existing_converted(
     source: &Path,
     destination: &Path,
@@ -1133,22 +1051,40 @@ fn import_d2r_cached(
 }
 
 fn import_d2r(request: &D2rImportRequest, reporter: &Reporter) -> Result<PathBuf, String> {
+    let name = if cfg!(windows) {
+        "d2r-convert.exe"
+    } else {
+        "d2r-convert"
+    };
+    let converter = std::env::var_os("DAMNATIONX_D2R_RUST_CONVERTER")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| request.importer_dir.join("bin").join(name));
+    import_d2r_with_converter(request, reporter, Some(converter))
+}
+
+fn import_d2r_with_converter(
+    request: &D2rImportRequest,
+    reporter: &Reporter,
+    converter: Option<PathBuf>,
+) -> Result<PathBuf, String> {
     reporter.check()?;
     if !assets::is_d2r_install(&request.game_dir) {
-        return Err("Choose the owned D2R installation containing .build.info and Data".into());
+        return Err(D2R_INSTALL_REQUIRED.into());
     }
-    if !request
-        .importer_dir
-        .join("d2r_import/__main__.py")
-        .is_file()
-        || !request.importer_dir.join("requirements.txt").is_file()
-    {
+    let has_recipes = request.importer_dir.join("mapping.toml").is_file()
+        && request.importer_dir.join("env_mapping.toml").is_file();
+    if !has_recipes {
         return Err("Importer recipes are missing; choose resources/d2r-import or the repository's tools/d2r-import".into());
     }
     let destination = request.cache_dir.join("glb");
     let mut stage = Stage::new(&destination)?;
     let mut work = crate::d2r_resume::Work::open(&request.cache_dir, &request.game_dir)?;
-    let cache = work.cache.clone();
+    let cache = work.cache.canonicalize().map_err(|e| e.to_string())?;
+    let game = request.game_dir.canonicalize().map_err(|e| e.to_string())?;
+    let importer = request
+        .importer_dir
+        .canonicalize()
+        .map_err(|e| e.to_string())?;
     reporter.log(format!(
         "Conversion work is retained at {} for retries after failure or cancellation",
         cache.display()
@@ -1165,12 +1101,6 @@ fn import_d2r(request: &D2rImportRequest, reporter: &Reporter) -> Result<PathBuf
         }
         fs::create_dir_all(cache.join("glb")).map_err(|e| e.to_string())?;
     }
-    let mut environment = vec![
-        ("D2R_IMPORT_CACHE".into(), cache.as_os_str().into()),
-        ("D2R_GAME_DIR".into(), request.game_dir.as_os_str().into()),
-        ("PYTHONPATH".into(), request.importer_dir.as_os_str().into()),
-        ("PYTHONUNBUFFERED".into(), "1".into()),
-    ];
     let tool_name = if cfg!(windows) {
         "d2rtool.exe"
     } else {
@@ -1178,200 +1108,91 @@ fn import_d2r(request: &D2rImportRequest, reporter: &Reporter) -> Result<PathBuf
     };
     let packaged_tool = request.importer_dir.join("bin").join(tool_name);
     let cached_tool = request.cache_dir.join("bin").join(tool_name);
-    if packaged_tool.is_file() {
-        environment.push(("D2RTOOL".into(), packaged_tool.into_os_string()));
-    } else if cached_tool.is_file() {
-        environment.push(("D2RTOOL".into(), cached_tool.clone().into_os_string()));
-    }
-    let selected = select_python(&request.python, assets::python_candidates(), |path| {
-        reporter.check()?;
-        python_call(
-            path,
-            &python_prefix(path),
-            &["-c", PYTHON_PROBE],
-            &request.importer_dir,
-            &environment,
-            reporter,
-        )
-    });
-    reporter.check()?;
-    let (mut python, identity) = selected?;
-    if python != request.python {
-        reporter.log(format!(
-            "Selected working Python {} instead of {}",
-            python.display(),
-            request.python.display()
-        ));
-    }
-    let mut prefix = python_prefix(&python);
-    if request.create_venv {
-        // The interpreter/tools cache is separate from the playable asset tree.
-        // Re-running pip repairs an interrupted first setup without touching it.
-        let venv = request
-            .cache_dir
-            .parent()
-            .unwrap()
-            .join(python_environment_name(&python, &identity));
-        let executable = venv.join(if cfg!(windows) {
-            "Scripts/python.exe"
+    if let Some(converter) = converter {
+        let helper = if packaged_tool.is_file() {
+            &packaged_tool
         } else {
-            "bin/python"
-        });
-        let usable =
-            managed_python_healthy(&executable, &request.importer_dir, &environment, reporter);
-        reporter.check()?;
-        if !usable {
-            if venv.exists() {
-                reporter.log("Rebuilding stale importer Python environment");
-                fs::remove_dir_all(&venv)
-                    .map_err(|e| format!("Could not rebuild {}: {e}", venv.display()))?;
-            }
-            reporter.progress("Creating importer Python environment", 0, None);
-            let mut argv = prefix.clone();
-            argv.extend([
-                OsString::from("-m"),
-                OsString::from("venv"),
-                venv.into_os_string(),
-            ]);
-            run(
-                &python,
-                &argv,
-                &request.importer_dir,
-                &environment,
-                reporter,
-            )?;
-        }
-        python = executable;
-        prefix.clear();
-        reporter.progress("Installing NumPy and Pillow", 0, None);
-        let requirements = request.importer_dir.join("requirements.txt");
-        let args = [
-            OsString::from("-m"),
-            OsString::from("pip"),
-            OsString::from("install"),
-            OsString::from("--disable-pip-version-check"),
-            OsString::from("-r"),
-            requirements.into_os_string(),
-        ];
-        run(
-            &python,
-            &args,
-            &request.importer_dir,
-            &environment,
-            reporter,
-        )?;
-    }
-    python_call(
-        &python,
-        &prefix,
-        &[
-            "-c",
-            "import numpy, PIL; print('Importer dependencies available')",
-        ],
-        &request.importer_dir,
-        &environment,
-        reporter,
-    )?;
-    let steps: &[(&str, &[&str])] = &[
-        ("Preparing owned D2R archive access", &["setup"]),
-        ("Converting mapped models", &["mapping"]),
-        ("Resolving animation mapping", &["resolve"]),
-        ("Building level environments", &["env", "build"]),
-        ("Extracting D2R interface", &["ui"]),
-        ("Extracting Town Portal fields", &["vfx", "town_portal"]),
-    ];
-    let mut reused_models = false;
-    for (index, (label, args)) in steps.iter().enumerate() {
-        reporter.check()?;
-        let phase = match index {
-            1 | 2 => Some("models"),
-            3 => Some("environment"),
-            4 => Some("ui"),
-            5 => Some("portal"),
-            _ => None,
+            &cached_tool
         };
-        let ready_for = |phase: &str| {
+        if !converter.is_file() || !helper.is_file() {
+            return Err("D2R importer is incomplete: the converter or archive helper is missing from the release".into());
+        }
+        let converter = converter.canonicalize().map_err(|e| e.to_string())?;
+        let helper = helper.canonicalize().map_err(|e| e.to_string())?;
+        let steps = [
+            (
+                "models",
+                "Converting mapped models",
+                "mapping-all",
+                Some("mapping.toml"),
+            ),
+            (
+                "environment",
+                "Building level environments",
+                "environment",
+                Some("env_mapping.toml"),
+            ),
+            ("ui", "Extracting D2R interface", "ui", None),
+            ("portal", "Extracting Town Portal fields", "portal", None),
+        ];
+        for (index, (phase, label, command, recipe)) in steps.iter().enumerate() {
+            reporter.check()?;
             let status = assets::inspect(&AssetPaths {
                 d2r_dir: Some(cache.join("glb")),
                 ..Default::default()
             });
-            match phase {
+            let ready = match *phase {
                 "models" => status.d2r_mapping.ready,
                 "environment" => status.d2r_environment.ready,
                 "ui" => status.d2r_ui.ready,
                 "portal" => status.d2r_portal.ready,
                 _ => false,
+            };
+            if work.begin(phase, &request.importer_dir, ready)? {
+                reporter.log(format!("Reusing completed phase: {label}"));
+                reporter.progress(label, (index + 1) as u64, Some(steps.len() as u64));
+                continue;
             }
-        };
-        let reuse = if index == 2 {
-            reused_models
-        } else if let Some(phase) = phase {
-            work.begin(phase, &request.importer_dir, ready_for(phase))?
-        } else {
-            false
-        };
-        if index == 1 {
-            reused_models = reuse;
-        }
-        if reuse {
-            reporter.log(format!("Reusing completed phase: {label}"));
+            // This is the retained work cache, never the published destination.
+            // The converter refuses to overwrite a completed mapping manifest.
+            if *phase == "models" {
+                let manifest = cache.join("glb/mapping.resolved.json");
+                if manifest.exists() {
+                    fs::remove_file(manifest).map_err(|e| e.to_string())?;
+                }
+            }
+            let mut args = vec![
+                OsString::from(command),
+                game.as_os_str().into(),
+                cache.as_os_str().into(),
+                helper.as_os_str().into(),
+            ];
+            if let Some(recipe) = recipe {
+                args.push(importer.join(recipe).into_os_string());
+            }
+            reporter.progress(label, index as u64, Some(steps.len() as u64));
+            run(&converter, &args, &importer, &[], reporter)?;
+            let status = assets::inspect(&AssetPaths {
+                d2r_dir: Some(cache.join("glb")),
+                ..Default::default()
+            });
+            let valid = match *phase {
+                "models" => status.d2r_mapping.ready,
+                "environment" => status.d2r_environment.ready,
+                "ui" => status.d2r_ui.ready,
+                "portal" => status.d2r_portal.ready,
+                _ => false,
+            };
+            if !valid {
+                return Err(format!("Rust importer produced incomplete {phase} assets; previous installation retained"));
+            }
+            work.complete(phase)?;
             reporter.progress(label, (index + 1) as u64, Some(steps.len() as u64));
-            continue;
         }
-        reporter.progress(label, index as u64, Some(steps.len() as u64));
-        let mut argv = prefix.clone();
-        argv.extend([
-            OsString::from("-u"),
-            OsString::from("-m"),
-            OsString::from("d2r_import"),
-        ]);
-        argv.extend(args.iter().map(|arg| OsString::from(*arg)));
-        run(
-            &python,
-            &argv,
-            &request.importer_dir,
-            &environment,
-            reporter,
-        )?;
-        if index != 1 {
-            if let Some(phase) = phase.filter(|phase| ready_for(phase)) {
-                work.complete(phase)?;
-            }
-        }
-        reporter.progress(label, (index + 1) as u64, Some(steps.len() as u64));
+        stage.publish(&cache.join("glb"), &destination, reporter)?;
+        return Ok(destination);
     }
-    reporter.progress("Validating converted assets", 0, None);
-    let status = assets::inspect(&AssetPaths {
-        d2r_dir: Some(cache.join("glb")),
-        ..Default::default()
-    });
-    if !status.d2r_ready() {
-        return Err(format!(
-            "Converted cache is incomplete; keeping previous installation.\n{}\n{}\n{}\n{}",
-            status.d2r_mapping.detail,
-            status.d2r_environment.detail,
-            status.d2r_ui.detail,
-            status.d2r_portal.detail
-        ));
-    }
-    stage.publish(&cache.join("glb"), &destination, reporter)?;
-    // Retain a freshly built helper without replacing any working helper.
-    // This is a tools cache, outside the committed playable asset subtree.
-    let built_tool = cache.join("bin").join(tool_name);
-    if !cached_tool.exists() && built_tool.is_file() {
-        let cache_result = (|| -> std::io::Result<()> {
-            fs::create_dir_all(cached_tool.parent().unwrap())?;
-            let temporary = cached_tool.with_extension("installing");
-            fs::copy(&built_tool, &temporary)?;
-            fs::rename(temporary, &cached_tool)
-        })();
-        if let Err(error) = cache_result {
-            reporter.log(format!(
-                "Converted assets installed; helper cache could not be retained: {error}"
-            ));
-        }
-    }
-    Ok(destination)
+    Err("Rust D2R converter is unavailable".into())
 }
 
 fn publish_sound_packs(
@@ -1495,11 +1316,13 @@ fn import_d2r_sounds(
     reporter: &Reporter,
 ) -> Result<PathBuf, String> {
     reporter.check()?;
-    if !assets::is_d2r_install(&request.game_dir) || !request.game_dir.join("Data/indices").is_dir()
-    {
-        return Err(
-            "Choose the owned D2R installation containing .build.info and Data/indices".into(),
-        );
+    let readable = match assets::d2r_layout(&request.game_dir) {
+        Some(assets::D2rLayout::BattleNet { data }) => data.join("indices").is_dir(),
+        Some(assets::D2rLayout::Steam { .. }) => true,
+        None => false,
+    };
+    if !readable {
+        return Err(D2R_INSTALL_REQUIRED.into());
     }
     let program = request
         .program
@@ -1572,154 +1395,6 @@ mod tests {
         }
     }
 
-    fn available_python() -> Option<PathBuf> {
-        let mut candidates = Vec::new();
-        for key in ["PYTHON_SYS_EXECUTABLE", "PYTHON"] {
-            if let Some(path) = std::env::var_os(key) {
-                candidates.push(PathBuf::from(path));
-            }
-        }
-        candidates.extend([
-            PathBuf::from("/opt/homebrew/bin/python3"),
-            PathBuf::from("python3"),
-            PathBuf::from("python"),
-            PathBuf::from("py.exe"),
-        ]);
-        candidates.into_iter().find(|program| {
-            Command::new(program)
-                .args(python_prefix(program))
-                .args([
-                    "-c",
-                    "import sys; sys.exit(0 if sys.version_info >= (3, 11) else 1)",
-                ])
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status()
-                .is_ok_and(|status| status.success())
-        })
-    }
-
-    #[test]
-    fn python_upgrade_recovers_from_a_cached_old_or_deleted_interpreter() {
-        for failure in ["Python 3.11 or newer is required", "file not found"] {
-            let old = PathBuf::from("old-python");
-            let new = PathBuf::from("new-python");
-            let mut attempts = Vec::new();
-            let (selected, _) = select_python(&old, vec![old.clone(), new.clone()], |path| {
-                attempts.push(path.to_path_buf());
-                if path == old {
-                    Err(failure.into())
-                } else {
-                    Ok(vec!["Python 3.13".into()])
-                }
-            })
-            .unwrap();
-            assert_eq!(selected, new);
-            assert_eq!(attempts, vec![old, new]);
-        }
-    }
-
-    #[test]
-    fn working_explicit_python_wins_and_missing_python_gives_recovery_steps() {
-        let chosen = Path::new("selected-python");
-        let (selected, _) = select_python(chosen, vec!["other-python".into()], |path| {
-            assert_eq!(path, chosen);
-            Ok(Vec::new())
-        })
-        .unwrap();
-        assert_eq!(selected, chosen);
-        let error =
-            select_python(chosen, Vec::new(), |_| Err("exit code: 9009".into())).unwrap_err();
-        assert!(error.contains("Launch options > Python"));
-        assert!(error.contains("exit code: 9009"));
-    }
-
-    #[test]
-    fn store_alias_is_skipped_without_starting_it() {
-        let path = Path::new("WindowsApps/python.exe");
-        let result = select_python(path, Vec::new(), |_| panic!("must not open the Store"));
-        assert!(result
-            .unwrap_err()
-            .contains("Windows Store execution alias"));
-    }
-
-    #[test]
-    fn runtime_upgrade_or_launcher_default_change_invalidates_the_venv_key() {
-        let path = Path::new("py.exe");
-        let old = vec!["Python311/python.exe".into(), "3.11.9".into()];
-        let upgrade = vec!["Python311/python.exe".into(), "3.11.10".into()];
-        let changed_default = vec!["Python313/python.exe".into(), "3.13.0".into()];
-        let original = python_environment_name(path, &old);
-        assert_eq!(original, python_environment_name(path, &old));
-        assert_ne!(original, python_environment_name(path, &upgrade));
-        assert_ne!(original, python_environment_name(path, &changed_default));
-    }
-
-    #[test]
-    fn minimum_python_version_is_checked_even_with_optimization_enabled() {
-        let Some(python) = available_python() else {
-            eprintln!("SKIP Python probe: Python 3.11+ is unavailable");
-            return;
-        };
-        let script = format!("import sys; sys.version_info = (3,10); {PYTHON_PROBE}");
-        let output = Command::new(&python)
-            .args(python_prefix(&python))
-            .args(["-O", "-c", &script])
-            .output()
-            .unwrap();
-        assert!(!output.status.success());
-        assert!(
-            String::from_utf8_lossy(&output.stderr).contains("Python 3.11 or newer is required")
-        );
-    }
-
-    #[test]
-    fn interrupted_venv_without_pip_is_unhealthy_until_bootstrapped() {
-        let Some(python) = available_python() else {
-            eprintln!("SKIP venv recovery: Python 3.11+ is unavailable");
-            return;
-        };
-        let temp = tempfile::tempdir().unwrap();
-        let venv = temp.path().join("managed python");
-        let report = reporter();
-        let mut args = python_prefix(&python);
-        args.extend([
-            OsString::from("-m"),
-            OsString::from("venv"),
-            OsString::from("--without-pip"),
-            venv.clone().into_os_string(),
-        ]);
-        run(&python, &args, temp.path(), &[], &report).unwrap();
-        let executable = venv.join(if cfg!(windows) {
-            "Scripts/python.exe"
-        } else {
-            "bin/python"
-        });
-        assert!(!managed_python_healthy(
-            &executable,
-            temp.path(),
-            &[],
-            &report
-        ));
-        // ensurepip uses the interpreter's bundled wheels, without network access.
-        python_call(
-            &executable,
-            &[],
-            &["-m", "ensurepip"],
-            temp.path(),
-            &[],
-            &report,
-        )
-        .unwrap();
-        assert!(managed_python_healthy(
-            &executable,
-            temp.path(),
-            &[],
-            &report
-        ));
-    }
-
     fn sound_pack(path: &Path, marker: &[u8]) {
         fs::create_dir_all(path.join("sfx")).unwrap();
         fs::write(
@@ -1751,32 +1426,25 @@ mod tests {
         let program = root.join("native sound importer with spaces");
         fs::write(
             &program,
-            r#"#!/usr/bin/env python3
-import argparse, pathlib, struct, sys, time, wave
-p = argparse.ArgumentParser()
-p.add_argument('--import-d2-sounds', required=True)
-p.add_argument('--d2r-game-dir', required=True)
-p.add_argument('--sound-output-dir', required=True)
-a = p.parse_args()
-source = pathlib.Path(a.d2r_game_dir)
-out = pathlib.Path(a.sound_output_dir)
-(source / 'called').write_text(a.import_d2_sounds)
-if (source / 'pause').exists():
-    print('waiting in native sound import', flush=True)
-    time.sleep(30)
-if (source / 'fail-native').exists():
-    print('owned archive could not be opened', flush=True)
-    sys.exit(7)
-for name in ['d2r-sounds-classic', 'd2r-sounds-advanced']:
-    if name.endswith('advanced') and (source / 'fail-validation').exists():
-        break
-    root = out / name
-    (root / 'sfx').mkdir(parents=True)
-    with wave.open(str(root / 'sfx/test.wav'), 'wb') as f:
-        f.setnchannels(1); f.setsampwidth(2); f.setframerate(22050)
-        f.writeframes(struct.pack('<16h', *range(16)))
-    (root / 'manifest.ini').write_text('[mod]\nname=source-free test sound pack\n')
-print('Imported 1 classic and 1 remastered sound', flush=True)
+            r#"#!/bin/sh
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --import-d2-sounds) mode="$2"; shift 2;;
+    --d2r-game-dir) source="$2"; shift 2;;
+    --sound-output-dir) out="$2"; shift 2;;
+    *) exit 2;;
+  esac
+done
+printf %s "$mode" > "$source/called"
+if [ -f "$source/pause" ]; then echo 'waiting in native sound import'; sleep 30; fi
+if [ -f "$source/fail-native" ]; then echo 'owned archive could not be opened'; exit 7; fi
+for name in d2r-sounds-classic d2r-sounds-advanced; do
+  if [ "$name" = d2r-sounds-advanced ] && [ -f "$source/fail-validation" ]; then break; fi
+  mkdir -p "$out/$name/sfx"
+  printf 'RIFF0000WAVE0000000000000000000000000000000000000000' > "$out/$name/sfx/test.wav"
+  printf '[mod]\nname=source-free test sound pack\n' > "$out/$name/manifest.ini"
+done
+echo 'Imported 1 classic and 1 remastered sound'
 "#,
         )
         .unwrap();
@@ -1831,6 +1499,63 @@ print('Imported 1 classic and 1 remastered sound', flush=True)
             fs::read(request.destination.join("unrelated-user-mod/keep.txt")).unwrap(),
             b"untouched"
         );
+    }
+
+    /// Rewrites a fixture install into Steam's shape: no `.build.info` or
+    /// `Data/indices`, and a static store described by `Data/.build.config`.
+    fn make_steam_install(game: &Path) {
+        let _ = fs::remove_file(game.join(".build.info"));
+        let _ = fs::remove_dir_all(game.join("Data/indices"));
+        fs::create_dir_all(game.join("Data")).unwrap();
+        fs::write(
+            game.join("Data/.build.config"),
+            "root = bf9064519cc56ba5fe197ce27e4729a1\n",
+        )
+        .unwrap();
+        fs::write(game.join("Data/00-00000001.data"), b"").unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn steam_install_sounds_import_and_reimport_after_a_patch() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut request = sound_worker_fixture(temp.path());
+        make_steam_install(&request.game_dir);
+        request.stamp = Some(temp.path().join("d2r-models").join(d2r_cache::SOUND_STAMP));
+        let called = request.game_dir.join("called");
+        assert!(!import_d2r_sounds_cached(&request, &reporter()).unwrap().1);
+        assert_eq!(fs::read_to_string(&called).unwrap(), "d2r");
+        for name in assets::D2R_SOUND_PACKS {
+            assert!(assets::sound_pack_status(&request.destination.join(name)).is_ok());
+        }
+        fs::remove_file(&called).unwrap();
+        assert!(import_d2r_sounds_cached(&request, &reporter()).unwrap().1);
+        assert!(!called.exists());
+        // A Steam patch rewrites the build config.
+        fs::write(request.game_dir.join("Data/.build.config"), "root = 01\n").unwrap();
+        assert!(!import_d2r_sounds_cached(&request, &reporter()).unwrap().1);
+        assert!(called.is_file());
+        // Without its build config the folder is not an install, and nothing runs.
+        fs::remove_file(request.game_dir.join("Data/.build.config")).unwrap();
+        fs::remove_file(&called).unwrap();
+        let error = import_d2r_sounds(&request, &reporter()).unwrap_err();
+        assert_eq!(error, D2R_INSTALL_REQUIRED);
+        assert!(!called.exists());
+    }
+
+    #[test]
+    fn steam_install_passes_the_art_import_gate() {
+        let temp = tempfile::tempdir().unwrap();
+        let game = temp.path().join("Diablo II Resurrected");
+        make_steam_install(&game);
+        let request = D2rImportRequest {
+            game_dir: game,
+            cache_dir: temp.path().join("cache"),
+            importer_dir: temp.path().join("no recipes"),
+        };
+        // The install is accepted; the request stops at the missing recipes instead.
+        let error = import_d2r_with_converter(&request, &reporter(), None).unwrap_err();
+        assert!(error.contains("recipes are missing"), "{error}");
     }
 
     #[test]
@@ -2229,296 +1954,108 @@ print('Imported 1 classic and 1 remastered sound', flush=True)
             assert!(!incomplete_conversion(line));
         }
     }
+    #[cfg(unix)]
     #[test]
-    fn six_step_d2r_worker_publishes_valid_assets_and_preserves_them_on_failure() {
-        let python = available_python();
-        let Some(python) = python else {
-            eprintln!("SKIP six-step D2R worker transaction: Python 3.11+ is unavailable");
-            return;
-        };
+    fn rust_importer_transaction_validates_phases_and_preserves_published_assets_on_failure() {
+        use std::os::unix::fs::PermissionsExt;
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().canonicalize().unwrap();
-        let importer = root.join("fake importer with spaces");
-        let game = root.join("synthetic owned game");
-        let cache = root.join("external cache");
-        fs::create_dir_all(importer.join("d2r_import")).unwrap();
+        let game = root.join("owned game");
+        let cache = root.join("cache");
+        let importer = root.join("recipes");
         fs::create_dir_all(game.join("Data")).unwrap();
-        fs::write(game.join(".build.info"), "synthetic install marker").unwrap();
-        fs::write(
-            importer.join("requirements.txt"),
-            "# synthetic dependency stubs\n",
-        )
-        .unwrap();
-        for name in ["numpy.py", "PIL.py", "d2r_import/__init__.py"] {
-            fs::write(importer.join(name), "# source-free test stub\n").unwrap();
-        }
-        fs::write(
-            importer.join("d2r_import/__main__.py"),
-            r#"import json, os, struct, sys, time
-from pathlib import Path
-
-game = Path(os.environ['D2R_GAME_DIR'])
-cache = Path(os.environ['D2R_IMPORT_CACHE'])
-glb = cache / 'glb'
-stage = ' '.join(sys.argv[1:])
-with (game / 'invocations.txt').open('a', encoding='utf-8') as log:
-    log.write(stage + '\n')
-
-def write(name, data):
-    path = glb / name
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_bytes(data)
-
-def manifest(name, value):
-    write(name, json.dumps(value).encode('utf-8'))
-
-if stage == 'setup':
-    (cache / 'raw').mkdir(parents=True, exist_ok=True)
-    (cache / 'raw/new-extract.marker').write_text('staged only')
-elif stage == 'mapping':
-    model = json.dumps({'asset': {'version': '2.0'}, 'animations': [{'name': 'idle'}]}).encode()
-    model += b' ' * (-len(model) % 4)
-    write('hero.glb', b'glTF' + struct.pack('<II', 2, 20 + len(model))
-          + struct.pack('<I4s', len(model), b'JSON') + model)
-    write('transaction.marker', b'unpublished failure' if (game / 'fail-env').exists() else b'published')
-elif stage == 'resolve':
-    manifest('mapping.resolved.json', {'version': 2, 'entries': [
-        {'model': 'hero', 'glb': 'hero.glb', 'clips': {'stand': 'idle'}}]})
-elif stage == 'env build':
-    if (game / 'pause-env').exists():
-        write('env/paused.marker', b'waiting for cancellation')
-        while (game / 'pause-env').exists():
-            time.sleep(0.01)
-    if (game / 'fail-env').exists():
-        write('env/interrupted.marker', b'unpublished environment')
-        print('synthetic env error', flush=True)
-        sys.exit(7)
-    write('env/stone.png', b'source-free nonempty image fixture')
-    manifest('env/env.resolved.json', {'version': 2,
-        'levels': {name: {} for name in ['town', 'cathedral', 'catacombs', 'caves', 'hell']},
-        'models': {'hero': {'glb': 'hero.glb'}},
-        'materials': {'stone': {'albedo': 'env/stone.png'}}})
-elif stage == 'ui':
-    write('ui/interface.png', b'source-free nonempty image fixture')
-    keys = ['panel_background', 'button_sprint', 'options_background', 'options_pause_button',
-            'options_tabs', 'options_checkbox', 'options_slider_track', 'options_slider_thumb']
-    manifest('ui/ui.resolved.json', {'version': 1,
-        'images': {key: {'file': 'interface.png'} for key in keys}})
-elif stage == 'vfx town_portal':
-    write('vfx/town_portal/field.png', b'source-free nonempty image fixture')
-    keys = ['t_fx_noise_cells_conviction', 't_fx_noise_cells_conviction_glow_02_hilights',
-            't_fx_noise_goopy_03_meshdissolve', 't_fx_portal_gradient_03']
-    if (game / 'fail-portal').exists():
-        keys.remove('t_fx_portal_gradient_03')
-    manifest('vfx/town_portal/portal.resolved.json', {'version': 1,
-        'textures': {key: {'png': 'vfx/town_portal/field.png'} for key in keys}})
-else:
-    raise SystemExit('unexpected worker stage: ' + stage)
-"#,
-        )
-        .unwrap();
-        fs::create_dir_all(cache.join("raw")).unwrap();
+        fs::write(game.join(".build.info"), b"build").unwrap();
+        fs::create_dir_all(importer.join("d2r_import")).unwrap();
+        fs::write(importer.join("d2r_import/__main__.py"), b"").unwrap();
+        fs::write(importer.join("requirements.txt"), b"").unwrap();
+        fs::write(importer.join("mapping.toml"), b"fixture").unwrap();
+        fs::write(importer.join("env_mapping.toml"), b"fixture").unwrap();
         fs::create_dir_all(cache.join("bin")).unwrap();
-        fs::create_dir_all(cache.join("glb")).unwrap();
-        fs::write(cache.join("raw/keep.marker"), b"original raw").unwrap();
-        let tool = cache.join("bin").join(if cfg!(windows) {
-            "d2rtool.exe"
-        } else {
-            "d2rtool"
-        });
-        fs::write(&tool, b"original helper").unwrap();
-        fs::write(cache.join("glb/transaction.marker"), b"before import").unwrap();
-        #[cfg(unix)]
-        fs::write(
-            cache.join("glb/legacy:model.png"),
-            b"old nonportable texture",
-        )
-        .unwrap();
+        fs::write(cache.join("bin/d2rtool"), b"helper").unwrap();
+        let write = |phase: &str, path: &str, bytes: &[u8]| {
+            let path = game.join("fixtures").join(phase).join(path);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, bytes).unwrap();
+        };
+        let mut model = br#"{"asset":{"version":"2.0"},"animations":[{"name":"idle"}]}"#.to_vec();
+        while model.len() % 4 != 0 {
+            model.push(b' ');
+        }
+        let mut glb = b"glTF".to_vec();
+        glb.extend_from_slice(&2u32.to_le_bytes());
+        glb.extend_from_slice(&(20u32 + model.len() as u32).to_le_bytes());
+        glb.extend_from_slice(&(model.len() as u32).to_le_bytes());
+        glb.extend_from_slice(b"JSON");
+        glb.extend(model);
+        write("mapping-all", "hero.glb", &glb);
+        write("mapping-all","mapping.resolved.json",br#"{"version":2,"entries":[{"model":"hero","glb":"hero.glb","clips":{"stand":"idle"}}]}"#);
+        write("environment", "env/stone.png", b"image");
+        write("environment","env/env.resolved.json",br#"{"version":2,"levels":{"town":{},"cathedral":{},"catacombs":{},"caves":{},"hell":{}},"models":{"hero":{"glb":"hero.glb"}},"materials":{"stone":{"albedo":"env/stone.png"}}}"#);
+        write("ui", "ui/interface.png", b"image");
+        write("ui","ui/ui.resolved.json",br#"{"version":1,"images":{"panel_background":{"file":"interface.png"},"button_sprint":{"file":"interface.png"},"options_background":{"file":"interface.png"},"options_pause_button":{"file":"interface.png"},"options_tabs":{"file":"interface.png"},"options_checkbox":{"file":"interface.png"},"options_slider_track":{"file":"interface.png"},"options_slider_thumb":{"file":"interface.png"}}}"#);
+        write("portal", "vfx/town_portal/field.png", b"image");
+        write("portal","vfx/town_portal/portal.resolved.json",br#"{"version":1,"textures":{"t_fx_noise_cells_conviction":{"png":"vfx/town_portal/field.png"},"t_fx_noise_cells_conviction_glow_02_hilights":{"png":"vfx/town_portal/field.png"},"t_fx_noise_goopy_03_meshdissolve":{"png":"vfx/town_portal/field.png"},"t_fx_portal_gradient_03":{"png":"vfx/town_portal/field.png"}}}"#);
+        fs::create_dir_all(importer.join("bin")).unwrap();
+        let converter = importer.join("bin/d2r-convert");
+        fs::write(&converter, "#!/bin/sh\nif [ \"$1\" = environment ] && [ -f \"$2/fail-env\" ]; then exit 7; fi\nmkdir -p \"$3/glb\"\ncp -R \"$2/fixtures/$1/.\" \"$3/glb/\"\n").unwrap();
+        fs::set_permissions(&converter, fs::Permissions::from_mode(0o755)).unwrap();
         let request = D2rImportRequest {
             game_dir: game.clone(),
             cache_dir: cache.clone(),
             importer_dir: importer,
-            python,
-            create_venv: false,
         };
-        let destination = import_d2r(&request, &reporter()).unwrap();
-        assert_eq!(destination, cache.join("glb"));
-        #[cfg(unix)]
-        assert!(
-            !destination.join("legacy:model.png").exists(),
-            "legacy converted bytes must be rebuilt rather than copied"
-        );
+        let dest = import_d2r(&request, &reporter()).unwrap();
+        let original = fs::read(dest.join("mapping.resolved.json")).unwrap();
+        fs::write(game.join("fail-env"), b"").unwrap();
+        // Change the source metadata so the resumed environment cannot be reused.
+        fs::write(game.join(".build.info"), b"new build").unwrap();
+        assert!(import_d2r_with_converter(&request, &reporter(), Some(converter)).is_err());
         assert_eq!(
-            fs::read_to_string(game.join("invocations.txt"))
-                .unwrap()
-                .lines()
-                .collect::<Vec<_>>(),
-            [
-                "setup",
-                "mapping",
-                "resolve",
-                "env build",
-                "ui",
-                "vfx town_portal"
-            ]
+            fs::read(dest.join("mapping.resolved.json")).unwrap(),
+            original
         );
-        assert!(assets::inspect(&AssetPaths {
-            d2r_dir: Some(destination.clone()),
+    }
+    #[test]
+    #[ignore = "requires owned D2R installation and compiled Rust converter/helper"]
+    fn owned_rust_import_completes_through_launcher() {
+        let game =
+            PathBuf::from(std::env::var_os("D2R_RUST_OWNED_GAME").expect("D2R_RUST_OWNED_GAME"));
+        let converter = PathBuf::from(
+            std::env::var_os("D2R_RUST_TEST_CONVERTER").expect("D2R_RUST_TEST_CONVERTER"),
+        );
+        let helper =
+            PathBuf::from(std::env::var_os("D2R_RUST_TEST_HELPER").expect("D2R_RUST_TEST_HELPER"));
+        let importer = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../d2r-import")
+            .canonicalize()
+            .unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let cache = temp.path().join("d2r-models");
+        fs::create_dir_all(cache.join("bin")).unwrap();
+        let name = if cfg!(windows) {
+            "d2rtool.exe"
+        } else {
+            "d2rtool"
+        };
+        fs::copy(helper, cache.join("bin").join(name)).unwrap();
+        let request = D2rImportRequest {
+            game_dir: game,
+            cache_dir: cache,
+            importer_dir: importer,
+        };
+        let dest = import_d2r_with_converter(&request, &reporter(), Some(converter)).unwrap();
+        let status = assets::inspect(&AssetPaths {
+            d2r_dir: Some(dest),
             ..Default::default()
-        })
-        .d2r_ready());
-        assert_eq!(
-            fs::read(destination.join("transaction.marker")).unwrap(),
-            b"published"
-        );
-        assert_eq!(
-            fs::read(cache.join("raw/keep.marker")).unwrap(),
-            b"original raw"
-        );
-        assert_eq!(fs::read(&tool).unwrap(), b"original helper");
-        assert!(!cache.join("raw/new-extract.marker").exists());
-        let snapshot = |path: &Path| -> BTreeMap<PathBuf, Vec<u8>> {
-            inventory(path, &reporter())
-                .unwrap()
-                .into_iter()
-                .map(|file| (file.relative, fs::read(file.source).unwrap()))
-                .collect()
-        };
-        let accepted = snapshot(&destination);
-        // Start a fresh conversion, then fail after the models have completed.
-        let work = cache.join(".import-work");
-        if work.exists() {
-            fs::remove_dir_all(&work).unwrap();
-        }
-        fs::write(game.join("invocations.txt"), "").unwrap();
-        fs::write(game.join("fail-env"), "stop at env").unwrap();
-        let error = import_d2r(&request, &reporter()).unwrap_err();
-        assert!(error.contains("synthetic env error"), "{error}");
-        assert_eq!(
-            fs::read_to_string(game.join("invocations.txt"))
-                .unwrap()
-                .lines()
-                .collect::<Vec<_>>(),
-            ["setup", "mapping", "resolve", "env build"]
-        );
-        assert_eq!(snapshot(&destination), accepted);
+        });
         assert!(
-            work.join("content/glb/hero.glb").is_file(),
-            "failed import discarded completed models"
+            status.d2r_ready(),
+            "mapping: {}; environment: {}; ui: {}; portal: {}",
+            status.d2r_mapping.detail,
+            status.d2r_environment.detail,
+            status.d2r_ui.detail,
+            status.d2r_portal.detail
         );
-        assert!(work.join("content/raw/new-extract.marker").is_file());
-        assert_eq!(
-            fs::read(cache.join("raw/keep.marker")).unwrap(),
-            b"original raw"
-        );
-        assert_eq!(fs::read(&tool).unwrap(), b"original helper");
-        assert!(!cache.join("raw/new-extract.marker").exists());
-        #[cfg(unix)]
-        {
-            let legacy = destination.join("legacy:model.png");
-            fs::write(&legacy, b"old nonportable texture").unwrap();
-            let error = import_d2r(&request, &reporter()).unwrap_err();
-            assert!(error.contains("synthetic env error"), "{error}");
-            assert_eq!(fs::read(&legacy).unwrap(), b"old nonportable texture");
-            fs::remove_file(legacy).unwrap();
-            assert_eq!(snapshot(&destination), accepted);
-        }
-        // Cached import: the first run records the result, an unchanged repeat
-        // starts no importer step, and a missing output imports again.
-        fs::remove_file(game.join("fail-env")).unwrap();
-        let invocations = || fs::read_to_string(game.join("invocations.txt")).unwrap();
-        fs::write(game.join("invocations.txt"), "").unwrap();
-        let (path, reused) = import_d2r_cached(&request, &reporter()).unwrap();
-        assert_eq!((path, reused), (destination.clone(), false));
-        assert_eq!(
-            invocations().lines().collect::<Vec<_>>(),
-            ["setup", "env build", "ui", "vfx town_portal"]
-        );
-        assert!(cache.join(d2r_cache::ART_STAMP).is_file());
-        fs::write(game.join("invocations.txt"), "").unwrap();
-        assert!(import_d2r_cached(&request, &reporter()).unwrap().1);
-        assert_eq!(invocations(), "");
-        fs::remove_file(destination.join("ui/interface.png")).unwrap();
-        assert!(!import_d2r_cached(&request, &reporter()).unwrap().1);
-        assert_eq!(invocations().lines().collect::<Vec<_>>(), ["setup", "ui"]);
-        fs::write(game.join("invocations.txt"), "").unwrap();
-        assert!(import_d2r_cached(&request, &reporter()).unwrap().1);
-        assert_eq!(invocations(), "");
-
-        // Reproduce the original late portal validation failure. A portal-only
-        // recipe update must not make models, environments or UI run again.
-        let model = fs::read(destination.join("hero.glb")).unwrap();
-        fs::write(
-            request.importer_dir.join("d2r_import/vfx.py"),
-            "# portal revision 1",
-        )
-        .unwrap();
-        fs::write(game.join("fail-portal"), "missing required gradient").unwrap();
-        let accepted = snapshot(&destination);
-        let error = import_d2r_cached(&request, &reporter()).unwrap_err();
-        assert!(
-            error.contains("Portal is missing t_fx_portal_gradient_03"),
-            "{error}"
-        );
-        assert_eq!(snapshot(&destination), accepted);
-        assert_eq!(
-            invocations().lines().collect::<Vec<_>>(),
-            ["setup", "vfx town_portal"]
-        );
-        fs::remove_file(game.join("fail-portal")).unwrap();
-        fs::write(
-            request.importer_dir.join("d2r_import/vfx.py"),
-            "# fixed portal revision 2",
-        )
-        .unwrap();
-        fs::write(game.join("invocations.txt"), "").unwrap();
-        import_d2r_cached(&request, &reporter()).unwrap();
-        assert_eq!(
-            invocations().lines().collect::<Vec<_>>(),
-            ["setup", "vfx town_portal"]
-        );
-        assert_eq!(fs::read(destination.join("hero.glb")).unwrap(), model);
-
-        // Real child-process cancellation also retains the finished models.
-        fs::write(
-            request.importer_dir.join("d2r_import/env.py"),
-            "# environment revision 2",
-        )
-        .unwrap();
-        fs::write(game.join("pause-env"), "wait").unwrap();
-        let worker_reporter = reporter();
-        let cancel = worker_reporter.cancel.clone();
-        let worker_request = request.clone();
-        let worker = thread::spawn(move || import_d2r_cached(&worker_request, &worker_reporter));
-        let deadline = Instant::now() + Duration::from_secs(15);
-        while !work.join("content/glb/env/paused.marker").exists() {
-            assert!(
-                !worker.is_finished(),
-                "importer exited before cancellation probe"
-            );
-            assert!(
-                Instant::now() < deadline,
-                "importer never reached cancellation probe"
-            );
-            thread::sleep(Duration::from_millis(10));
-        }
-        cancel.store(true, Ordering::Release);
-        assert!(worker.join().unwrap().unwrap_err().contains("Cancelled"));
-        assert_eq!(fs::read(work.join("content/glb/hero.glb")).unwrap(), model);
-        assert_eq!(snapshot(&destination), accepted);
-        fs::remove_file(game.join("pause-env")).unwrap();
-        fs::write(game.join("invocations.txt"), "").unwrap();
-        import_d2r_cached(&request, &reporter()).unwrap();
-        assert!(!invocations().contains("mapping"));
-        assert!(!invocations().contains("resolve"));
-
-        // A changed owned game build invalidates raw extracts and all phases.
-        fs::write(work.join("content/raw/obsolete.marker"), "old build").unwrap();
-        fs::write(game.join(".build.info"), "new synthetic D2R build").unwrap();
-        fs::write(game.join("invocations.txt"), "").unwrap();
-        import_d2r_cached(&request, &reporter()).unwrap();
-        assert_eq!(invocations().lines().count(), 6);
-        assert!(!work.join("content/raw/obsolete.marker").exists());
     }
     #[test]
     fn process_child_fixture() {

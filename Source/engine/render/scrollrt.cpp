@@ -1,9 +1,11 @@
+#include "dvlnet/async_runtime.h"
 /**
  * @file scrollrt.cpp
  *
  * Implementation of functionality for rendering the dungeons, monsters and calling other render routines.
  */
 #include "engine/render/scrollrt.h"
+#include "survivors.h"
 
 #include <algorithm>
 #include <array>
@@ -276,6 +278,8 @@ void UndrawCursor(const Surface &out)
 
 bool ShouldShowCursor()
 {
+	if (host::HideGameCursor())
+		return false; // --host-hide-cursor: clean recordings
 	if (fpv::IsMouseLook())
 		return false; // first person: the crosshair replaces the cursor until a panel or Alt frees it
 	if (ControlMode == ControlTypes::KeyboardAndMouse)
@@ -431,6 +435,7 @@ void DrawMissile(const Surface &out, WorldTilePosition tilePosition, Point targe
  */
 void DrawMonster(const Surface &out, Point tilePosition, Point targetBufferPosition, const Monster &monster, int lightTableIndex)
 {
+	targetBufferPosition += AsyncNetRenderOffset(monster);
 	if (!monster.animInfo.sprites) {
 		Log("Draw Monster \"{}\": NULL Cel Buffer", monster.name());
 		return;
@@ -520,6 +525,7 @@ uint8_t GetPlayerOutlineColor(int id)
  */
 void DrawPlayer(const Surface &out, const Player &player, Point tilePosition, Point targetBufferPosition, int lightTableIndex)
 {
+	targetBufferPosition += AsyncNetRenderOffset(player);
 	if (!IsTileLit(tilePosition) && !MyPlayer->_pInfraFlag && !MyPlayer->isOnArenaLevel() && leveltype != DTYPE_TOWN) {
 		return;
 	}
@@ -2582,6 +2588,7 @@ void DrawAndBlit()
 	if (*GetOptions().Gameplay.showMultiplayerPartyInfo && PartySidePanelOpen)
 		DrawPartyMemberInfoPanel(ui);
 
+	DrawSurvivorsMode(ui);
 	DrawCursor(ui);
 
 	DrawFPS(ui);

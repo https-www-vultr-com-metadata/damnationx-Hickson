@@ -277,6 +277,20 @@ struct Player {
 	 */
 	AnimationInfo AnimInfo;
 	/**
+	 * @brief Survivors attack/cast animation drawn over the movement state.
+	 *
+	 * Survivors auto attacks and manual actions resolve without occupying the
+	 * player mode, so walking keeps its step timing. This overlay only selects
+	 * the displayed sprite. Sprites are looked up from AnimationData by graphic
+	 * and direction, so gear or level reloads cannot leave a dangling list.
+	 */
+	AnimationInfo survivorsActionAnim {};
+	player_graphic survivorsActionGraphic = player_graphic::Attack;
+	Direction survivorsActionDirection = Direction::South;
+	bool survivorsActionActive = false;
+	/** @brief Counts overlay starts, so the co-op authority can tell clients about new ones. */
+	uint8_t survivorsActionSerial = 0;
+	/**
 	 * @brief Contains a optional preview ClxSprite that is displayed until the current command is handled by the game logic
 	 */
 	OptionalClxSprite previewCelSprite;
@@ -782,14 +796,31 @@ public:
 
 	[[nodiscard]] player_graphic getGraphic() const;
 
+	/** @brief Graphic to render: the Survivors action overlay while it plays, otherwise getGraphic(). */
+	[[nodiscard]] player_graphic getDisplayedGraphic() const
+	{
+		return survivorsActionActive ? survivorsActionGraphic : getGraphic();
+	}
+	/** @brief Animation timing to render with (see getDisplayedGraphic). Movement offsets still use AnimInfo. */
+	[[nodiscard]] const AnimationInfo &getDisplayedAnimation() const
+	{
+		return survivorsActionActive ? survivorsActionAnim : AnimInfo;
+	}
+
 	[[nodiscard]] uint16_t getSpriteWidth() const;
 
 	void getAnimationFramesAndTicksPerFrame(player_graphic graphics, int8_t &numberOfFrames, int8_t &ticksPerFrame) const;
 
 	[[nodiscard]] ClxSprite currentSprite() const
 	{
-		return previewCelSprite ? *previewCelSprite : AnimInfo.currentSprite();
+		if (previewCelSprite)
+			return *previewCelSprite;
+		if (const OptionalClxSprite action = survivorsActionSprite())
+			return *action;
+		return AnimInfo.currentSprite();
 	}
+	/** @brief The Survivors action overlay sprite, if one is playing and its graphic is loaded. */
+	[[nodiscard]] OptionalClxSprite survivorsActionSprite() const;
 	[[nodiscard]] Displacement getRenderingOffset(const ClxSprite sprite) const
 	{
 		Displacement offset = { -CalculateSpriteTileCenterX(sprite.width()), 0 };
@@ -809,6 +840,11 @@ public:
 	[[nodiscard]] Direction getSpriteDirection() const
 	{
 		return isWalking() && IsSmoothMovementEnabled() ? tempDirection : _pdir;
+	}
+	/** @brief Direction to render: a Survivors action faces its target, otherwise getSpriteDirection(). */
+	[[nodiscard]] Direction getDisplayedDirection() const
+	{
+		return survivorsActionActive ? survivorsActionDirection : getSpriteDirection();
 	}
 
 	/**
@@ -989,6 +1025,14 @@ void PlrDoTrans(Point position);
 void SetPlayerOld(Player &player);
 void FixPlayerLocation(Player &player, Direction bDir);
 void StartStand(Player &player, Direction dir);
+/** Start a native sword swing at an adjacent Survivors target, using the weapon's rank damage. */
+bool StartSurvivorsAutoMelee(Player &player, Point target, int damage, bool cleave);
+/** Play a Survivors attack or cast animation facing target over the current stand/walk, without changing the player mode. */
+void StartSurvivorsActionAnimation(Player &player, player_graphic graphic, Point target);
+/** Co-op client: start an action the authority reported, without the local restart throttle. */
+void ReplaySurvivorsActionAnimation(Player &player, player_graphic graphic, Direction direction);
+bool SurvivorsManualAction(Player &player, Point target, bool ranged, bool spell, Direction wallDirection);
+void ResetSurvivorsManualActions();
 void StartPlrBlock(Player &player, Direction dir);
 void FixPlrWalkTags(const Player &player);
 void StartPlrHit(Player &player, int dam, bool forcehit);
@@ -1007,7 +1051,7 @@ void ClrPlrPath(Player &player);
 bool PosOkPlayer(const Player &player, Point position);
 void MakePlrPath(Player &player, Point targetPosition, bool endspace);
 void CheckPlrSpell(bool isShiftHeld, SpellID spellID = MyPlayer->_pRSpell, SpellType spellType = MyPlayer->_pRSplType);
-void SyncPlrAnim(Player &player);
+DVL_API_FOR_TEST void SyncPlrAnim(Player &player);
 void SyncInitPlrPos(Player &player);
 void SyncInitPlr(Player &player);
 void CheckStats(Player &player);

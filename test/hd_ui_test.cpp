@@ -16,6 +16,19 @@ using hd_ui::Placed;
 using hd_ui::PlacedMasked;
 using hd_ui::Rect;
 
+TEST(HdUiIndexTest, IndexedFontsRequireLosslessEncoding)
+{
+	using hd_ui::IndexedSheetEncodingPreservesIndices;
+	EXPECT_TRUE(IndexedSheetEncodingPreservesIndices(std::string_view("\x89PNG\r\n\x1a\n", 8)));
+	std::string webp = "RIFFxxxxWEBP";
+	webp.append("VP8L\x01\0\0\0x\0", 10);
+	EXPECT_TRUE(IndexedSheetEncodingPreservesIndices(webp));
+	webp.replace(12, 4, "VP8 ");
+	EXPECT_FALSE(IndexedSheetEncodingPreservesIndices(webp));
+	EXPECT_FALSE(IndexedSheetEncodingPreservesIndices("RIFFxxxxWEBP"));
+	EXPECT_FALSE(IndexedSheetEncodingPreservesIndices("not an image"));
+}
+
 constexpr char Sample[] = "\xEF\xBB\xBF# DamnationX HD UI\n"
                           "scale 4\n"
                           "sheet 0 ui/ctrlpan-panel8-0.png 2560 576\n"

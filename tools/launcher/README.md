@@ -50,8 +50,12 @@ Characters and World have separate controls.
 
 An **owned D2R installation** and a **converted D2R cache** are different inputs:
 
-- The install is the local game directory containing `.build.info` and `Data/`.
-  Select it for Import from D2R. CrossOver/Wine installs can be used as local
+- The install is the local game directory. A Battle.net install contains
+  `.build.info` and `Data/`; a Steam install (patch 3.2.0.1 and later) has no
+  `.build.info` and keeps a static CASC store in `Data/`, described by
+  `Data/.build.config`. Select it for Import from D2R; picking its `Data`
+  folder also works. The launcher finds Steam installs through each library in
+  Steam's `libraryfolders.vdf`. CrossOver/Wine installs can be used as local
   sources on macOS/Linux.
 - The converted cache contains `glb/mapping.resolved.json`, `glb/env/`,
   `glb/ui/` and `glb/vfx/town_portal/`. Select either that cache parent or its
@@ -75,32 +79,8 @@ Selecting another owned installation or D2R build discards incompatible work;
 recipe changes rebuild their affected phases. Clear D2R import also removes this
 retained work. A working packaged or cached helper is reused.
 
-Import from an owned installation requires:
+Import from an owned installation uses the packaged Rust converter, its mapping recipes, and the native `d2rtool` archive helper. Releases include both executables, so no interpreter, package installation, compiler, or network download is required for conversion.
 
-- Python 3.11 or newer. The importer checks the saved interpreter and searches
-  installed alternatives if it was removed or is too old. Windows Store aliases
-  are skipped. Select an executable under Launch options > Python if needed.
-  Managed environments are keyed by runtime identity and rebuilt if broken;
-  upgrading Python does not require deleting launcher settings in AppData.
-- NumPy `>=1.24,<3` and Pillow `>=10,<13`. The managed virtual-environment option
-  creates an isolated Python environment and installs these requirements. That
-  dependency installation requires internet access; an existing prepared Python
-  environment can be used instead.
-- The source importer recipe, discovered at
-  `resources/d2r-import` beside the launcher, or `tools/d2r-import` in a checkout.
-- A native `d2rtool` helper. Packages can supply it at
-  `resources/d2r-import/bin/d2rtool` (`d2rtool.exe` on Windows). Without a prebuilt
-  helper, conversion needs CMake 3.20+ and a C/C++17 compiler. The helper build
-  fetches a pinned, SHA256-verified CascLib source archive and uses its bundled
-  zlib; it does not download game data.
-
-For a prepared environment, install the Python requirements with:
-
-```sh
-python3 -m pip install -r tools/d2r-import/requirements.txt
-```
-
-On Windows, use the chosen Python executable or `py -3.11` in place of `python3`.
 Asset paths and converted bytes stay in local user storage. A D2R import reads
 the installation you select; no D2R account sign-in or game-data download occurs.
 
@@ -111,7 +91,7 @@ D2R renderer or its original particle simulation.
 
 Open **Sounds** and select **Import D2R sounds…** to read your owned D2R
 installation. This separate action imports both the Classic and Remastered sound
-packs through the game's native C++ importer. It does not need Python or a D2R
+packs through the game's native C++ importer. It does not need a D2R
 graphics conversion. Both packs show their imported sample count and readiness.
 
 Choose **Diablo (original)**, **D2R Classic**, or **D2R Remastered** in the sound
@@ -208,9 +188,7 @@ builds the legacy macOS game and is not the cross-platform launcher build path.
 
 The browser frontend retains display/settings controls and starts the browser
 game through the embedding page's `launch.start(args)` integration. Its file
-manager handles browser uploads. Native filesystem discovery, Python execution,
-D2R conversion, native process launch and desktop ZIP installation are unavailable
-in WebAssembly.
+manager handles browser uploads. Native filesystem discovery, native process launch and desktop ZIP installation are unavailable in WebAssembly. Browser D2R conversion uses the Rust WebAssembly converter.
 
 ```sh
 rustup target add wasm32-unknown-unknown
@@ -223,36 +201,10 @@ the launcher page alone does not provide the game-side `launch.start` function.
 
 ## Distribution archives
 
-The standard-library Python packager makes a ZIP on Windows and a `.tar.gz` on
-macOS/Linux. It preserves Unix executable permissions and writes `PACKAGE.json`
-with per-file SHA256 hashes plus an archive checksum sidecar.
-
-```sh
-python3 tools/launcher/packaging/package.py \
-  --binary tools/launcher/target/release/launcher \
-  --platform macos-arm64 --output-dir dist/launcher --importer auto
-```
-
-Use the actual build's platform label (`windows-x64`, `macos-arm64`,
-`macos-x64`, `linux-x64`, etc.) and executable suffix. `--importer auto` includes
-source recipes when the checkout contains them; `--importer include` requires
-them; `--importer omit` creates a launcher-only package. Importer files are copied
-from an explicit source allowlist. Extracted assets, converted art and caches are
-excluded.
-
-To supply a prebuilt helper, build it outside the repository and pass it explicitly:
-
-```sh
-python3 tools/d2r-import/native/build.py --cache /absolute/external/d2r-helper --config Release
-python3 tools/launcher/packaging/check_helper.py /absolute/external/d2r-helper/bin/d2rtool
-python3 tools/launcher/packaging/package.py \
-  --binary tools/launcher/target/release/launcher --platform macos-arm64 \
-  --output-dir dist/launcher --importer include \
-  --helper /absolute/external/d2r-helper/bin/d2rtool
-```
+Release archives include the native converter, mapping recipes and archive helper. The Rust package tool updates `PACKAGE.json`, archive checksums and executable permissions when adding the converter.
 
 The helper package requires its sibling `licenses` directory, carrying the exact
-CascLib, bundled zlib and BitKnit2 notices written by `native/build.py`. The
+CascLib, bundled zlib and BitKnit2 notices included by the helper build. The
 archive includes the project license. These are unsigned archives, without a
 game executable or owned art. The private `trainer` feature is excluded from the
 default build and CI artifacts.
@@ -262,20 +214,14 @@ default build and CI artifacts.
 `.github/workflows/launcher.yml` defines independent native test/build/archive jobs
 on Windows x64, macOS ARM64 and Linux x64, plus a wasm32 frontend check. Native
 tests use synthetic archives and a real process/grandchild fixture for worker
-cancellation. A complete six-step D2R transaction test runs a source-free fake
-importer through real subprocesses, covering successful publication and a failed
-conversion that preserves the previous playable cache. It exercises worker
-orchestration and rollback, without reading an owned D2R archive. Importer Python
-tests use synthetic resources and mocked native build commands. The optional
-workflow-dispatch helper build compiles pinned
-CascLib and runs `d2rtool --version`/`--help` without owned data.
+cancellation. A four-phase Rust importer transaction test covers successful publication and failed conversion rollback. Owned-data qualification additionally checks the mapping, environment, interface and portal output against launcher readiness checks.
 Set the manual workflow's `upload_artifacts` input to false for a validation-only
 run: tests, builds, helper checks and packaging still run, without uploading the
 archives to GitHub storage. Normal push/PR runs upload the resulting packages.
 
 Local macOS checks have exercised library readiness, the native file picker,
 game launch, live conversion progress and cancellation that retains the old cache.
-These checks are separate from Windows/Linux CI and real owned-archive conversion.
+Owned-archive conversion checks are separate from Windows/Linux CI.
 The workflow definitions are not evidence that remote CI jobs have already run.
 
 These jobs establish compilation and the covered automated setup behavior when
@@ -283,8 +229,8 @@ they pass.
 They do not exercise a real desktop's file picker, an owned D2R archive, a GPU
 driver or a game launch on every OS.
 
-Packaging checks can be run without Cargo or game data:
+Packaging checks can be run without game data:
 
 ```sh
-python3 -m unittest discover -s tools/launcher/packaging -p 'test_*.py'
+cargo test --manifest-path tools/d2r-packager/Cargo.toml --locked
 ```

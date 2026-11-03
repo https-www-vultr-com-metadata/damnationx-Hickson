@@ -144,6 +144,50 @@ TEST(D2SoundImportJobTest, ImportsFromMpqFolder)
 	std::filesystem::remove_all(root);
 }
 
+TEST(D2SoundInstallTest, RecognizesBattleNetAndSteamInstalls)
+{
+	const std::filesystem::path root = std::filesystem::temp_directory_path() / "dvl_d2r_layout_test";
+	std::filesystem::remove_all(root);
+	const std::filesystem::path battleNet = root / "battle.net";
+	std::filesystem::create_directories(battleNet / "Data" / "indices");
+	std::ofstream(battleNet / ".build.info") << "Version!STRING:0\n1.6.80273\n";
+	EXPECT_TRUE(IsDiablo2ResurrectedInstallDir(battleNet.string()));
+	EXPECT_EQ(D2rStoragePath(battleNet.string()), battleNet.string());
+
+	// Steam (patch 3.2.0.1 and later): no .build.info; Data holds a static storage.
+	const std::filesystem::path steam = root / "steam";
+	std::filesystem::create_directories(steam / "Data");
+	std::ofstream(steam / "Data" / ".build.config") << "root = bf9064519cc56ba5fe197ce27e4729a1\n";
+	std::ofstream(steam / "Data" / "00-00000001.data") << "";
+	EXPECT_TRUE(IsDiablo2ResurrectedInstallDir(steam.string()));
+	// CascLib gets the build config itself, so a case-sensitive `Data` is found.
+	EXPECT_EQ(D2rStoragePath(steam.string()), (steam / "Data" / ".build.config").string());
+
+	// Each layout needs all of its parts.
+	std::filesystem::remove_all(battleNet / "Data" / "indices");
+	EXPECT_FALSE(IsDiablo2ResurrectedInstallDir(battleNet.string()));
+	std::filesystem::remove(steam / "Data" / ".build.config");
+	EXPECT_FALSE(IsDiablo2ResurrectedInstallDir(steam.string()));
+	EXPECT_EQ(D2rStoragePath(steam.string()), steam.string());
+	std::filesystem::remove_all(root);
+}
+
+TEST(D2SoundInstallTest, ReadsSteamLibraryFolders)
+{
+	const std::string_view vdf = "\"libraryfolders\"\n{\n"
+	                             "\t\"0\"\n\t{\n\t\t\"path\"\t\t\"C:\\\\Program Files (x86)\\\\Steam\"\n"
+	                             "\t\t\"label\"\t\t\"path\"\n\t\t\"contentid\"\t\t\"123\"\n\t}\n"
+	                             "\t\"1\"\n\t{\n\t\t\"path\"\t\t\"D:\\\\SteamLibrary\"\n"
+	                             "\t\t\"apps\"\n\t\t{\n\t\t\t\"2536520\"\t\t\"42928243987\"\n\t\t}\n\t}\n"
+	                             "\t\"2\"\n\t{\n\t\t\"path\"\t\t\"/home/player/.local/share/Steam\"\n\t}\n"
+	                             "\t\"3\"\n\t{\n\t\t\"path\"\t\t\"E:\\\\cut off";
+	const std::vector<std::string> expected { "C:\\Program Files (x86)\\Steam", "D:\\SteamLibrary", "/home/player/.local/share/Steam" };
+	EXPECT_EQ(SteamLibraryPaths(vdf), expected);
+	EXPECT_TRUE(SteamLibraryPaths("").empty());
+	EXPECT_TRUE(SteamLibraryPaths("\"path\"").empty());
+	EXPECT_TRUE(SteamLibraryPaths("\"path\" \"\"").empty());
+}
+
 TEST(D2SoundImportJobTest, FailsWithoutArchives)
 {
 	const std::filesystem::path root = std::filesystem::temp_directory_path() / "dvl_d2sound_empty_test";

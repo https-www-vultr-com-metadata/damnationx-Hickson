@@ -4,6 +4,7 @@
  * Implementation of function for sending and receiving network messages.
  */
 #include "msg.h"
+#include "dvlnet/async_runtime.h"
 
 #include <climits>
 #include <cmath>
@@ -31,6 +32,7 @@
 #include "control/control.hpp"
 #include "dead.h"
 #include "engine/backbuffer_state.hpp"
+#include "engine/path.h"
 #include "engine/random.hpp"
 #include "engine/world_tile.hpp"
 #include "gamemenu.h"
@@ -54,6 +56,7 @@
 #include "portals/validation.hpp"
 #include "quests/validation.hpp"
 #include "spells.h"
+#include "survivors.h"
 #include "storm/storm_net.hpp"
 #include "sync.h"
 #include "tmsg.h"
@@ -301,6 +304,30 @@ DJunk sgJunk;
 uint8_t sgbDeltaChunks;
 std::list<TMegaPkt> MegaPktList;
 Item ItemLimbo;
+struct SurvivorsLocalDrop { Item item; Point position; };
+std::vector<SurvivorsLocalDrop> SurvivorsLocalDrops;
+
+void AppendLocalDropEscrow(std::vector<Item> &items)
+{
+	for (const auto &drop : SurvivorsLocalDrops) items.push_back(drop.item);
+}
+
+void MaterializeLocalDrops()
+{
+	if (MyPlayer == nullptr) return;
+	for (auto it = SurvivorsLocalDrops.begin(); it != SurvivorsLocalDrops.end();) {
+		if (ActiveItemCount >= MAXITEMS) break;
+		const auto tile = FindClosestValidPosition(ItemSpaceOk, it->position, 0, 50);
+		if (!tile) { ++it; continue; }
+		PlaceItemInWorld(std::move(it->item), *tile);
+		it = SurvivorsLocalDrops.erase(it);
+	}
+}
+
+void ClearLocalDropEscrow()
+{
+	SurvivorsLocalDrops.clear();
+}
 
 /** @brief Last sent player command for the local player. */
 TCmdLocParam5 lastSentPlayerCmd;
@@ -1601,6 +1628,12 @@ size_t OnItemExtra(const TCmdGItem &message, Player &player)
 
 size_t OnPutItem(const TCmdPItem &message, Player &player)
 {
+	if (IsSurvivorsMode() && AsyncNetEnabled() && AsyncNetIsAuthority() && &player == MyPlayer) {
+		// Local drops enter durable escrow before their queued command executes.
+		// They may already have been materialized by the checkpoint barrier.
+		MaterializeLocalDrops();
+		return sizeof(message);
+	}
 	if (gbBufferMsgs == 1) {
 		BufferMessage(player, &message, sizeof(message));
 	} else if (IsPItemValid(message, player)) {
@@ -1668,6 +1701,7 @@ size_t OnStandingAttackTile(const TCmdLoc &message, Player &player)
 	const Point position { message.x, message.y };
 
 	if (gbBufferMsgs != 1 && player.isOnActiveLevel() && leveltype != DTYPE_TOWN && InDungeonBounds(position)) {
+		if (IsSurvivorsMode()) { SurvivorsManualAction(player, position, false, false, Direction::South); return sizeof(message); }
 		ClrPlrPath(player);
 		player.destAction = ACTION_ATTACK;
 		player.destParam1 = position.x;
@@ -1682,6 +1716,7 @@ size_t OnRangedAttackTile(const TCmdLoc &message, Player &player)
 	const Point position { message.x, message.y };
 
 	if (gbBufferMsgs != 1 && player.isOnActiveLevel() && leveltype != DTYPE_TOWN && InDungeonBounds(position)) {
+		if (IsSurvivorsMode()) { SurvivorsManualAction(player, position, true, false, Direction::South); return sizeof(message); }
 		ClrPlrPath(player);
 		player.destAction = ACTION_RATTACK;
 		player.destParam1 = position.x;
@@ -1741,6 +1776,7 @@ size_t OnSpellWall(const TCmdLocParam4 &message, Player &player)
 
 	if (!InitNewSpell(player, message.wParam1, message.wParam2, message.wParam4))
 		return sizeof(message);
+	if (IsSurvivorsMode()) { SurvivorsManualAction(player, position, false, true, static_cast<Direction>(wParamDirection)); return sizeof(message); }
 
 	ClrPlrPath(player);
 	player.destAction = ACTION_SPELLWALL;
@@ -1765,6 +1801,7 @@ size_t OnSpellTile(const TCmdLocParam3 &message, Player &player)
 
 	if (!InitNewSpell(player, message.wParam1, message.wParam2, message.wParam3))
 		return sizeof(message);
+	if (IsSurvivorsMode()) { SurvivorsManualAction(player, position, false, true, Direction::South); return sizeof(message); }
 
 	ClrPlrPath(player);
 	player.destAction = ACTION_SPELL;
@@ -1811,6 +1848,7 @@ size_t OnAttackMonster(const TCmdParam1 &message, Player &player)
 
 	if (gbBufferMsgs != 1 && player.isOnActiveLevel() && leveltype != DTYPE_TOWN && monsterIdx < MaxMonsters) {
 		const Point position = Monsters[monsterIdx].position.future;
+		if (IsSurvivorsMode()) { SurvivorsManualAction(player, position, false, false, Direction::South); return sizeof(message); }
 		if (player.position.tile.WalkingDistance(position) > 1)
 			MakePlrPath(player, position, false);
 		player.destAction = ACTION_ATTACKMON;
@@ -1825,6 +1863,7 @@ size_t OnAttackPlayer(const TCmdParam1 &message, Player &player)
 	const uint16_t playerIdx = Swap16LE(message.wParam1);
 
 	if (gbBufferMsgs != 1 && player.isOnActiveLevel() && leveltype != DTYPE_TOWN && playerIdx < Players.size()) {
+		if (IsSurvivorsMode()) return sizeof(message);
 		MakePlrPath(player, Players[playerIdx].position.future, false);
 		player.destAction = ACTION_ATTACKPLR;
 		player.destParam1 = playerIdx;
@@ -1838,6 +1877,7 @@ size_t OnRangedAttackMonster(const TCmdParam1 &message, Player &player)
 	const uint16_t monsterIdx = Swap16LE(message.wParam1);
 
 	if (gbBufferMsgs != 1 && player.isOnActiveLevel() && leveltype != DTYPE_TOWN && monsterIdx < MaxMonsters) {
+		if (IsSurvivorsMode()) { SurvivorsManualAction(player, Monsters[monsterIdx].position.future, true, false, Direction::South); return sizeof(message); }
 		ClrPlrPath(player);
 		player.destAction = ACTION_RATTACKMON;
 		player.destParam1 = monsterIdx;
@@ -1851,6 +1891,7 @@ size_t OnRangedAttackPlayer(const TCmdParam1 &message, Player &player)
 	const uint16_t playerIdx = Swap16LE(message.wParam1);
 
 	if (gbBufferMsgs != 1 && player.isOnActiveLevel() && leveltype != DTYPE_TOWN && playerIdx < Players.size()) {
+		if (IsSurvivorsMode()) return sizeof(message);
 		ClrPlrPath(player);
 		player.destAction = ACTION_RATTACKPLR;
 		player.destParam1 = playerIdx;
@@ -1873,6 +1914,7 @@ size_t OnSpellMonster(const TCmdParam4 &message, Player &player)
 
 	if (!InitNewSpell(player, message.wParam2, message.wParam3, message.wParam4))
 		return sizeof(message);
+	if (IsSurvivorsMode()) { SurvivorsManualAction(player, Monsters[monsterIdx].position.future, false, true, Direction::South); return sizeof(message); }
 
 	ClrPlrPath(player);
 	player.destAction = ACTION_SPELLMON;
@@ -1894,6 +1936,7 @@ size_t OnSpellPlayer(const TCmdParam4 &message, Player &player)
 
 	if (!InitNewSpell(player, message.wParam2, message.wParam3, message.wParam4))
 		return sizeof(message);
+	if (IsSurvivorsMode()) { SurvivorsManualAction(player, Players[playerIdx].position.future, false, true, Direction::South); return sizeof(message); }
 
 	ClrPlrPath(player);
 	player.destAction = ACTION_SPELLPLR;
@@ -1931,6 +1974,10 @@ size_t OnResurrect(const TCmdParam1 &message, Player &caster)
 	Player &target = Players[playerIdx];
 
 	SpawnResurrectBeam(caster, target);
+	if (AsyncNetEnabled() && AsyncNetIsAuthority()) {
+		if(target._pHitPoints<=0) ApplyResurrect(target);
+		return sizeof(message);
+	}
 
 	if (&target == MyPlayer && target._pHitPoints <= 0) {
 		NetSendCmd(true, CMD_PLRALIVE);
@@ -2683,6 +2730,10 @@ size_t HandleCmd(size_t (*handler)(const TCmdImpl &, const Player &), const Play
 
 } // namespace
 
+void SurvivorsAppendLocalDropEscrow(std::vector<Item> &items) { AppendLocalDropEscrow(items); }
+void SurvivorsMaterializeLocalDrops() { MaterializeLocalDrops(); }
+void SurvivorsClearLocalDropEscrow() { ClearLocalDropEscrow(); }
+
 void PrepareItemForNetwork(const Item &item, TItem &messageItem)
 {
 	messageItem.bId = item._iIdentified ? 1 : 0;
@@ -3204,6 +3255,8 @@ void NetSendCmdGItem(bool bHiPri, _cmd_id bCmd, const Player &player, uint8_t ii
 
 void NetSendCmdPItem(bool bHiPri, _cmd_id bCmd, Point position, const Item &item)
 {
+	if (bCmd == CMD_PUTITEM && IsSurvivorsMode() && AsyncNetEnabled() && AsyncNetIsAuthority())
+		SurvivorsLocalDrops.push_back({ item, position });
 	TCmdPItem cmd {};
 
 	cmd.bCmd = bCmd;
@@ -3296,6 +3349,12 @@ void NetSendCmdChBeltItem(bool bHiPri, int beltIndex)
 
 void NetSendCmdDamage(bool bHiPri, const Player &player, uint32_t dwDam, DamageType damageType)
 {
+	if (AsyncNetEnabled()) {
+		if (AsyncNetIsAuthority())
+			ApplyPlrDamage(damageType, const_cast<Player &>(player), 0, 0, static_cast<int>(dwDam), DeathReason::Player);
+		return;
+	}
+
 	TCmdDamage cmd;
 
 	cmd.bCmd = CMD_PLRDAMAGE;

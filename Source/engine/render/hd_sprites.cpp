@@ -409,14 +409,14 @@ bool HdSpritesDrawPlayer(const Surface &out, const Player &player, Point targetB
 		}
 	}
 	const bool inTown = leveltype == DTYPE_TOWN;
-	const std::string_view baseAction = PlayerClipName(player.getGraphic(), inTown);
+	const std::string_view baseAction = PlayerClipName(player.getDisplayedGraphic(), inTown);
 	const std::string prefix = hd_sprites::ResolvePlayerClipPrefix(Index, className, player._pgfxnum, baseAction, inTown);
 	if (prefix.empty())
 		return false;
 	KeepPlayerClipsLoaded(prefix, inTown);
 
 	// Free-form movement: the sprite faces along the drawn movement (tempDirection while walking).
-	const int direction = static_cast<int>(player.getSpriteDirection());
+	const int direction = static_cast<int>(player.getDisplayedDirection());
 	const std::string_view action = hd_sprites::PlayerActionForLocation(Index, prefix, baseAction, direction, inTown);
 	const hd_sprites::BodyClipChoice choice = hd_sprites::ChooseBodyClip(Index, prefix, action, direction, inTown, HdSpritesGpuClipStatus,
 	    /*allowNeighbourDirections=*/prefix == "warrior/");
@@ -429,7 +429,7 @@ bool HdSpritesDrawPlayer(const Surface &out, const Player &player, Point targetB
 		return choice.hide; // hide: HD art is on its way, draw no body this frame rather than the classic one
 
 	const AnimationInfo &anim = player.AnimInfo;
-	const int frame = choice.animate ? PlayerFrame(anim, Index.clips[choice.clip]) : 0;
+	const int frame = choice.animate ? PlayerFrame(player.getDisplayedAnimation(), Index.clips[choice.clip]) : 0;
 
 	Point pivot = targetBufferPosition + TileCentre;
 	// Same drawn (free-form, sub-tile) offset as the classic body; it also applies while standing.
@@ -472,11 +472,11 @@ bool HdSpritesPlayerPose(const Player &player, HdSpritePose &pose)
 	if (className.empty() || !EnsureIndex())
 		return false;
 	const bool inTown = leveltype == DTYPE_TOWN;
-	const std::string_view baseAction = PlayerClipName(player.getGraphic(), inTown);
+	const std::string_view baseAction = PlayerClipName(player.getDisplayedGraphic(), inTown);
 	const std::string prefix = hd_sprites::ResolvePlayerClipPrefix(Index, className, player._pgfxnum, baseAction, inTown);
 	if (prefix.empty())
 		return false;
-	const int direction = static_cast<int>(player.getSpriteDirection());
+	const int direction = static_cast<int>(player.getDisplayedDirection());
 	const std::string_view action = hd_sprites::PlayerActionForLocation(Index, prefix, baseAction, direction, inTown);
 	// The host loads every clip itself: the first candidate the index has is drawable.
 	const hd_sprites::BodyClipChoice choice = hd_sprites::ChooseBodyClip(Index, prefix, action, direction, inTown,
@@ -485,7 +485,7 @@ bool HdSpritesPlayerPose(const Player &player, HdSpritePose &pose)
 		return false;
 	pose = {};
 	pose.clip = choice.clip;
-	pose.frame = choice.animate ? PlayerFrame(player.AnimInfo, Index.clips[choice.clip]) : 0;
+	pose.frame = choice.animate ? PlayerFrame(player.getDisplayedAnimation(), Index.clips[choice.clip]) : 0;
 	return true;
 }
 

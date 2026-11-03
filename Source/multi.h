@@ -67,6 +67,7 @@ void multi_net_ping();
 bool multi_handle_delta();
 void ProcessGameMessagePackets();
 void multi_send_zero_packet(uint8_t pnum, _cmd_id bCmd, const std::byte *data, size_t size);
+void AsyncNetApplyNativeCommands(uint8_t peer, const std::byte *data, size_t size);
 void NetClose();
 bool NetInit(bool bSinglePlayer);
 void recv_plrinfo(Player &player, const TCmdPlrInfoHdr &header, bool recv);

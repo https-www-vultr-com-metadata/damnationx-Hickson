@@ -1,3 +1,4 @@
+#include "host/host_frontend.hpp"
 #include "DiabloUI/multi/selgame.h"
 
 #include <cstddef>
@@ -22,6 +23,8 @@
 #endif
 
 #include "DiabloUI/diabloui.h"
+#include "dvlnet/async_session.h"
+#include "survivors.h"
 #include "DiabloUI/hero/selhero.h"
 #include "DiabloUI/scrollbar.h"
 #include "DiabloUI/selok.h"
@@ -105,11 +108,18 @@ bool IsGameCompatible(const GameData &data)
 	return data.versionMajor == PROJECT_VERSION_MAJOR
 	    && data.versionMinor == PROJECT_VERSION_MINOR
 	    && data.versionPatch == PROJECT_VERSION_PATCH
-	    && data.isSpawn == (gbIsSpawn ? 1 : 0);
+	    && data.isSpawn == (gbIsSpawn ? 1 : 0)
+	    && ((data.reserved[1] & 1U) != 0) == IsSurvivorsMode()
+	    && (data.reserved[0] == 0 || data.reserved[0] == net::async::GameProtocolTag)
+	    && (!IsSurvivorsMode() || data.reserved[0] == net::async::GameProtocolTag);
 }
 
 static std::string GetErrorMessageIncompatibility(const GameData &data)
 {
+	if (((data.reserved[1] & 1U) != 0) != IsSurvivorsMode())
+		return (data.reserved[1] & 1U) != 0 ? "Enter Survivors Camp and choose co-op to join this room." : "Use Multiplayer from the main menu to join this campaign room.";
+	if (data.reserved[0] != 0 && data.reserved[0] != net::async::GameProtocolTag)
+		return "The host uses an incompatible asynchronous networking protocol.";
 	if (data.isSpawn != (gbIsSpawn ? 1 : 0)) {
 		if (data.isSpawn)
 			return std::string(_("The host is running the shareware edition."));
@@ -802,6 +812,7 @@ void RefreshGameList()
 
 bool UiSelectGame(GameData *gameData, int *playerId)
 {
+	host::FrontendScope frontendScope(4);
 	firstPublicGameInfoRequestSend = 0;
 	gdwPlayerId = playerId;
 	m_game_data = gameData;

@@ -4,6 +4,7 @@
  * Implementation of player functionality, leveling, actions, creation, loading, etc.
  */
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdint>
 
@@ -48,6 +49,8 @@
 #include "objects.h"
 #include "options.h"
 #include "player.h"
+#include "dvlnet/async_runtime.h"
+#include "survivors.h"
 #include "portal.h"
 #include "qol/autopickup.h"
 #include "qol/stash.h"
@@ -70,6 +73,8 @@ Player *InspectPlayer;
 bool MyPlayerIsDead;
 
 namespace {
+
+std::array<unsigned, MAX_PLRS> SurvivorsManualCooldown {};
 
 struct DirectionSettings {
 	Direction dir;
@@ -545,7 +550,8 @@ bool DoWalk(Player &player)
 			ChangeLightOffset(player.lightId, { 0, 0 });
 	}
 
-	AutoPickup(player);
+	if (!AsyncNetEnabled() || AsyncNetIsAuthority())
+		AutoPickup(player);
 	return true;
 }
 
@@ -565,7 +571,7 @@ bool WeaponDecay(Player &player, int ii)
 
 bool DamageWeapon(Player &player, unsigned damageFrequency)
 {
-	if (&player != MyPlayer) {
+	if (!AsyncNetOwnsPlayer(player)) {
 		return false;
 	}
 
@@ -734,7 +740,7 @@ bool PlrHitMonst(Player &player, Monster &monster, bool adjacentDamage = false)
 	if (adjacentDamage)
 		dam >>= 2;
 
-	if (&player == MyPlayer) {
+	if (AsyncNetOwnsPlayer(player)) {
 		if (HasAnyOf(player.pDamAcFlags, ItemSpecialEffectHf::Peril)) {
 			dam2 += player._pIGetHit << 6;
 			if (dam2 >= 0) {
@@ -865,7 +871,7 @@ bool PlrHitPlr(Player &attacker, Player &target)
 		}
 		RedrawComponent(PanelDrawComponent::Health);
 	}
-	if (&attacker == MyPlayer) {
+	if (AsyncNetOwnsPlayer(attacker)) {
 		NetSendCmdDamage(true, target, skdam, DamageType::Physical);
 	}
 	StartPlrHit(target, skdam, false);
@@ -894,6 +900,11 @@ bool DoAttack(Player &player)
 	if (player.AnimInfo.currentFrame == player._pAFNum - 1) {
 		Point position = player.position.tile + player._pdir;
 		Monster *monster = FindMonsterAtPosition(position);
+		if (monster == nullptr && AsyncNetEnabled() && AsyncNetIsAuthority() && player.destParam1 >= 0 && player.destParam1 < static_cast<int>(MaxMonsters)) {
+			Monster &candidate = Monsters[player.destParam1];
+			if (!candidate.isInvalid && candidate.hitPoints > 0 && AsyncNetMeleeReach(player, candidate, 1))
+				monster = &candidate;
+		}
 
 		if (monster != nullptr) {
 			if (CanTalkToMonst(*monster)) {
@@ -1029,7 +1040,7 @@ bool DoRangeAttack(Player &player)
 
 void DamageParryItem(Player &player)
 {
-	if (&player != MyPlayer) {
+	if (!AsyncNetOwnsPlayer(player)) {
 		return;
 	}
 
@@ -1073,7 +1084,7 @@ bool DoBlock(Player &player)
 
 void DamageArmor(Player &player)
 {
-	if (&player != MyPlayer) {
+	if (!AsyncNetOwnsPlayer(player)) {
 		return;
 	}
 
@@ -1404,6 +1415,11 @@ void CheckNewPath(Player &player, bool pmWillBeCalled)
 			}
 			break;
 		case ACTION_PICKUPITEM:
+			if (AsyncNetEnabled() && AsyncNetIsAuthority() && &player != MyPlayer) {
+				if (player.position.tile.WalkingDistance(item->position) <= 1)
+					InvGetItem(player, targetId);
+				break;
+			}
 			if (&player == MyPlayer) {
 				x = std::abs(player.position.tile.x - item->position.x);
 				y = std::abs(player.position.tile.y - item->position.y);
@@ -1414,6 +1430,11 @@ void CheckNewPath(Player &player, bool pmWillBeCalled)
 			}
 			break;
 		case ACTION_PICKUPAITEM:
+			if (AsyncNetEnabled() && AsyncNetIsAuthority() && &player != MyPlayer) {
+				if (player.position.tile.WalkingDistance(item->position) <= 1)
+					AutoGetItem(player, item, targetId);
+				break;
+			}
 			if (&player == MyPlayer) {
 				x = std::abs(player.position.tile.x - item->position.x);
 				y = std::abs(player.position.tile.y - item->position.y);
@@ -1423,6 +1444,7 @@ void CheckNewPath(Player &player, bool pmWillBeCalled)
 			}
 			break;
 		case ACTION_TALK:
+			if (AsyncNetEnabled() && AsyncNetIsAuthority() && &player != MyPlayer) AsyncNetInteractWithTowner(player,player.destParam1);
 			if (&player == MyPlayer) {
 				HelpFlag = false;
 				TalkToTowner(player, player.destParam1);
@@ -1639,6 +1661,176 @@ void GetPlayerGraphicsPath(std::string_view path, std::string_view prefix, std::
 }
 
 } // namespace
+
+OptionalClxSprite Player::survivorsActionSprite() const
+{
+	if (!survivorsActionActive)
+		return std::nullopt;
+	const PlayerAnimationData &data = AnimationData[static_cast<size_t>(survivorsActionGraphic)];
+	if (!data.sprites)
+		return std::nullopt;
+	const ClxSpriteList sprites = data.spritesForDirection(survivorsActionDirection);
+	const int frame = std::clamp<int>(survivorsActionAnim.getFrameToUseForRendering(), 0, static_cast<int>(sprites.numSprites()) - 1);
+	return sprites[frame];
+}
+
+namespace {
+
+bool BeginSurvivorsActionAnimation(Player &player, player_graphic graphic, Direction direction, bool restartEarly)
+{
+	if (player.hasNoLife() || (player._pmode != PM_STAND && !player.isWalking()))
+		return false;
+	// Rapid weapons share one overlay: let the previous action reach its
+	// release frame before another restarts it, so swings do not stutter.
+	const int8_t actionFrame = graphic == player_graphic::Attack ? player._pAFNum : player._pSFNum;
+	if (!restartEarly && player.survivorsActionActive && player.survivorsActionAnim.currentFrame < player.survivorsActionAnim.numberOfFrames - 1
+	    && player.survivorsActionAnim.currentFrame < actionFrame)
+		return false;
+	LoadPlrGFX(player, graphic);
+	int8_t numberOfFrames;
+	int8_t ticksPerFrame;
+	player.getAnimationFramesAndTicksPerFrame(graphic, numberOfFrames, ticksPerFrame);
+	if (numberOfFrames <= 0)
+		return false;
+	player.survivorsActionAnim.setNewAnimation(std::nullopt, numberOfFrames, ticksPerFrame, AnimationDistributionFlags::ProcessAnimationPending, 0, actionFrame);
+	player.survivorsActionGraphic = graphic;
+	player.survivorsActionDirection = direction;
+	player.survivorsActionActive = true;
+	++player.survivorsActionSerial;
+	return true;
+}
+
+} // namespace
+
+void StartSurvivorsActionAnimation(Player &player, player_graphic graphic, Point target)
+{
+	const Direction direction = target == player.position.tile ? player.getSpriteDirection() : GetDirection(player.position.tile, target);
+	BeginSurvivorsActionAnimation(player, graphic, direction, false);
+}
+
+void ReplaySurvivorsActionAnimation(Player &player, player_graphic graphic, Direction direction)
+{
+	// The authority already applied its release-frame rule, so restart freely,
+	// except over the same action this client already started locally (for
+	// example its own manual swing), which would otherwise hitch.
+	const bool sameAction = player.survivorsActionActive && player.survivorsActionGraphic == graphic && player.survivorsActionDirection == direction;
+	BeginSurvivorsActionAnimation(player, graphic, direction, !sameAction);
+}
+
+bool StartSurvivorsAutoMelee(Player &player, Point target, int damage, bool cleave)
+{
+	if (player._pHitPoints <= 0 || (player._pmode != PM_STAND && !player.isWalking())
+	    || player.position.tile.WalkingDistance(target) != 1)
+		return false;
+	Monster *monster = FindMonsterAtPosition(target);
+	if (monster == nullptr || CanTalkToMonst(*monster))
+		return false;
+
+	// Resolve the swing independently of the player's movement mode. Starting a
+	// native attack calls FixPlayerLocation, which interrupts and snaps a walk.
+	const Direction direction = GetDirection(player.position.tile, target);
+	StartSurvivorsActionAnimation(player, player_graphic::Attack, target);
+	const int originalMinDamage = player._pIMinDam;
+	const int originalMaxDamage = player._pIMaxDam;
+	if (damage > 0) player._pIMinDam = player._pIMaxDam = damage;
+	PlaySfxLoc(SfxID::Swing, player.position.tile);
+	bool didHit = PlrHitMonst(player, *monster);
+	if (!gbIsHellfire || !HasAllOf(player._pIFlags, ItemSpecialEffect::FireDamage | ItemSpecialEffect::LightningDamage)) {
+		if (HasAnyOf(player._pIFlags, ItemSpecialEffect::FireDamage)) {
+			const int elementalDamage = didHit ? RandomIntBetween(player._pIFMinDam, player._pIFMaxDam) : 0;
+			AddMissile(target, { 1, 0 }, Direction::South, MissileID::WeaponExplosion, TARGET_MONSTERS, player, elementalDamage, 0);
+		}
+		if (HasAnyOf(player._pIFlags, ItemSpecialEffect::LightningDamage)) {
+			const int elementalDamage = didHit ? RandomIntBetween(player._pILMinDam, player._pILMaxDam) : 0;
+			AddMissile(target, { 2, 0 }, Direction::South, MissileID::WeaponExplosion, TARGET_MONSTERS, player, elementalDamage, 0);
+		}
+	}
+	if (player.CanCleave() || cleave) {
+		for (Direction adjacent : { Left(direction), Right(direction) }) {
+			const Point position = player.position.tile + adjacent;
+			Monster *other = FindMonsterAtPosition(position);
+			if (other != nullptr && !CanTalkToMonst(*other) && other->position.old == position)
+				didHit |= PlrHitMonst(player, *other, true);
+		}
+	}
+	player._pIMinDam = originalMinDamage;
+	player._pIMaxDam = originalMaxDamage;
+	if (didHit)
+		DamageWeapon(player, 30);
+	return true;
+}
+
+// Manual actions have their own cooldown instead of occupying the movement
+// state machine. Network commands are still validated and executed by the
+// authority, so held input cannot bypass the rate limit.
+bool SurvivorsManualAction(Player &player, Point target, bool ranged, bool spell, Direction wallDirection)
+{
+	const unsigned id = player.getId();
+	if (id >= SurvivorsManualCooldown.size() || SurvivorsManualCooldown[id] != 0 || player.hasNoLife()
+	    || (player._pmode != PM_STAND && !player.isWalking()) || !InDungeonBounds(target))
+		return false;
+	const Direction direction = GetDirection(player.position.tile, target);
+	if (spell) {
+		bool valid = false;
+		switch (player.queuedSpell.spellType) {
+		case SpellType::Skill:
+		case SpellType::Spell: valid = CheckSpell(player, player.queuedSpell.spellId, player.queuedSpell.spellType, true) == SpellCheckResult::Success; break;
+		case SpellType::Scroll: valid = CanUseScroll(player, player.queuedSpell.spellId); break;
+		case SpellType::Charges: valid = CanUseStaff(player, player.queuedSpell.spellId); break;
+		default: break;
+		}
+		if (!valid) return false;
+		const auto oldDirection = player._pdir;
+		const auto oldTempDirection = player.tempDirection;
+		player._pdir = direction;
+		player.tempDirection = wallDirection;
+		player.queuedSpell.spellLevel = player.GetSpellLevel(player.queuedSpell.spellId);
+		player.executedSpell = player.queuedSpell;
+		PlaySfxLoc(GetSpellData(player.executedSpell.spellId).sSFX, player.position.tile);
+		CastSpell(player, player.executedSpell.spellId, player.position.tile, target, player.executedSpell.spellLevel);
+		StartSurvivorsActionAnimation(player, GetPlayerGraphicForSpell(player.executedSpell.spellId), target);
+		if (IsAnyOf(player.executedSpell.spellType, SpellType::Scroll, SpellType::Charges)) EnsureValidReadiedSpell(player);
+		player._pdir = oldDirection;
+		player.tempDirection = oldTempDirection;
+	} else if (ranged) {
+		int damage = 4;
+		MissileID missile = MissileID::Arrow;
+		if (HasAnyOf(player._pIFlags, ItemSpecialEffect::FireArrows)) missile = MissileID::FireArrow;
+		if (HasAnyOf(player._pIFlags, ItemSpecialEffect::LightningArrows)) missile = MissileID::LightningArrow;
+		if (HasAllOf(player._pIFlags, ItemSpecialEffect::FireArrows | ItemSpecialEffect::LightningArrows)) {
+			missile = MissileID::SpectralArrow;
+			damage = RandomIntBetween(player._pIFMinDam, player._pIFMaxDam);
+		}
+		AddMissile(player.position.tile, target, direction, missile, TARGET_MONSTERS, player, damage, 0);
+		if (HasAnyOf(player._pIFlags, ItemSpecialEffect::MultipleArrows)) {
+			for (int angle : { -1, 1 }) {
+				const int x = target.x - player.position.tile.x;
+				const int y = target.y - player.position.tile.y;
+				const Displacement offset { y == 0 ? 0 : (y < 0 ? -angle : angle), x == 0 ? 0 : (x < 0 ? angle : -angle) };
+				AddMissile(player.position.tile, target + offset, direction, missile, TARGET_MONSTERS, player, damage, 0);
+			}
+		}
+		PlaySfxLoc(SfxID::ShootBow, player.position.tile);
+		StartSurvivorsActionAnimation(player, player_graphic::Attack, target);
+		DamageWeapon(player, 40);
+	} else {
+		// Manual swings use the equipped weapon's normal damage, not the
+		// independent automatic sword skill's bonus damage.
+		const Point adjacent = player.position.tile + direction;
+		if (!StartSurvivorsAutoMelee(player, adjacent, 0, false)) {
+			PlaySfxLoc(SfxID::Swing, player.position.tile);
+			StartSurvivorsActionAnimation(player, player_graphic::Attack, adjacent);
+		}
+	}
+	const unsigned rate = std::clamp<unsigned>(sgGameInitInfo.nTickRate, 1, 120);
+	SurvivorsManualCooldown[id] = std::max(1U, (rate * (spell ? 800 : 650) + 999) / 1000);
+	return true;
+}
+
+void ResetSurvivorsManualActions()
+{
+	SurvivorsManualCooldown.fill(0);
+}
 
 void Player::CalcScrolls()
 {
@@ -2137,6 +2329,8 @@ void Player::occupyTile(Point tilePosition, bool isMoving) const
 
 bool Player::isLevelOwnedByLocalClient() const
 {
+	if (AsyncNetEnabled())
+		return AsyncNetIsAuthority();
 	for (const Player &other : Players) {
 		if (!other.plractive)
 			continue;
@@ -2542,7 +2736,7 @@ void NextPlrLevel(Player &player)
 
 void Player::_addExperience(uint32_t experience, int levelDelta)
 {
-	if (this != MyPlayer || hasNoLife())
+	if (!AsyncNetOwnsPlayer(*this) || hasNoLife())
 		return;
 
 	if (isMaxCharacterLevel()) {
@@ -2590,7 +2784,11 @@ void AddPlrMonstExper(int lvl, unsigned exp, char pmask)
 
 	if (totplrs != 0) {
 		const unsigned e = exp / totplrs;
-		if ((pmask & (1 << MyPlayerId)) != 0)
+		if (AsyncNetEnabled() && AsyncNetIsAuthority()) {
+			for (auto &player : Players)
+				if ((pmask & (1 << player.getId())) != 0)
+					player.addExperience(e, lvl);
+		} else if ((pmask & (1 << MyPlayerId)) != 0)
 			MyPlayer->addExperience(e, lvl);
 	}
 }
@@ -2615,6 +2813,7 @@ void InitPlayer(Player &player, bool firstTime)
 
 	player.lightId = NO_LIGHT;
 	player.position.ResetFreeform();
+	player.survivorsActionActive = false;
 
 	if (player.isOnActiveLevel()) {
 
@@ -2728,6 +2927,10 @@ void StartPlrBlock(Player &player, Direction dir)
 		SyncPlrKill(player, DeathReason::Unknown);
 		return;
 	}
+	// A swarm can trigger blocks every few ticks. Survivors keeps the block's
+	// damage avoidance, but never lets its animation interrupt movement.
+	if (IsSurvivorsMode())
+		return;
 
 	PlaySfxLoc(SfxID::ItemSword, player.position.tile);
 
@@ -2760,6 +2963,13 @@ void StartPlrHit(Player &player, int dam, bool forcehit)
 {
 	if (player._pInvincible && player.hasNoLife() && &player == MyPlayer) {
 		SyncPlrKill(player, DeathReason::Unknown);
+		return;
+	}
+	// Damage and the short Survivors contact grace are handled before this call.
+	// Re-entering PM_GOTHIT on each accepted hit otherwise pins a hunter in a
+	// dense pack even though the run's grace prevents most follow-up damage.
+	if (IsSurvivorsMode()) {
+		RedrawComponent(PanelDrawComponent::Health);
 		return;
 	}
 
@@ -2806,7 +3016,7 @@ StartPlayerKill(Player &player, DeathReason deathReason)
 		return;
 	}
 
-	if (&player == MyPlayer) {
+	if (AsyncNetOwnsPlayer(player)) {
 		NetSendCmdParam1(true, CMD_PLRDEAD, static_cast<uint16_t>(deathReason));
 		gamemenu_off();
 	}
@@ -2839,7 +3049,7 @@ StartPlayerKill(Player &player, DeathReason deathReason)
 	player._pInvincible = true;
 	SetPlayerHitPoints(player, 0);
 
-	if (&player != MyPlayer && dropItems) {
+	if (!AsyncNetOwnsPlayer(player) && dropItems) {
 		// Ensure that items are removed for remote players
 		// The dropped items will be synced separately (by the remote client)
 		for (Item &item : player.InvBody) {
@@ -2856,7 +3066,7 @@ StartPlayerKill(Player &player, DeathReason deathReason)
 
 		// Only generate drops once (for the local player)
 		// For remote players we get separated sync messages (by the remote client)
-		if (&player == MyPlayer) {
+		if (AsyncNetOwnsPlayer(player)) {
 			RedrawComponent(PanelDrawComponent::Health);
 
 			if (!player.HoldItem.isEmpty()) {
@@ -2946,6 +3156,8 @@ void StripTopGold(Player &player)
 
 void ApplyPlrDamage(DamageType damageType, Player &player, int dam, int minHP /*= 0*/, int frac /*= 0*/, DeathReason deathReason /*= DeathReason::MonsterOrTrap*/)
 {
+	if (AsyncNetEnabled() && !AsyncNetIsAuthority())
+		return;
 	int totalDamage = (dam << 6) + frac;
 	if (&player == MyPlayer && !player.hasNoLife()) {
 		lua::OnPlayerTakeDamage(&player, totalDamage, static_cast<int>(damageType));
@@ -2975,6 +3187,8 @@ void ApplyPlrDamage(DamageType damageType, Player &player, int dam, int minHP /*
 
 	if (totalDamage == 0)
 		return;
+	if (totalDamage > 0 && !SurvivorsAllowPlayerDamage(player))
+		return;
 
 	RedrawComponent(PanelDrawComponent::Health);
 	player._pHitPoints -= totalDamage;
@@ -2989,6 +3203,8 @@ void ApplyPlrDamage(DamageType damageType, Player &player, int dam, int minHP /*
 	}
 	if (player.hasNoLife()) {
 		SyncPlrKill(player, deathReason);
+	} else if (totalDamage > 0 && IsSurvivorsMode()) {
+		SurvivorsOpenEscapeLane(player);
 	}
 }
 
@@ -3020,6 +3236,11 @@ __attribute__((no_sanitize("shift-base")))
 void
 StartNewLvl(Player &player, interface_mode fom, int lvl)
 {
+	if (!AsyncNetAllowLevelChange() && !(IsSurvivorsMode() && IsSurvivorsTransitionPending() && static_cast<unsigned>(lvl) == SurvivorsActLevel(GetSurvivorsRunStatus().act - 1)))
+		return;
+	// Only the Survivors director may move a run between acts.
+	if (IsSurvivorsMode() && !IsSurvivorsTransitionPending())
+		return;
 	InitLevelChange(player);
 
 	switch (fom) {
@@ -3058,6 +3279,10 @@ StartNewLvl(Player &player, interface_mode fom, int lvl)
 
 void RestartTownLvl(Player &player)
 {
+	if (!AsyncNetAllowLevelChange())
+		return;
+	if (IsSurvivorsMode())
+		return;
 	InitLevelChange(player);
 
 	player.setLevel(0);
@@ -3081,6 +3306,10 @@ void RestartTownLvl(Player &player)
 
 void StartWarpLvl(Player &player, size_t pidx)
 {
+	if (!AsyncNetAllowLevelChange())
+		return;
+	if (IsSurvivorsMode())
+		return;
 	InitLevelChange(player);
 
 	if (gbIsMultiplayer) {
@@ -3153,9 +3382,25 @@ const auto OptionChangeHandlerSmoothMovement = (GetOptions().Gameplay.smoothMove
 
 } // namespace
 
+void AsyncNetAdvancePredictedPlayer(Player &player)
+{
+	if (player.hasNoLife() || player._pLvlChanging || (player.destAction != ACTION_NONE && player.destAction != ACTION_WALK))
+		return;
+	if (player._pmode != PM_STAND && !player.isWalking())
+		return;
+	const bool completed = player.isWalking() && DoWalk(player);
+	CheckNewPath(player, completed);
+	if (player.isWalking())
+		player.AnimInfo.processAnimation();
+}
+
 void ProcessPlayers()
 {
 	assert(MyPlayer != nullptr);
+	for (auto &cooldown : SurvivorsManualCooldown) {
+		if (!IsSurvivorsMode()) cooldown = 0;
+		else if (cooldown > 0) --cooldown;
+	}
 	Player &myPlayer = *MyPlayer;
 
 	if (myPlayer.pLvlLoad > 0) {
@@ -3258,6 +3503,13 @@ void ProcessPlayers()
 				player.AnimInfo.processAnimation();
 			if (isRunning && player.isWalking() && !player.AnimInfo.isLastFrame())
 				player.AnimInfo.processAnimation();
+			// Native modes (hit, block, death, level change) take over the sprite.
+			if (player.survivorsActionActive) {
+				if ((player._pmode != PM_STAND && !player.isWalking()) || player.survivorsActionAnim.isLastFrame())
+					player.survivorsActionActive = false;
+				else
+					player.survivorsActionAnim.processAnimation();
+			}
 		}
 	}
 }
@@ -3424,9 +3676,23 @@ void CheckPlrSpell(bool isShiftHeld, SpellID spellID, SpellType spellType)
 
 void SyncPlrAnim(Player &player)
 {
+	if (HeadlessMode)
+		return;
 	const player_graphic graphic = player.getGraphic();
-	if (!HeadlessMode)
-		player.AnimInfo.sprites = player.AnimationData[static_cast<size_t>(graphic)].spritesForDirection(player.getSpriteDirection());
+	// A network snapshot may move directly into an animation that this client
+	// has never played (notably death, which InitPlayerGFX does not preload).
+	// Load it before rebinding instead of dereferencing an empty sprite sheet.
+	LoadPlrGFX(player, graphic);
+	auto &animation = player.AnimationData[static_cast<size_t>(graphic)];
+	if (animation.sprites) {
+		player.AnimInfo.sprites = animation.spritesForDirection(player.getSpriteDirection());
+	} else {
+		// A block/attack can be invalid after equipment changes. Keep rendering
+		// the standing sprite until the authority supplies the next state.
+		LoadPlrGFX(player, player_graphic::Stand);
+		auto &stand = player.AnimationData[static_cast<size_t>(player_graphic::Stand)];
+		player.AnimInfo.sprites = stand.sprites ? OptionalClxSpriteList { stand.spritesForDirection(player._pdir) } : std::nullopt;
+	}
 }
 
 void SyncInitPlrPos(Player &player)

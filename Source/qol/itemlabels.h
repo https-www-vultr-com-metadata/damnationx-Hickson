@@ -15,6 +15,8 @@ void HighlightKeyPressed(bool pressed);
 bool IsItemLabelHighlighted();
 void ResetItemlabelHighlighted();
 bool IsHighlightingLabelsEnabled();
+/** Show all ground labels while held/toggled, or just the item beneath the pointer. */
+bool ShouldShowItemLabel(int id);
 void AddItemToLabelQueue(int id, Point position);
 /** First-person view: queues a label whose bottom centre is at a UI-space point (already projected). */
 void AddItemToLabelQueueAt(int id, Point uiAnchor);

@@ -25,6 +25,7 @@
 #include "multi.h"
 #include "options.h"
 #include "pfile.h"
+#include "survivors.h"
 #include "qol/floatingnumbers.h"
 #include "utils/language.h"
 #include "utils/str_cat.hpp"
@@ -96,7 +97,8 @@ const char *const SoundToggleNames[] = {
 
 void GamemenuUpdateSingle()
 {
-	sgSingleMenu[2].setEnabled(gbValidSaveFile);
+	sgSingleMenu[1].setEnabled(!IsSurvivorsMode());
+	sgSingleMenu[2].setEnabled(!IsSurvivorsMode() && gbValidSaveFile);
 
 	const bool enable = MyPlayer->_pmode != PM_DEATH && !MyPlayerIsDead;
 
@@ -162,7 +164,7 @@ void GamemenuGetBrightness()
 
 void GamemenuGetSpeed()
 {
-	if (gbIsMultiplayer) {
+	if (gbIsMultiplayer || IsSurvivorsMode()) {
 		sgOptionsMenu[3].removeFlags(GMENU_ENABLED | GMENU_SLIDER);
 		if (sgGameInitInfo.nTickRate >= 50)
 			sgOptionsMenu[3].pszStr = _("Speed: Fastest").data();
@@ -280,6 +282,9 @@ void GamemenuBrightness(bool bActivate)
 
 void GamemenuSpeed(bool bActivate)
 {
+	// Keep act timers and independent weapon clocks stable throughout a hunt.
+	if (IsSurvivorsMode())
+		return;
 	if (bActivate) {
 		if (sgGameInitInfo.nTickRate != 20)
 			sgGameInitInfo.nTickRate = 20;
@@ -323,6 +328,8 @@ void gamemenu_quit_game(bool bActivate)
 
 void gamemenu_load_game(bool /*bActivate*/)
 {
+	if (IsSurvivorsMode())
+		return;
 	EventHandler saveProc = SetEventHandler(DisableInputEventHandler);
 	gamemenu_off();
 	ClearFloatingNumbers();
@@ -361,6 +368,8 @@ void gamemenu_load_game(bool /*bActivate*/)
 
 void gamemenu_save_game(bool /*bActivate*/)
 {
+	if (IsSurvivorsMode())
+		return;
 	if (pcurs != CURSOR_HAND) {
 		return;
 	}

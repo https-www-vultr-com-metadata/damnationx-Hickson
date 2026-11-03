@@ -46,6 +46,10 @@
 #include "engine/surface.hpp"
 #include "engine/ticks.hpp"
 #include "headless_mode.hpp"
+#include "host/host_frontend.hpp"
+#ifdef DAMNATIONX_HOST_LIB
+#include "host/host_internal.hpp"
+#endif
 #include "hwcursor.hpp"
 #include "init.hpp"
 #include "options.h"
@@ -81,6 +85,7 @@
 
 namespace devilution {
 
+
 OptionalOwnedClxSpriteList ArtLogo;
 OptionalOwnedClxSpriteList DifficultyIndicator;
 
@@ -93,6 +98,8 @@ OptionalOwnedClxSpriteList ArtCursor;
 std::size_t SelectedItem = 0;
 
 namespace {
+
+void UiFocus(std::size_t itemIndex, bool checkUp, bool ignoreItemsWraps);
 
 OptionalOwnedClxSpriteList ArtHero;
 std::vector<uint8_t> ArtHeroPortraitOrder;
@@ -113,6 +120,79 @@ bool UiItemsWraps;
 
 std::optional<TextInputState> UiTextInputState;
 bool allowEmptyTextInput = false;
+
+#ifdef DAMNATIONX_HOST_LIB
+uint32_t FrontendStage = 0;
+uint32_t FrontendRevision = 1;
+DxpFrontendSnapshot FrontendCopy {};
+struct FrontendCommand { uint32_t revision, action, index; };
+std::optional<FrontendCommand> PendingFrontendCommand;
+
+void CopyFrontend()
+{
+	const auto heroClass = FrontendCopy.heroClass;
+	const auto heroLevel = FrontendCopy.heroLevel;
+	const std::string heroName(FrontendCopy.heroName);
+	FrontendCopy = {};
+	FrontendCopy.version = 1;
+	FrontendCopy.stage = host::InGame() ? 0 : FrontendStage;
+	FrontendCopy.revision = FrontendRevision;
+	FrontendCopy.selected = static_cast<uint32_t>(SelectedItem);
+	FrontendCopy.heroClass = heroClass;
+	FrontendCopy.heroLevel = heroLevel;
+	CopyUtf8(FrontendCopy.heroName, heroName, sizeof(FrontendCopy.heroName));
+	if (FrontendCopy.stage == 0) return;
+	// Editable, confirmation and non-list dialogs retain their complete native UI.
+	if (UiTextInputState.has_value() || gUiList == nullptr || gfnListSelect == nullptr)
+		FrontendCopy.stage = 6;
+	std::string subtitle;
+	for (const UiItemBase *item : gUiItems) {
+		if (item->IsHidden()) continue;
+		std::string_view text;
+		if (item->IsType(UiType::ArtText)) text = static_cast<const UiArtText *>(item)->GetText();
+		else if (item->IsType(UiType::Text)) text = static_cast<const UiText *>(item)->GetText();
+		if (text.empty()) continue;
+		if (FrontendCopy.title[0] == '\0' && item->m_rect.y < GetUIRectangle().position.y + 195)
+			CopyUtf8(FrontendCopy.title, text, sizeof(FrontendCopy.title));
+		else if (text.size() > 3 && subtitle.size() < 460) {
+			if (!subtitle.empty()) subtitle += "\n";
+			subtitle += text;
+		}
+	}
+	CopyUtf8(FrontendCopy.subtitle, subtitle, sizeof(FrontendCopy.subtitle));
+	if (gUiList != nullptr && FrontendCopy.stage != 6) {
+		if (gUiList->m_vecItems.size() > 64) FrontendCopy.stage = 6;
+		FrontendCopy.count = static_cast<uint32_t>(std::min<size_t>(gUiList->m_vecItems.size(), 64));
+		for (uint32_t i = 0; i < FrontendCopy.count; ++i) {
+			const auto &item = *gUiList->GetItem(i);
+			auto &entry = FrontendCopy.entries[i];
+			CopyUtf8(entry.label, std::string_view(item.m_text), sizeof(entry.label));
+			entry.value = item.m_value;
+			entry.enabled = !HasAnyOf(item.uiFlags, UiFlags::ElementHidden | UiFlags::ElementDisabled);
+		}
+		// Hero-class lists are also used within the hero dialog.
+		if (FrontendStage == 2 && FrontendCopy.count >= 3
+		    && gUiList->GetItem(0)->m_text == _("Warrior"))
+			FrontendCopy.stage = 3;
+	}
+}
+
+void ProcessFrontendCommand()
+{
+	const auto command = PendingFrontendCommand;
+	PendingFrontendCommand.reset();
+	if (!command || command->revision != FrontendRevision || FrontendStage == 0) return;
+	if (FrontendStage == 1) mainmenu_restart_repintro();
+	if (command->action == 2) { UiFocusNavigationEsc(); return; }
+	if (command->action == 4) { UiFocusNavigationYesNo(); return; }
+	if (gUiList == nullptr || command->index >= gUiList->m_vecItems.size()) return;
+	const auto &item = *gUiList->GetItem(command->index);
+	if (HasAnyOf(item.uiFlags, UiFlags::ElementHidden | UiFlags::ElementDisabled)) return;
+	UiFocus(command->index, false, true);
+	if (command->action == 1) UiFocusNavigationSelect();
+}
+#endif
+
 
 constexpr Uint32 ListDoubleClickTimeMs = 500;
 std::size_t lastListClickIndex = static_cast<std::size_t>(-1);
@@ -196,9 +276,14 @@ bool IsTextInputActive()
 
 void UiInitList(void (*fnFocus)(size_t value), void (*fnSelect)(size_t value), void (*fnEsc)(), const std::vector<std::unique_ptr<UiItemBase>> &items, bool itemsWraps, void (*fnFullscreen)(), bool (*fnYesNo)(), size_t selectedItem /*= 0*/)
 {
+#ifdef DAMNATIONX_HOST_LIB
+	++FrontendRevision;
+	PendingFrontendCommand.reset();
+#endif
 	SelectedItem = selectedItem;
 	SelectedItemMax = 0;
 	ListViewportSize = 0;
+	gUiList = nullptr;
 	gfnListFocus = fnFocus;
 	gfnListSelect = fnSelect;
 	gfnListEsc = fnEsc;
@@ -266,6 +351,11 @@ void UiRenderListItems()
 
 void UiInitList_clear()
 {
+#ifdef DAMNATIONX_HOST_LIB
+	++FrontendRevision;
+	FrontendCopy.stage = 0;
+	PendingFrontendCommand.reset();
+#endif
 	SelectedItem = 0;
 	SelectedItemMax = 0;
 	ListViewportSize = 1;
@@ -844,6 +934,9 @@ void UiClearScreen()
 
 void UiPollAndRender(std::optional<tl::function_ref<bool(SDL_Event &)>> eventHandler)
 {
+#ifdef DAMNATIONX_HOST_LIB
+	ProcessFrontendCommand();
+#endif
 #ifdef DEVILUTIONX_TRAINER
 	TrainerSocketPoll();
 #endif
@@ -861,6 +954,9 @@ void UiPollAndRender(std::optional<tl::function_ref<bool(SDL_Event &)>> eventHan
 	HandleMenuAction(GetMenuHeldUpDownAction());
 	UiRenderListItems();
 	DrawMouse();
+#ifdef DAMNATIONX_HOST_LIB
+	CopyFrontend();
+#endif
 	UiFadeIn();
 
 	// Must happen after at least one call to `UiFadeIn` with non-zero fadeValue.
@@ -1223,4 +1319,41 @@ void DrawMouse()
 		return;
 	RenderClxSprite(Surface(DiabloUiSurface()), (*ArtCursor)[0], MousePosition);
 }
+
+#ifdef DAMNATIONX_HOST_LIB
+namespace host {
+uint32_t SetFrontendStage(uint32_t stage)
+{
+	const uint32_t previous = FrontendStage;
+	FrontendStage = stage;
+	FrontendCopy.stage = stage == 7 ? 7 : 0;
+	++FrontendRevision;
+	PendingFrontendCommand.reset();
+	return previous;
+}
+void SetFrontendHero(uint32_t heroClass, uint32_t level, std::string_view name)
+{
+	FrontendCopy.heroClass = heroClass;
+	FrontendCopy.heroLevel = level;
+	CopyUtf8(FrontendCopy.heroName, name, sizeof(FrontendCopy.heroName));
+}
+} // namespace host
+extern "C" bool dxp_frontend_snapshot(DxpFrontendSnapshot *output, uint32_t size)
+{
+	if (!host::IsActive() || output == nullptr || size != sizeof(*output)) return false;
+	*output = FrontendCopy;
+	if (host::InGame()) output->stage = 0;
+	return output->version == 1;
+}
+extern "C" bool dxp_frontend_command(uint32_t revision, uint32_t action, uint32_t index)
+{
+	if (!host::IsActive() || host::InGame() || PendingFrontendCommand || revision != FrontendRevision
+	    || FrontendCopy.stage == 0 || FrontendCopy.stage == 6 || action < 1 || action > 4) return false;
+	if (action == 4 && (FrontendCopy.stage != 2 || gfnListYesNo == nullptr)) return false;
+	if (action != 2 && action != 4 && (index >= FrontendCopy.count || !FrontendCopy.entries[index].enabled)) return false;
+	PendingFrontendCommand = FrontendCommand { revision, action, index };
+	return true;
+}
+#endif
+
 } // namespace devilution

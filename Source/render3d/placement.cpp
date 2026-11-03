@@ -1,6 +1,7 @@
 // Adapted from Douglas Opan's diablo-3d town map manifest (Source/engine/render/town_editor_map.cpp); modified for
 // DamnationX (see placement.hpp).
 #include "render3d/placement.hpp"
+#include "utils/parse_int.hpp"
 
 #include <algorithm>
 #include <array>
@@ -42,7 +43,7 @@ bool ParseInt(std::string_view text, int &out)
 	text = Trim(text);
 	if (text.empty())
 		return false;
-	const auto result = std::from_chars(text.data(), text.data() + text.size(), out);
+	const auto result = ParseDecimal(text.data(), text.data() + text.size(), out);
 	return result.ec == std::errc() && result.ptr == text.data() + text.size();
 }
 

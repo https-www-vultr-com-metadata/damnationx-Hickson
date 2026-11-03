@@ -3,9 +3,38 @@
 #include <gtest/gtest.h>
 
 #include "engine/animationinfo.h"
+#include "dvlnet/async_item_animation.hpp"
 #include "nthread.h"
 
 using namespace devilution;
+
+TEST(AnimationInfo, ReplicaGroundItemRestoresAuthorityFrameWithoutPendingTick)
+{
+	Item item {};
+	item._iCurs = 0;
+	item._iIdentified = true;
+	AsyncNetRestoreItemAnimation(item, 4, true);
+	auto &animation = item.AnimInfo;
+	const int finalFrame = animation.numberOfFrames - 1;
+	ASSERT_GE(finalFrame, 4);
+	EXPECT_FALSE(animation.distributesFrames());
+	EXPECT_EQ(animation.currentFrame, 4);
+	EXPECT_EQ(animation.getFrameToUseForRendering(), 4);
+	EXPECT_TRUE(item._iAnimFlag);
+	EXPECT_TRUE(item._iIdentified);
+	EXPECT_EQ(item.selectionRegion, SelectionRegion::None);
+	// A stopped item must remain on its final authoritative frame, even when
+	// rendering many times without any client-side item simulation.
+	AsyncNetRestoreItemAnimation(item, finalFrame, false);
+	EXPECT_FALSE(item._iAnimFlag);
+	EXPECT_TRUE(item._iIdentified);
+	EXPECT_EQ(item.selectionRegion, SelectionRegion::Bottom);
+	for (int i = 0; i < 5; ++i) EXPECT_EQ(animation.getFrameToUseForRendering(), finalFrame);
+	AsyncNetRestoreItemAnimation(item, -100, true);
+	EXPECT_EQ(animation.currentFrame, 0);
+	AsyncNetRestoreItemAnimation(item, 100, true);
+	EXPECT_EQ(animation.currentFrame, finalFrame);
+}
 
 enum class TestDataType {
 	SetNewAnimation,

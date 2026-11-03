@@ -2,6 +2,7 @@
 
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <string>
 #include <unordered_map>
 
@@ -15,6 +16,17 @@
 
 namespace devilution {
 namespace {
+
+// Browser builds disable C++ exceptions; use Lua's protected error path there.
+[[noreturn]] void LightError(lua_State *state, const std::string &message)
+{
+#if defined(__cpp_exceptions)
+	throw sol::error(message);
+#else
+	luaL_error(state, "%s", message.c_str());
+	std::abort(); // luaL_error never returns
+#endif
+}
 
 struct PresentationLight {
 	float x = 0;
@@ -42,19 +54,19 @@ sol::table LuaRenderModule(sol::state_view &lua)
 	LuaSetDocFn(light, "create", "(descriptor: table)", "Create a validated presentation-only light.", [](const sol::table &descriptor) {
 		const auto radius = descriptor["radius"].get_or(0.0F);
 		const auto intensity = descriptor["intensity"].get_or(0.0F);
-		if (!std::isfinite(radius) || radius <= 0 || radius > 128) throw sol::error("render.light: radius out of range");
-		if (!std::isfinite(intensity) || intensity < 0 || intensity > 100) throw sol::error("render.light: intensity out of range");
+		if (!std::isfinite(radius) || radius <= 0 || radius > 128) LightError(descriptor.lua_state(), "render.light: radius out of range");
+		if (!std::isfinite(intensity) || intensity < 0 || intensity > 100) LightError(descriptor.lua_state(), "render.light: intensity out of range");
 		const auto material = descriptor["material"].get_or(std::string {});
 		const auto channel = descriptor["channel"].get_or(descriptor["previewChannel"].get_or(std::string {}));
-		if (material != "torch_flame" && material != "spell_glow") throw sol::error("render.light: unsupported material '" + material + "'");
-		if (channel != "emissive" && channel != "albedo" && channel != "normal" && channel != "height" && channel != "occlusion") throw sol::error("render.light: missing preview channel '" + channel + "'");
+		if (material != "torch_flame" && material != "spell_glow") LightError(descriptor.lua_state(), "render.light: unsupported material '" + material + "'");
+		if (channel != "emissive" && channel != "albedo" && channel != "normal" && channel != "height" && channel != "occlusion") LightError(descriptor.lua_state(), "render.light: missing preview channel '" + channel + "'");
 		const auto id = nextPresentationLightId++;
 		presentationLights.emplace(id, PresentationLight { descriptor["x"].get_or(0.0F), descriptor["y"].get_or(0.0F), descriptor["z"].get_or(0.0F) });
 		return id;
 	});
 	LuaSetDocFn(light, "update", "(id: integer, update: table)", "Update a moving presentation-only light.", [](std::uint32_t id, const sol::table &update) {
 		const auto it = presentationLights.find(id);
-		if (it == presentationLights.end()) throw sol::error("render.light: stale or expired light id");
+		if (it == presentationLights.end()) LightError(update.lua_state(), "render.light: stale or expired light id");
 		it->second.x = update["x"].get_or(it->second.x);
 		it->second.y = update["y"].get_or(it->second.y);
 		it->second.z = update["z"].get_or(it->second.z);

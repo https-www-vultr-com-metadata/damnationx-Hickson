@@ -1,4 +1,5 @@
 #include "lua/modules/log.hpp"
+#include "utils/parse_int.hpp"
 
 #ifdef USE_SDL3
 #include <SDL3/SDL_log.h>
@@ -82,7 +83,7 @@ std::expected<std::string, std::string> FormatLuaMessage(std::string_view fmt, s
 			if (automaticIndexing)
 				return std::unexpected("cannot switch from automatic to manual argument indexing");
 			manualIndexing = true;
-			const std::from_chars_result parseResult = std::from_chars(argId.data(), argId.data() + argId.size(), argIndex);
+			const std::from_chars_result parseResult = ParseDecimal(argId.data(), argId.data() + argId.size(), argIndex);
 			if (parseResult.ec != std::errc() || parseResult.ptr != argId.data() + argId.size())
 				return std::unexpected(StrCat("invalid argument id \"", argId, "\""));
 		}

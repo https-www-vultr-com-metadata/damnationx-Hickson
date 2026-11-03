@@ -26,6 +26,13 @@
 
 #include <gtest/gtest.h>
 
+#include "dvlnet/async_runtime.h"
+#include "dvlnet/async_session.h"
+#include "game_mode.hpp"
+#include "headless_mode.hpp"
+#include "msg.h"
+#include "tables/townerdat.hpp"
+#include "towners.h"
 #include "ui_test.hpp"
 
 #include "control/control.hpp"
@@ -36,6 +43,8 @@
 #include "options.h"
 #include "player.h"
 #include "qol/stash.h"
+#include "qol/visual_store.h"
+#include "survivors.h"
 #include "quests.h"
 #include "stores.h"
 #include "storm/storm_net.hpp"
@@ -156,7 +165,7 @@ protected:
 	 */
 	Item MakeSellableSword()
 	{
-		Item item {};
+		Item item { };
 		InitializeItem(item, IDI_BARDSWORD);
 		item._iIdentified = true;
 		return item;
@@ -167,7 +176,7 @@ protected:
 	 */
 	Item MakeUnidentifiedMagicItem()
 	{
-		Item item {};
+		Item item { };
 		InitializeItem(item, IDI_BARDSWORD);
 		item._iMagical = ITEM_QUALITY_MAGIC;
 		item._iIdentified = false;
@@ -181,7 +190,7 @@ protected:
 	 */
 	Item MakeDamagedSword()
 	{
-		Item item {};
+		Item item { };
 		InitializeItem(item, IDI_BARDSWORD);
 		item._iIdentified = true;
 		item._iMaxDur = 40;
@@ -247,7 +256,7 @@ TEST_F(StoreTransactionTest, StoreAutoPlace_EmptyInventory)
 	ClearBelt();
 	ClearEquipment();
 
-	Item item {};
+	Item item { };
 	InitializeItem(item, IDI_HEAL);
 
 	// Dry-run: should succeed.
@@ -259,7 +268,7 @@ TEST_F(StoreTransactionTest, StoreAutoPlace_EmptyInventory)
 
 TEST_F(StoreTransactionTest, SmithWillBuy_AcceptsMeleeWeapon)
 {
-	Item sword {};
+	Item sword { };
 	InitializeItem(sword, IDI_BARDSWORD);
 	sword._iIdentified = true;
 	EXPECT_TRUE(SmithWillBuy(sword));
@@ -267,7 +276,7 @@ TEST_F(StoreTransactionTest, SmithWillBuy_AcceptsMeleeWeapon)
 
 TEST_F(StoreTransactionTest, SmithWillBuy_RejectsMiscItems)
 {
-	Item scroll {};
+	Item scroll { };
 	InitializeItem(scroll, IDI_HEAL);
 	EXPECT_FALSE(SmithWillBuy(scroll));
 }
@@ -275,7 +284,7 @@ TEST_F(StoreTransactionTest, SmithWillBuy_RejectsMiscItems)
 TEST_F(StoreTransactionTest, WitchWillBuy_AcceptsStaff)
 {
 	// Witch buys staves and misc magical items but not most weapons.
-	Item staff {};
+	Item staff { };
 	InitializeItem(staff, IDI_SHORTSTAFF);
 	staff._iIdentified = true;
 	EXPECT_TRUE(WitchWillBuy(staff));
@@ -283,7 +292,7 @@ TEST_F(StoreTransactionTest, WitchWillBuy_AcceptsStaff)
 
 TEST_F(StoreTransactionTest, WitchWillBuy_RejectsSword)
 {
-	Item sword {};
+	Item sword { };
 	InitializeItem(sword, IDI_BARDSWORD);
 	sword._iIdentified = true;
 	EXPECT_FALSE(WitchWillBuy(sword));
@@ -727,7 +736,7 @@ TEST_F(StoreTransactionTest, WitchBuy_NonPinnedItemRemoved)
 
 TEST_F(StoreTransactionTest, RepairCost_MagicItem_ScalesWithDurabilityLoss)
 {
-	Item item {};
+	Item item { };
 	InitializeItem(item, IDI_BARDSWORD);
 	item._iMagical = ITEM_QUALITY_MAGIC;
 	item._iIdentified = true;
@@ -756,7 +765,7 @@ TEST_F(StoreTransactionTest, RepairCost_MagicItem_ScalesWithDurabilityLoss)
 
 TEST_F(StoreTransactionTest, RepairCost_NormalItem_MinimumOneGold)
 {
-	Item item {};
+	Item item { };
 	InitializeItem(item, IDI_BARDSWORD);
 	item._iMagical = ITEM_QUALITY_NORMAL;
 	item._iIdentified = true;
@@ -929,4 +938,246 @@ TEST_F(StoreTransactionTest, SmithPremiumBuy_ReplacesSlot)
 }
 
 } // namespace
+
+TEST_F(StoreTransactionTest, AuthorityShopRejectsStaleSeedDistanceAndInsufficientPlayerFunds)
+{
+	PopulateVendors();
+	auto savedTowners = std::move(Towners);
+	Towners.emplace_back();
+	Towners.back()._ttype = TOWN_SMITH;
+	Towners.back().position = MyPlayer->position.tile;
+	ASSERT_FALSE(SmithItems.empty());
+	const unsigned seed = SmithItems[0]._iSeed;
+	const auto stock = SmithItems.size();
+	const int gold = MyPlayer->_pGold;
+	EXPECT_FALSE(ApplyAsyncStoreTransaction(*MyPlayer, AsyncStoreAction::SmithBuy, 0, seed + 1));
+	EXPECT_EQ(SmithItems.size(), stock);
+	EXPECT_EQ(MyPlayer->_pGold, gold);
+	Towners.back().position = { 100, 100 };
+	EXPECT_FALSE(ApplyAsyncStoreTransaction(*MyPlayer, AsyncStoreAction::SmithBuy, 0, seed));
+	Towners.back().position = MyPlayer->position.tile;
+	MyPlayer->_pGold = 0;
+	Stash.gold = 50000; // A remote player cannot spend a local stash balance.
+	EXPECT_FALSE(ApplyAsyncStoreTransaction(*MyPlayer, AsyncStoreAction::SmithBuy, 0, seed));
+	EXPECT_EQ(SmithItems.size(), stock);
+	Towners = std::move(savedTowners);
+}
+
+TEST_F(StoreTransactionTest, AuthorityShopBuyAndSellCommitInventoryGoldWithoutSpendingStash)
+{
+	PopulateVendors();
+	auto savedTowners = std::move(Towners);
+	Towners.emplace_back();
+	Towners.back()._ttype = TOWN_SMITH;
+	Towners.back().position = MyPlayer->position.tile;
+	ASSERT_FALSE(SmithItems.empty());
+	const auto stock = SmithItems.size();
+	const Item offered = SmithItems[0];
+	// A tall sword needs three free inventory rows; twenty gold piles in the
+	// shared UI fixture deliberately occupy two rows. Use a real affordable,
+	// fitting inventory here, like the existing native buy-success scenario.
+	StripPlayer();
+	SetPlayerGold(offered._iIvalue + 1000);
+	Stash.gold = 12345;
+	const int gold = MyPlayer->_pGold;
+	const auto stash = Stash.gold;
+	ASSERT_TRUE(ApplyAsyncStoreTransaction(*MyPlayer, AsyncStoreAction::SmithBuy, 0, offered._iSeed));
+	EXPECT_EQ(SmithItems.size(), stock - 1);
+	EXPECT_EQ(MyPlayer->_pGold, gold - offered._iIvalue);
+	EXPECT_EQ(Stash.gold, stash);
+	EXPECT_FALSE(ApplyAsyncStoreTransaction(*MyPlayer, AsyncStoreAction::SmithBuy, 0, offered._iSeed));
+	Item sword = MakeSellableSword();
+	sword._iSeed = 987654;
+	ASSERT_TRUE(AutoPlaceItemInInventory(*MyPlayer, sword));
+	int index = -1;
+	for (int i = 0; i < MyPlayer->_pNumInv; ++i)
+		if (MyPlayer->InvList[i]._iSeed == sword._iSeed) index = i;
+	ASSERT_GE(index, 0);
+	const int beforeSale = MyPlayer->_pGold;
+	ASSERT_TRUE(ApplyAsyncStoreTransaction(*MyPlayer, AsyncStoreAction::SmithSell, INVITEM_INV_FIRST + index, sword._iSeed));
+	EXPECT_GT(MyPlayer->_pGold, beforeSale);
+	EXPECT_EQ(Stash.gold, stash);
+	EXPECT_FALSE(ApplyAsyncStoreTransaction(*MyPlayer, AsyncStoreAction::SmithSell, INVITEM_INV_FIRST + index, sword._iSeed));
+	Towners = std::move(savedTowners);
+}
+
+namespace {
+class ScopedAsyncAuthorityForTest {
+	GameData savedInfo = sgGameInitInfo;
+	bool savedMulti = gbIsMultiplayer, savedActive = MyPlayer->plractive, savedSet = setlevel, savedPlayerSet = MyPlayer->plrIsOnSetLevel;
+	uint8_t savedLevel = currlevel, savedPlayerLevel = MyPlayer->plrlevel, savedId = MyPlayerId;
+	dungeon_type savedType = leveltype;
+
+public:
+	ScopedAsyncAuthorityForTest()
+	{
+		gbIsMultiplayer = true;
+		MyPlayerId = 0;
+		MyPlayer->plractive = true;
+		MyPlayer->setLevel(uint8_t { 0 });
+		currlevel = 0;
+		setlevel = false;
+		leveltype = DTYPE_TOWN;
+		sgGameInitInfo.reserved[0] = net::async::GameProtocolTag;
+		sgGameInitInfo.nTickRate = 20;
+		AsyncNetInitialize();
+	}
+	~ScopedAsyncAuthorityForTest()
+	{
+		AsyncNetShutdown();
+		sgGameInitInfo = savedInfo;
+		gbIsMultiplayer = savedMulti;
+		MyPlayerId = savedId;
+		MyPlayer->plractive = savedActive;
+		MyPlayer->plrlevel = savedPlayerLevel;
+		MyPlayer->plrIsOnSetLevel = savedPlayerSet;
+		currlevel = savedLevel;
+		setlevel = savedSet;
+		leveltype = savedType;
+	}
+};
+} // namespace
+
+TEST_F(StoreTransactionTest, SurvivorsAuthorityShopUsesPlayerGoldAndRejectsStaleBuyback)
+{
+	ScopedAsyncAuthorityForTest authority;
+	SetSurvivorsMode(true);
+	struct Cleanup { ~Cleanup() { SetSurvivorsMode(false); ResetSurvivorsBuyback(); } } cleanup;
+	currlevel = 1;
+	leveltype = DTYPE_CATHEDRAL;
+	MyPlayer->setLevel(uint8_t { 1 });
+	ResetSurvivorsBuyback();
+	StripPlayer();
+	SetPlayerGold(1000);
+	Item sword = MakeSellableSword();
+	sword._iSeed = 987654;
+	ASSERT_TRUE(AutoPlaceItemInInventory(*MyPlayer, sword));
+	const int index = MyPlayer->_pNumInv - 1;
+	const int before = MyPlayer->_pGold;
+	EXPECT_FALSE(ApplyAsyncStoreTransaction(*MyPlayer, AsyncStoreAction::SmithSell, INVITEM_INV_FIRST + index, sword._iSeed + 1));
+	ASSERT_TRUE(ApplyAsyncStoreTransaction(*MyPlayer, AsyncStoreAction::SmithSell, INVITEM_INV_FIRST + index, sword._iSeed));
+	ASSERT_EQ(GetSurvivorsBuybackItems(MyPlayerId).size(), 1U);
+	EXPECT_GT(MyPlayer->_pGold, before);
+	EXPECT_FALSE(ApplyAsyncStoreTransaction(*MyPlayer, AsyncStoreAction::SurvivorsBuyback, 0, sword._iSeed + 1));
+	ASSERT_TRUE(ApplyAsyncStoreTransaction(*MyPlayer, AsyncStoreAction::SurvivorsBuyback, 0, sword._iSeed));
+	EXPECT_EQ(MyPlayer->_pGold, before);
+	EXPECT_TRUE(GetSurvivorsBuybackItems(MyPlayerId).empty());
+	EXPECT_FALSE(ApplyAsyncStoreTransaction(*MyPlayer, AsyncStoreAction::SurvivorsBuyback, 0, sword._iSeed));
+	EXPECT_FALSE(ApplyAsyncStoreTransaction(*MyPlayer, AsyncStoreAction::WitchBuy, 0, 0));
+}
+
+TEST_F(StoreTransactionTest, SurvivorsEquipmentIntentRejectsStaleIdentity)
+{
+	StripPlayer();
+	Item sword = MakeSellableSword();
+	sword._iSeed = 314159;
+	ASSERT_TRUE(AutoPlaceItemInInventory(*MyPlayer, sword));
+	const unsigned index = MyPlayer->_pNumInv - 1;
+	EXPECT_FALSE(SurvivorsEquipInventoryItem(*MyPlayer, index, sword._iSeed + 1));
+	EXPECT_EQ(MyPlayer->_pNumInv, 1);
+	ASSERT_TRUE(SurvivorsEquipInventoryItem(*MyPlayer, index, sword._iSeed));
+	EXPECT_EQ(MyPlayer->_pNumInv, 0);
+	EXPECT_EQ(MyPlayer->InvBody[INVLOC_HAND_LEFT]._iSeed, sword._iSeed);
+}
+
+TEST_F(StoreTransactionTest, RemoteDeathSnapshotLoadsMissingAnimationBeforeRebinding)
+{
+	const bool oldHeadless = HeadlessMode;
+	const auto oldLevelType = leveltype;
+	HeadlessMode = false;
+	leveltype = DTYPE_CATHEDRAL;
+	MyPlayer->_pmode = PM_DEATH;
+	MyPlayer->_pdir = Direction::South;
+	MyPlayer->AnimationData[static_cast<size_t>(player_graphic::Death)].sprites = std::nullopt;
+	ASSERT_FALSE(MyPlayer->AnimationData[static_cast<size_t>(player_graphic::Death)].sprites.has_value());
+	SyncPlrAnim(*MyPlayer);
+	EXPECT_TRUE(MyPlayer->AnimationData[static_cast<size_t>(player_graphic::Death)].sprites.has_value());
+	EXPECT_TRUE(MyPlayer->AnimInfo.sprites.has_value());
+	MyPlayer->_pmode = PM_STAND;
+	HeadlessMode = oldHeadless;
+	leveltype = oldLevelType;
+}
+
+TEST_F(StoreTransactionTest, AuthorityIdentifyRequiresAnIssuedLeaseAndConsumesItOnce)
+{
+	StripPlayer();
+	Item magic = MakeUnidentifiedMagicItem();
+	magic._iSeed = 111;
+	ASSERT_TRUE(AutoPlaceItemInInventory(*MyPlayer, magic));
+	const unsigned slot = NUM_INVLOC;
+	ScopedAsyncAuthorityForTest authority;
+	CheckIdentify(*MyPlayer, slot);
+	AsyncNetBeforeTick();
+	EXPECT_FALSE(MyPlayer->InvList[0]._iIdentified);
+	AsyncNetOfferTargetedSpell(*MyPlayer, SpellID::Identify);
+	const auto lease = GetAsyncTargetedSpellStatus(*MyPlayer);
+	ASSERT_TRUE(lease.ready);
+	CheckIdentify(*MyPlayer, slot);
+	EXPECT_FALSE(MyPlayer->InvList[0]._iIdentified); // The authority must execute the ordered request.
+	AsyncNetBeforeTick();
+	EXPECT_TRUE(MyPlayer->InvList[0]._iIdentified);
+	EXPECT_FALSE(GetAsyncTargetedSpellStatus(*MyPlayer).ready);
+	MyPlayer->InvList[0]._iIdentified = false;
+	CheckIdentify(*MyPlayer, slot);
+	AsyncNetBeforeTick();
+	EXPECT_FALSE(MyPlayer->InvList[0]._iIdentified);
+}
+
+TEST_F(StoreTransactionTest, AuthorityRepairRejectsWrongSpellAndExecutesNativeWearOnlyOnce)
+{
+	StripPlayer();
+	Item sword = MakeSellableSword();
+	sword._iSeed = 222;
+	sword._iMaxDur = 30;
+	sword._iDurability = 5;
+	ASSERT_TRUE(AutoPlaceItemInInventory(*MyPlayer, sword));
+	ScopedAsyncAuthorityForTest authority;
+	AsyncNetOfferTargetedSpell(*MyPlayer, SpellID::Identify);
+	DoRepair(*MyPlayer, NUM_INVLOC);
+	AsyncNetBeforeTick();
+	EXPECT_EQ(MyPlayer->InvList[0]._iDurability, 5);
+	EXPECT_TRUE(GetAsyncTargetedSpellStatus(*MyPlayer).ready);
+	AsyncNetOfferTargetedSpell(*MyPlayer, SpellID::ItemRepair);
+	DoRepair(*MyPlayer, NUM_INVLOC);
+	AsyncNetBeforeTick();
+	const int repaired = MyPlayer->InvList[0]._iDurability, maxDur = MyPlayer->InvList[0]._iMaxDur;
+	EXPECT_GT(repaired, 5);
+	EXPECT_LT(maxDur, 30);
+	EXPECT_FALSE(GetAsyncTargetedSpellStatus(*MyPlayer).ready);
+	DoRepair(*MyPlayer, NUM_INVLOC);
+	AsyncNetBeforeTick();
+	EXPECT_EQ(MyPlayer->InvList[0]._iDurability, repaired);
+	EXPECT_EQ(MyPlayer->InvList[0]._iMaxDur, maxDur);
+}
+
+TEST_F(StoreTransactionTest, AuthorityRejectsClaimingAnUnownedSpellAsAFreeClassSkill)
+{
+	ScopedAsyncAuthorityForTest authority;
+	MyPlayer->destAction = ACTION_NONE;
+	NetSendCmdLocParam3(true, CMD_SPELLXY, MyPlayer->position.tile, static_cast<uint16_t>(SpellID::Fireball), static_cast<uint16_t>(SpellType::Skill), 0);
+	AsyncNetBeforeTick();
+	EXPECT_EQ(MyPlayer->destAction, ACTION_NONE);
+	EXPECT_FALSE(GetAsyncTargetedSpellStatus(*MyPlayer).ready);
+}
+
+TEST_F(StoreTransactionTest, AuthorityReadingBookLearnsSpellAndConsumesOneItem)
+{
+	StripPlayer();
+	Item book { };
+	InitializeItem(book, IDI_BOOK1);
+	book._iSpell = SpellID::HealOther;
+	book._iSeed = 333;
+	book._iMinMag = 0;
+	ASSERT_TRUE(AutoPlaceItemInInventory(*MyPlayer, book));
+	const auto level = MyPlayer->_pSplLvl[static_cast<unsigned>(SpellID::HealOther)];
+	MyPlayer->_pMemSpells &= ~GetSpellBitmask(SpellID::HealOther);
+	ScopedAsyncAuthorityForTest authority;
+	ASSERT_TRUE(UseInvItem(INVITEM_INV_FIRST));
+	EXPECT_EQ(MyPlayer->_pNumInv, 1);
+	AsyncNetBeforeTick();
+	EXPECT_EQ(MyPlayer->_pNumInv, 0);
+	EXPECT_EQ(MyPlayer->_pSplLvl[static_cast<unsigned>(SpellID::HealOther)], level + 1);
+	EXPECT_NE(MyPlayer->_pMemSpells & GetSpellBitmask(SpellID::HealOther), 0U);
+}
+
 } // namespace devilution

@@ -25,7 +25,8 @@ enum class VisualStoreVendor : uint8_t {
 
 enum class VisualStoreTab : uint8_t {
 	Basic = 0,
-	Premium = 1
+	Premium = 1,
+	Buyback = 2
 };
 
 // Grid: 10x9 = 90 slots per page
@@ -81,6 +82,16 @@ void CloseVisualStore();
  * @param tab The tab to switch to.
  */
 void SetVisualStoreTab(VisualStoreTab tab);
+/** Recalculate the displayed stock's requirements for the local player. */
+DVL_API_FOR_TEST void RefreshVisualStoreItemEligibility();
+DVL_API_FOR_TEST void ToggleSurvivorsBuyback();
+DVL_API_FOR_TEST void ResetSurvivorsBuyback();
+inline constexpr size_t SurvivorsBuybackLimit = 40;
+DVL_API_FOR_TEST std::span<const Item> GetSurvivorsBuybackItems(unsigned peer);
+DVL_API_FOR_TEST std::span<const int> GetSurvivorsBuybackPrices(unsigned peer);
+DVL_API_FOR_TEST bool SetSurvivorsBuyback(unsigned peer, std::span<const Item> items, std::span<const int> prices);
+DVL_API_FOR_TEST void RememberSurvivorsSale(unsigned peer, const Item &item, int price);
+DVL_API_FOR_TEST bool RemoveSurvivorsBuyback(unsigned peer, unsigned index, uint32_t seed, Item &item, int &price);
 
 /**
  * @brief Navigate to the next page of store items.

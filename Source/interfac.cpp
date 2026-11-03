@@ -23,6 +23,7 @@
 
 #include "control/control.hpp"
 #include "controls/input.h"
+#include "dvlnet/async_runtime.h"
 #include "engine/clx_sprite.hpp"
 #include "engine/dx.h"
 #include "engine/events.hpp"
@@ -545,7 +546,12 @@ void ProgressEventHandler(const SDL_Event &event, uint16_t modState)
 		ProgressEventHandlerState.prevHandler = nullptr;
 		IsProgress = false;
 
-		const Player &myPlayer = *MyPlayer;
+		Player &myPlayer = *MyPlayer;
+		// Async authority can publish snapshots before its own join-level
+		// command is applied. The local load is already complete here, so do
+		// not keep presenting the authority as changing levels indefinitely.
+		if (AsyncNetEnabled())
+			myPlayer._pLvlChanging = false;
 		NetSendCmdLocParam2(true, CMD_PLAYER_JOINLEVEL, myPlayer.position.tile, myPlayer.plrlevel, myPlayer.plrIsOnSetLevel ? 1 : 0);
 		DelayPlrMessages(SDL_GetTicks() - ProgressEventHandlerState.loadStartedAt);
 

@@ -4,6 +4,8 @@
  * Implementation of functions for keeping multiplaye games in sync.
  */
 #include "multi.h"
+#include "dvlnet/async_runtime.h"
+#include "dvlnet/async_session.h"
 #ifdef DAMNATION_S1_BRIDGE
 #include "s1_headless.hpp"
 #include "s1_bridge.hpp"
@@ -46,6 +48,8 @@
 #include "qol/chatlog.h"
 #include "storm/storm_net.hpp"
 #include "sync.h"
+#include "survivors.h"
+#include "survivors_progression.h"
 #include "tmsg.h"
 #include "utils/endian_read.hpp"
 #include "utils/endian_swap.hpp"
@@ -548,7 +552,12 @@ bool InitSingle(GameData *gameData)
 	InspectPlayer = MyPlayer;
 	gbIsMultiplayer = false;
 
-	pfile_read_player_from_save(gSaveNumber, *MyPlayer);
+#ifdef DAMNATION_S1_BRIDGE
+	if ((HeadlessMode || s1_headless::Rendered()) && s1_headless::Solo()) {
+		if (!s1_headless::PrepareSoloPlayer()) return false;
+	} else
+#endif
+		pfile_read_player_from_save(gSaveNumber, *MyPlayer);
 
 	return true;
 }
@@ -560,7 +569,7 @@ bool InitMulti(GameData *gameData)
 	int playerId;
 
 #ifdef DAMNATION_S1_BRIDGE
-	if (HeadlessMode) {
+	if (HeadlessMode || s1_headless::Rendered()) {
 		if (!s1_headless::InitializeNetwork(gameData)) return false;
 		RegisterNetEventHandlers();
 		if (!s1_headless::Connect(gameData, &playerId)) return false;
@@ -578,6 +587,13 @@ bool InitMulti(GameData *gameData)
 		gbSelectProvider = true;
 	}
 
+	if (((gameData->reserved[1] & 1U) != 0) != IsSurvivorsMode()
+	    || (gameData->reserved[0] != 0 && gameData->reserved[0] != net::async::GameProtocolTag)
+	    || (IsSurvivorsMode() && gameData->reserved[0] != net::async::GameProtocolTag)) {
+		Log("Incompatible multiplayer mode or protocol; enter Survivors co-op through its camp.");
+		SNetLeaveGame(leaveinfo_t::LEAVE_EXIT);
+		return false;
+	}
 	if (static_cast<size_t>(playerId) >= Players.size()) {
 		return false;
 	}
@@ -636,12 +652,20 @@ void InitGameInfo()
 	// Resolve both local opt-outs once on the host. Every client thereafter uses this shared bit.
 	const bool cathedralPortalMod = std::find(activeMods.begin(), activeMods.end(), "permanent_cathedral_portal") != activeMods.end();
 	sgGameInitInfo.bPermanentCathedralPortal = *options.Gameplay.cathedralPortal && cathedralPortalMod ? 1 : 0;
-	sgGameInitInfo.reserved[0] = 0;
-	sgGameInitInfo.reserved[1] = 0;
+	sgGameInitInfo.reserved[0] = gbIsMultiplayer ? net::async::GameProtocolTag : 0;
+	sgGameInitInfo.reserved[1] = IsSurvivorsMode() ? static_cast<uint8_t>(1U | (SurvivorsSelectedDifficulty() << 1)) : 0;
+}
+
+void AsyncNetApplyNativeCommands(uint8_t peer, const std::byte *data, size_t size)
+{
+	if (peer < Players.size() && size != 0)
+		(void)ParseCmd(peer, reinterpret_cast<const TCmd *>(data), size);
 }
 
 void NetSendLoPri(uint8_t playerId, const std::byte *data, size_t size)
 {
+	if (AsyncNetEnabled() && data != nullptr && AsyncNetSendCommand({data, size}))
+		return;
 	if (data != nullptr && size != 0) {
 		CopyPacket(&lowPriorityBuffer, data, size);
 		SendPacket(playerId, data, size);
@@ -650,6 +674,10 @@ void NetSendLoPri(uint8_t playerId, const std::byte *data, size_t size)
 
 void NetSendHiPri(uint8_t playerId, const std::byte *data, size_t size)
 {
+	if (AsyncNetEnabled()) {
+		if (data != nullptr) AsyncNetSendCommand({data, size});
+		return;
+	}
 	if (data != nullptr && size != 0) {
 		CopyPacket(&highPriorityBuffer, data, size);
 		SendPacket(playerId, data, size);
@@ -763,6 +791,8 @@ void ProcessGameMessagePackets()
 	while (SNetReceiveMessage(&playerId, (void **)&pkt, &totalPacketSize)) {
 		dwRecCount++;
 		ClearPlayerLeftState();
+		if (AsyncNetHandlePacket(playerId, { reinterpret_cast<const std::byte *>(pkt), totalPacketSize }))
+			continue;
 		if (totalPacketSize < sizeof(TPktHdr))
 			continue;
 		if (playerId >= Players.size())
@@ -775,7 +805,7 @@ void ProcessGameMessagePackets()
 		// Distrust all messages until player info is received
 		Player &player = Players[playerId];
 		const bool isTrustedPacket = IsNetPlayerValid(player);
-		if (isTrustedPacket) {
+		if (isTrustedPacket && !AsyncNetEnabled()) {
 			SyncPacketHeaderData(player, *pkt);
 		}
 
@@ -794,6 +824,13 @@ void ProcessGameMessagePackets()
 				continue;
 		}
 
+		if (AsyncNetEnabled() && gbBufferMsgs == 0 && messageSize != 0) {
+			const auto command = static_cast<_cmd_id>(message[0]);
+			// Joining/player-info handshakes retain their native format. Gameplay
+			// messages from old or malicious peers cannot bypass authority framing.
+			if (command != CMD_SEND_PLRINFO && command != CMD_ACK_PLRINFO)
+				continue;
+		}
 		HandleAllPackets(playerId, message, messageSize);
 	}
 	CheckPlayerInfoTimeouts();
@@ -835,6 +872,7 @@ void multi_send_zero_packet(uint8_t pnum, _cmd_id bCmd, const std::byte *data, s
 
 void NetClose()
 {
+	AsyncNetShutdown();
 	if (!sgbNetInited) {
 		return;
 	}
@@ -930,6 +968,7 @@ bool NetInit(bool bSinglePlayer)
 		    FormatGameSeed(sgGameInitInfo.gameSeed));
 	}
 
+	AsyncNetInitialize();
 	return true;
 }
 
@@ -968,7 +1007,7 @@ void recv_plrinfo(Player &player, const TCmdPlrInfoHdr &header, bool recv)
 		return;
 	}
 
-	if (!recv) {
+	if (!recv && !AsyncNetEnabled()) {
 		return;
 	}
 

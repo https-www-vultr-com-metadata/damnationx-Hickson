@@ -66,6 +66,12 @@ add_library(test_main OBJECT test/main.cpp)
 target_link_dependencies(test_main PUBLIC libdevilutionx_so GTest::gtest GTest::gmock)
 
 set(tests
+  survivors_test
+  survivors_progression_test
+  survivors_arsenal_test
+  survivors_coop_test
+  survivors_balance_test
+  survivors_encircle_test
   animationinfo_test
   appfat_test
   assets_test
@@ -136,6 +142,7 @@ set(standalone_tests
   str_cat_test
   utf8_test
   dvlnet_session_test
+  dvlnet_async_test
   gbuffer_test
   clx_normal_map_test
   tile_geometry_test
@@ -428,3 +435,7 @@ if(Python3_FOUND)
     COMMAND ${Python3_EXECUTABLE} "${PROJECT_SOURCE_DIR}/tools/wgsl_validate.py" "${PROJECT_SOURCE_DIR}/Source/engine/render/webgpu_shaders.hpp")
   set_tests_properties(wgsl_validate PROPERTIES SKIP_RETURN_CODE 77 LABELS "hybrid;wgsl")
 endif()
+
+# Asynchronous protocol is exercised without native globals or game data.
+target_sources(dvlnet_async_test PRIVATE Source/dvlnet/async_session.cpp)
+target_sources(dvlnet_session_test PRIVATE Source/dvlnet/session.cpp)

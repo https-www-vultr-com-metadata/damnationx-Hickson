@@ -15,6 +15,8 @@
 #include "loadsave.h"
 #include "plrmsg.h"
 #include "stores.h"
+#include "survivors.h"
+#include "survivors_arsenal.h"
 #include "tables/playerdat.hpp"
 #include "utils/endian_read.hpp"
 #include "utils/endian_swap.hpp"
@@ -484,6 +486,10 @@ bool UnPackNetPlayer(const PlayerNetPack &packed, Player &player)
 	const int32_t baseHpMax = Swap32LE(packed.pMaxHPBase);
 	const int32_t baseHp = Swap32LE(packed.pHPBase);
 	const int32_t hpMax = Swap32LE(packed.pMaxHP);
+	const bool survivorsRoom = IsSurvivorsMode() && gbIsMultiplayer && (sgGameInitInfo.reserved[1] & 1U) != 0;
+	if (survivorsRoom) {
+		ValidateFields(baseHpMax, hpMax, baseHpMax > 0 && hpMax > 0 && baseHpMax <= (10000 << 6) && hpMax <= (10000 << 6));
+	}
 	ValidateFields(baseHp, baseHpMax, baseHp >= (baseHpMax - hpMax) && baseHp <= baseHpMax);
 
 	const int32_t baseManaMax = Swap32LE(packed.pMaxManaBase);
@@ -600,8 +606,19 @@ bool UnPackNetPlayer(const PlayerNetPack &packed, Player &player)
 	ValidateFields(player._pMaxMana, SwapSigned32LE(packed.pMaxMana), player._pMaxMana == SwapSigned32LE(packed.pMaxMana));
 	ValidateFields(player._pDamageMod, SwapSigned32LE(packed.pDamageMod), player._pDamageMod == SwapSigned32LE(packed.pDamageMod));
 	ValidateFields(player.getBaseToBlock(), SwapSigned32LE(packed.pBaseToBlk), player.getBaseToBlock() == SwapSigned32LE(packed.pBaseToBlk));
-	ValidateFields(player._pIMinDam, SwapSigned32LE(packed.pIMinDam), player._pIMinDam == SwapSigned32LE(packed.pIMinDam));
-	ValidateFields(player._pIMaxDam, SwapSigned32LE(packed.pIMaxDam), player._pIMaxDam == SwapSigned32LE(packed.pIMaxDam));
+	if (survivorsRoom) {
+		// Native arrows read source-player damage rather than missile damage.
+		// The host's arsenal legitimately replaces these two derived fields.
+		const int32_t minimum = SwapSigned32LE(packed.pIMinDam);
+		const int32_t maximum = SwapSigned32LE(packed.pIMaxDam);
+		constexpr int32_t maximumRunDamage = static_cast<int32_t>(SurvivorsWeaponDamage(1000, SurvivorsWeaponMaxRank, 1000) + 3);
+		ValidateFields(minimum, maximum, minimum >= 0 && minimum <= maximum && maximum <= maximumRunDamage);
+		player._pIMinDam = minimum;
+		player._pIMaxDam = maximum;
+	} else {
+		ValidateFields(player._pIMinDam, SwapSigned32LE(packed.pIMinDam), player._pIMinDam == SwapSigned32LE(packed.pIMinDam));
+		ValidateFields(player._pIMaxDam, SwapSigned32LE(packed.pIMaxDam), player._pIMaxDam == SwapSigned32LE(packed.pIMaxDam));
+	}
 	ValidateFields(player._pIAC, SwapSigned32LE(packed.pIAC), player._pIAC == SwapSigned32LE(packed.pIAC));
 	ValidateFields(player._pIBonusDam, SwapSigned32LE(packed.pIBonusDam), player._pIBonusDam == SwapSigned32LE(packed.pIBonusDam));
 	ValidateFields(player._pIBonusToHit, SwapSigned32LE(packed.pIBonusToHit), player._pIBonusToHit == SwapSigned32LE(packed.pIBonusToHit));
@@ -613,7 +630,11 @@ bool UnPackNetPlayer(const PlayerNetPack &packed, Player &player)
 	ValidateFields(player._pIFMaxDam, SwapSigned32LE(packed.pIFMaxDam), player._pIFMaxDam == SwapSigned32LE(packed.pIFMaxDam));
 	ValidateFields(player._pILMinDam, SwapSigned32LE(packed.pILMinDam), player._pILMinDam == SwapSigned32LE(packed.pILMinDam));
 	ValidateFields(player._pILMaxDam, SwapSigned32LE(packed.pILMaxDam), player._pILMaxDam == SwapSigned32LE(packed.pILMaxDam));
+	if (survivorsRoom) {
+		ValidateFields(player._pMaxHPBase, player.calculateBaseLife(), SurvivorsPackedLifeInRange(player.calculateBaseLife(), player._pMaxHPBase));
+	} else {
 	ValidateFields(player._pMaxHPBase, player.calculateBaseLife(), player._pMaxHPBase <= player.calculateBaseLife());
+	}
 	ValidateFields(player._pMaxManaBase, player.calculateBaseMana(), player._pMaxManaBase <= player.calculateBaseMana());
 
 	return true;

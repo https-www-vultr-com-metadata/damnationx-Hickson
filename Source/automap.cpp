@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <format>
 
 #include "control/control.hpp"
 #include "engine/load_file.hpp"
@@ -17,6 +18,8 @@
 #include "engine/render/scrollrt.h"
 #include "levels/gendung.h"
 #include "levels/setmaps.h"
+#include "levels/survivors_exploration.hpp"
+#include "levels/survivors_rolling_runtime.hpp"
 #include "options.h"
 #include "player.h"
 #include "utils/attributes.h"
@@ -40,6 +43,7 @@ namespace devilution {
 
 namespace {
 Point Automap;
+SurvivorsExploration RollingExploration;
 
 enum MapColors : uint8_t {
 	/** color used to draw the player's arrow */
@@ -1505,6 +1509,13 @@ void DrawAutomapText(const Surface &out)
 
 	const std::string description = FormatRuntime(_(/* TRANSLATORS: {:s} means: Game Difficulty. */ "Difficulty: {:s}"), difficulty);
 	drawStringAndAdvanceLine(description);
+	if (SurvivorsRollingActive() && MyPlayer != nullptr) {
+		// The rolling world is open floor. Report stable world coordinates
+		// instead of showing the original finite dungeon's stale walls.
+		drawStringAndAdvanceLine(std::format("World: {}, {}",
+		    SurvivorsRollingOriginX() + MyPlayer->position.tile.x,
+		    SurvivorsRollingOriginY() + MyPlayer->position.tile.y));
+	}
 
 #ifdef _DEBUG
 	if (DebugGodMode || DebugInvisible || DisableLighting || DebugVision || DebugPath || DebugGrid || DebugScrollViewEnabled) {
@@ -1709,6 +1720,7 @@ void InitAutomap()
 	}
 
 	memset(AutomapView, 0, sizeof(AutomapView));
+	RollingExploration.Clear();
 
 	for (auto &column : dFlags)
 		for (auto &dFlag : column)
@@ -1771,15 +1783,20 @@ void DrawAutomap(const Surface &out)
 	if (leveltype != DTYPE_TOWN) {
 		Automap += { -4, -4 };
 	}
-	while (Automap.x + AutomapOffset.deltaX < 0)
-		AutomapOffset.deltaX++;
-	while (Automap.x + AutomapOffset.deltaX >= DMAXX)
-		AutomapOffset.deltaX--;
-
-	while (Automap.y + AutomapOffset.deltaY < 0)
-		AutomapOffset.deltaY++;
-	while (Automap.y + AutomapOffset.deltaY >= DMAXY)
-		AutomapOffset.deltaY--;
+	if (SurvivorsRollingActive()) {
+		// A rolling map can be panned past the current local engine window.
+		AutomapOffset.deltaX = std::clamp(AutomapOffset.deltaX, -8192, 8192);
+		AutomapOffset.deltaY = std::clamp(AutomapOffset.deltaY, -8192, 8192);
+	} else {
+		while (Automap.x + AutomapOffset.deltaX < 0)
+			AutomapOffset.deltaX++;
+		while (Automap.x + AutomapOffset.deltaX >= DMAXX)
+			AutomapOffset.deltaX--;
+		while (Automap.y + AutomapOffset.deltaY < 0)
+			AutomapOffset.deltaY++;
+		while (Automap.y + AutomapOffset.deltaY >= DMAXY)
+			AutomapOffset.deltaY--;
+	}
 
 	Automap += AutomapOffset;
 
@@ -1856,17 +1873,30 @@ void DrawAutomap(const Surface &out)
 
 	Point map = { Automap.x - cells, Automap.y - 1 };
 
+	const bool rolling = SurvivorsRollingActive();
+	auto drawTile = [&](Point center, Point localMega) {
+		if (!rolling) {
+			DrawAutomapTile(out, center, localMega);
+			return;
+		}
+		const auto explorer = RollingExploration.At(SurvivorsRollingOriginX(), SurvivorsRollingOriginY(), localMega);
+		if (explorer == MAP_EXP_NONE)
+			return;
+		const uint8_t color = explorer == MAP_EXP_OTHERS ? PAL16_BEIGE + 10 : MapColorsDim;
+		// A small dot marks explored open floor without inventing dungeon walls.
+		DrawMapFreeLine(out, center + Displacement { -1, 0 }, center + Displacement { 1, 0 }, color);
+	};
 	for (int i = 0; i <= cells + 1; i++) {
 		Point tile1 = screen;
 		for (int j = 0; j < cells; j++) {
-			DrawAutomapTile(out, tile1, { map.x + j, map.y - j });
+			drawTile(tile1, { map.x + j, map.y - j });
 			tile1.x += AmOffset(AmWidthOffset::DoubleTileRight, AmHeightOffset::None).deltaX;
 		}
 		map.y++;
 
 		Point tile2 = screen + AmOffset(AmWidthOffset::FullTileLeft, AmHeightOffset::FullTileDown);
 		for (int j = 0; j <= cells; j++) {
-			DrawAutomapTile(out, tile2, { map.x + j, map.y - j });
+			drawTile(tile2, { map.x + j, map.y - j });
 			tile2.x += AmOffset(AmWidthOffset::DoubleTileRight, AmHeightOffset::None).deltaX;
 		}
 		map.x++;
@@ -1897,6 +1927,10 @@ void UpdateAutomapExplorer(Point map, MapExplorationType explorer)
 
 void SetAutomapView(Point position, MapExplorationType explorer)
 {
+	if (SurvivorsRollingActive()) {
+		RollingExploration.Mark(SurvivorsRollingOriginX(), SurvivorsRollingOriginY(), position, explorer);
+		return;
+	}
 	const Point map { (position.x - 16) / 2, (position.y - 16) / 2 };
 
 	if (map.x < 0 || map.x >= DMAXX || map.y < 0 || map.y >= DMAXY) {

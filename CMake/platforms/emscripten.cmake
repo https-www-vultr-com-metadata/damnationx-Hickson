@@ -4,19 +4,25 @@ if(USE_SDL1)
   message(FATAL_ERROR "Emscripten requires SDL3, not SDL1")
 endif()
 
-# Validate user/toolchain flags before adding any source-built dependencies.
-get_cmake_property(_browser_variables VARIABLES)
-foreach(_variable IN LISTS _browser_variables)
-  if(_variable MATCHES "^CMAKE_.*FLAGS")
-    if("${${_variable}}" MATCHES "-pthread|-matomics|--shared-memory|USE_PTHREADS|PTHREAD_POOL|PROXY_TO_PTHREAD|SHARED_MEMORY|WASM_WORKERS|USE_SDL=2|USE_SDL_IMAGE=2")
-      message(FATAL_ERROR "Single-threaded SDL3 browser profile conflicts with ${_variable}: ${${_variable}}")
+# The Bevy companion runs the ordinary host/game rendezvous on one pthread.
+# Its page provides COOP/COEP; standalone classic retains its single-thread build.
+if(DAMNATIONX_HOST_LIB)
+  add_compile_definitions(DEVILUTIONX_BROWSER_PTHREAD_HOST=1 LOAD_ON_MAIN_THREAD)
+  add_compile_options(-pthread)
+  add_link_options(-pthread)
+else()
+  # Validate legacy profile flags before adding source-built dependencies.
+  get_cmake_property(_browser_variables VARIABLES)
+  foreach(_variable IN LISTS _browser_variables)
+    if(_variable MATCHES "^CMAKE_.*FLAGS")
+      if("${${_variable}}" MATCHES "-pthread|-matomics|--shared-memory|USE_PTHREADS|PTHREAD_POOL|PROXY_TO_PTHREAD|SHARED_MEMORY|WASM_WORKERS|USE_SDL=2|USE_SDL_IMAGE=2")
+        message(FATAL_ERROR "Single-threaded SDL3 browser profile conflicts with ${_variable}: ${${_variable}}")
+      endif()
     endif()
-  endif()
-endforeach()
-# Use the existing main-thread loading path, not an inline worker followed by
-# a progress loop that assumes concurrent execution.
-add_compile_definitions(DEVILUTIONX_BROWSER_SINGLE_THREADED=1 LOAD_ON_MAIN_THREAD)
-add_link_options(-sUSE_PTHREADS=0 -sSHARED_MEMORY=0)
+  endforeach()
+  add_compile_definitions(DEVILUTIONX_BROWSER_SINGLE_THREADED=1 LOAD_ON_MAIN_THREAD)
+  add_link_options(-sUSE_PTHREADS=0 -sSHARED_MEMORY=0)
+endif()
 
 set(BUILD_TESTING OFF)
 set(BUILD_ASSETS_MPQ OFF)

@@ -76,6 +76,9 @@ class Handler(http.server.SimpleHTTPRequestHandler):
 
     def end_headers(self):
         self.send_header("Cache-Control", CACHE_CONTROL)
+        if os.path.isfile(os.path.join(self.directory, "damnationx_core.js")):
+            self.send_header("Cross-Origin-Opener-Policy", "same-origin")
+            self.send_header("Cross-Origin-Embedder-Policy", "require-corp")
         super().end_headers()
 
 
@@ -99,7 +102,7 @@ def request(directory, path):
         server.close()
         response = http.client.HTTPResponse(client, method="HEAD")
         response.begin()
-        return response.status, response.getheader("Content-Type"), response.getheader("Cache-Control")
+        return response.status, response.getheader("Content-Type"), response.getheader("Cache-Control"), dict(response.getheaders())
     finally:
         client.close()
 
@@ -111,7 +114,7 @@ def self_test(build_dir, port, bind_address):
             name = f"sample{extension}"
             with open(os.path.join(directory, name), "wb") as f:
                 f.write(b"\0")
-            status, content_type, cache_control = request(directory, f"/{name}")
+            status, content_type, cache_control, _ = request(directory, f"/{name}")
             ok = status == 200 and content_type == expected and cache_control == CACHE_CONTROL
             print(f"{extension}\t{content_type}\t{'ok' if ok else 'FAIL'}")
             if not ok:
@@ -121,10 +124,16 @@ def self_test(build_dir, port, bind_address):
                     f"(expected {expected!r}), Cache-Control {cache_control!r} (expected {CACHE_CONTROL!r})",
                     file=sys.stderr,
                 )
-        status, _, cache_control = request(directory, "/missing.wasm")
+        status, _, cache_control, _ = request(directory, "/missing.wasm")
         if status != 404 or cache_control != CACHE_CONTROL:
             failures += 1
             print(f"serve_webgpu self-test: missing file returned status {status} with Cache-Control {cache_control!r}", file=sys.stderr)
+        with open(os.path.join(directory, "damnationx_core.js"), "wb") as f:
+            f.write(b"// companion simulation")
+        _, _, _, headers = request(directory, "/sample.wasm")
+        if headers.get("Cross-Origin-Opener-Policy") != "same-origin" or headers.get("Cross-Origin-Embedder-Policy") != "require-corp":
+            failures += 1
+            print("serve_webgpu self-test: missing browser host isolation headers", file=sys.stderr)
     if failures:
         print(f"serve_webgpu self-test: {failures} failure(s)", file=sys.stderr)
         return 1

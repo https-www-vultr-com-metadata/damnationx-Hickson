@@ -1,6 +1,7 @@
 #include "d2sound/d2sound_import.hpp"
 
 #include <algorithm>
+#include <cstdio>
 #include <cstdlib>
 #include <expected>
 #include <utility>
@@ -95,6 +96,27 @@ void AddWinePrefixes(std::vector<std::string> &prefixes, const std::string &bott
 		prefixes.push_back(JoinPath(JoinPath(bottlesDir, bottle), "drive_c"));
 }
 
+/** @brief Where Steam installs Diablo II: Resurrected (app 2536520) inside a library folder. */
+std::string SteamD2rDir(std::string_view library)
+{
+	return JoinPath(JoinPath(JoinPath(library, "steamapps"), "common"), Diablo2ResurrectedName);
+}
+
+/** @brief Adds D2R in a Steam folder's own library and in every library its `libraryfolders.vdf` lists. */
+void AddSteamLibraries(std::vector<std::string> &candidates, const std::string &steamDir)
+{
+	candidates.push_back(SteamD2rDir(steamDir));
+	FILE *file = OpenFile(JoinPath(JoinPath(steamDir, "steamapps"), "libraryfolders.vdf").c_str(), "rb");
+	if (file == nullptr)
+		return;
+	// Steam writes this file in a few KB; read no more than 1 MB of it.
+	std::string vdf(1 << 20, '\0');
+	vdf.resize(std::fread(vdf.data(), 1, vdf.size(), file));
+	std::fclose(file);
+	for (const std::string &library : SteamLibraryPaths(vdf))
+		candidates.push_back(SteamD2rDir(library));
+}
+
 std::vector<std::string> CandidateInstallDirs(D2SoundSource source)
 {
 	const std::string_view name = source == D2SoundSource::Diablo2 ? Diablo2Name : Diablo2ResurrectedName;
@@ -110,6 +132,11 @@ std::vector<std::string> CandidateInstallDirs(D2SoundSource source)
 	}
 	for (const char *root : { "C:\\Program Files (x86)\\", "C:\\Program Files\\", "C:\\Games\\" })
 		candidates.push_back(StrCat(root, name));
+	if (source == D2SoundSource::Diablo2Resurrected) {
+		if (std::optional<std::string> steam = ReadRegistryString(HKEY_CURRENT_USER, "Software\\Valve\\Steam", "SteamPath"))
+			AddSteamLibraries(candidates, *steam);
+		AddSteamLibraries(candidates, "C:\\Program Files (x86)\\Steam");
+	}
 #else
 	std::vector<std::string> winePrefixes;
 	const char *home = std::getenv("HOME");
@@ -141,7 +168,18 @@ std::vector<std::string> CandidateInstallDirs(D2SoundSource source)
 		for (const char *dir : { "Program Files (x86)", "Program Files", "Games" })
 			candidates.push_back(JoinPath(JoinPath(prefix, dir), name));
 		candidates.push_back(JoinPath(prefix, name));
+		// Windows Steam inside the prefix. The Windows paths in its libraryfolders.vdf are not
+		// found from here, so in practice only its own library is.
+		if (source == D2SoundSource::Diablo2Resurrected)
+			AddSteamLibraries(candidates, JoinPath(JoinPath(prefix, "Program Files (x86)"), "Steam"));
 	}
+#ifndef __APPLE__
+	// Native Linux Steam runs D2R through Proton; its libraries are ordinary folders.
+	if (source == D2SoundSource::Diablo2Resurrected && home != nullptr && *home != '\0') {
+		for (const char *steam : { ".local/share/Steam", ".steam/steam", ".var/app/com.valvesoftware.Steam/.local/share/Steam" })
+			AddSteamLibraries(candidates, JoinPath(home, steam));
+	}
+#endif
 #endif
 	return candidates;
 }

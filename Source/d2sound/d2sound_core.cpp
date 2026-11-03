@@ -221,12 +221,81 @@ bool IsDiablo2InstallDir(const std::string &path)
 	return !path.empty() && IsDirectory(ToPath(path)) && !FindD2FileIgnoringCase(path, "d2sfx.mpq").empty();
 }
 
+namespace {
+
+/** @brief The install's `Data` folder, which a case-sensitive copy may spell `data`. Empty if there is none. */
+std::filesystem::path FindD2rDataDir(const std::filesystem::path &root)
+{
+	if (IsDirectory(root / "Data"))
+		return root / "Data";
+	std::error_code error;
+	for (std::filesystem::directory_iterator it(root, error), end; !error && it != end; it.increment(error)) {
+		if (ToLower(FromPath(it->path().filename())) == "data" && IsDirectory(it->path()))
+			return it->path();
+	}
+	return {};
+}
+
+} // namespace
+
 bool IsDiablo2ResurrectedInstallDir(const std::string &path)
 {
 	if (path.empty())
 		return false;
 	const std::filesystem::path root = ToPath(path);
-	return IsDirectory(root / "Data" / "indices") && IsFile(root / ".build.info");
+	const std::filesystem::path data = FindD2rDataDir(root);
+	if (data.empty())
+		return false;
+	// Battle.net: `.build.info` and the `Data/indices` of a dynamic storage.
+	if (IsFile(root / ".build.info"))
+		return IsDirectory(data / "indices");
+	// Steam (since patch 3.2.0.1): a static storage described by `Data/.build.config`.
+	return IsFile(data / ".build.config");
+}
+
+std::string D2rStoragePath(const std::string &path)
+{
+	const std::filesystem::path root = ToPath(path);
+	if (IsFile(root / ".build.info"))
+		return path;
+	// Given a folder, CascLib only looks for a lowercase `data/.build.config`, which a
+	// case-sensitive file system (Linux, the browser's WORKERFS) spells `Data`. Given the file
+	// itself, it matches the name without case.
+	const std::filesystem::path data = FindD2rDataDir(root);
+	if (!data.empty() && IsFile(data / ".build.config"))
+		return FromPath(data / ".build.config");
+	return path;
+}
+
+std::vector<std::string> SteamLibraryPaths(std::string_view vdf)
+{
+	// Steam writes each `"path"		"<value>"` pair on one line, escaping only `\` and `"`.
+	constexpr std::string_view Key = "\"path\"";
+	std::vector<std::string> paths;
+	for (size_t pos = vdf.find(Key); pos != std::string_view::npos; pos = vdf.find(Key)) {
+		vdf.remove_prefix(pos + Key.size());
+		size_t i = 0;
+		while (i < vdf.size() && (vdf[i] == ' ' || vdf[i] == '\t'))
+			i++;
+		// A "path" that is itself a value (say, a library labelled "path") ends its line instead.
+		if (i >= vdf.size() || vdf[i] != '"')
+			continue;
+		std::string value;
+		bool closed = false;
+		for (i++; i < vdf.size() && vdf[i] != '\n'; i++) {
+			if (vdf[i] == '"') {
+				closed = true;
+				break;
+			}
+			if (vdf[i] == '\\' && i + 1 < vdf.size() && (vdf[i + 1] == '\\' || vdf[i + 1] == '"'))
+				i++;
+			value += vdf[i];
+		}
+		if (closed && !value.empty())
+			paths.push_back(std::move(value));
+		vdf.remove_prefix(i);
+	}
+	return paths;
 }
 
 std::string D2SoundSink::Describe(std::string_view modName, std::string_view path) const
@@ -351,9 +420,10 @@ bool D2SoundImportJob::Impl::Begin()
 		packs = { Diablo2SoundsModName };
 	} else {
 		auto cascReader = std::make_unique<CascSoundReader>();
-		if (!CascOpenStorage(result.installPath.c_str(), 0, &cascReader->storage)) {
+		const std::string storagePath = D2rStoragePath(result.installPath);
+		if (!CascOpenStorage(storagePath.c_str(), 0, &cascReader->storage)) {
 			cascReader->storage = nullptr;
-			Log(D2SoundLogLevel::Error, "CascOpenStorage failed for ", result.installPath, ": error ", std::to_string(GetCascError()));
+			Log(D2SoundLogLevel::Error, "CascOpenStorage failed for ", storagePath, ": error ", std::to_string(GetCascError()));
 			Fail(D2SoundImportError::OpenStorageFailed);
 			return false;
 		}

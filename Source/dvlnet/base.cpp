@@ -1,4 +1,5 @@
 #include "dvlnet/base.h"
+#include "dvlnet/async_session.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -312,18 +313,20 @@ bool base::SNetReceiveTurns(char **data, size_t *size, uint32_t *status)
 			continue;
 
 		status[i] |= PS_CONNECTED;
+		if (sgGameInitInfo.reserved[0] == async::GameProtocolTag)
+			status[i] |= PS_ACTIVE;
 
 		std::deque<turn_t> &turnQueue = playerState.turnQueue;
 		while (!turnQueue.empty()) {
 			const turn_t &turn = turnQueue.front();
 			const seq_t diff = turn.SequenceNumber - current_turn;
-			if (diff <= 0x7F)
+			if (diff <= 0x7F || sgGameInitInfo.reserved[0] == async::GameProtocolTag)
 				break;
 			turnQueue.pop_front();
 		}
 	}
 
-	if (AllTurnsArrived()) {
+	if (AllTurnsArrived() || sgGameInitInfo.reserved[0] == async::GameProtocolTag) {
 		for (size_t i = 0; i < Players.size(); ++i) {
 			PlayerState &playerState = playerStateTable_[i];
 			if (!playerState.isConnected)
@@ -334,7 +337,7 @@ bool base::SNetReceiveTurns(char **data, size_t *size, uint32_t *status)
 				continue;
 
 			const turn_t &turn = turnQueue.front();
-			if (turn.SequenceNumber != current_turn)
+			if (turn.SequenceNumber != current_turn && sgGameInitInfo.reserved[0] != async::GameProtocolTag)
 				continue;
 
 			playerState.lastTurnValue = turn.Value;

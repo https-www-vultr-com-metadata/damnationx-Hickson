@@ -11,12 +11,14 @@
 
 #include "engine/load_file.hpp"
 #include "engine/random.hpp"
+#include "levels/survivors_layout.hpp"
 #include "engine/world_tile.hpp"
 #include "levels/drlg_quests.hpp"
 #include "levels/dun_tile_data.hpp"
 #include "levels/gendung.h"
 #include "levels/gendung_defs.hpp"
 #include "tables/questdat.hpp"
+#include "survivors.h"
 #include "utils/is_of.hpp"
 #include "utils/status_macros.hpp"
 
@@ -1144,6 +1146,26 @@ bool PlaceStairs(lvl_entry entry)
 
 void GenerateLevel(lvl_entry entry)
 {
+	if (IsSurvivorsMode()) {
+		// Shape the native lava walls from this level's synchronized seed.
+		InitDungeonFlags();
+		DRLG_InitTrans();
+		const auto layout = GenerateSurvivorsLayout(GetLCGEngineState());
+		for (int y = 0; y < DMAXY; ++y)
+			for (int x = 0; x < DMAXX; ++x)
+				if (layout[x][y]) DungeonMask.set(x, y);
+		MakeDmt();
+		FixTilesPatterns();
+		FloodTransparencyValues(6);
+		FixTransparency();
+		FixCornerTiles();
+		Substitution();
+		SetPiece = {};
+		SetPieceRoom = {};
+		ViewPosition = { 56, 56 };
+		memcpy(pdungeon, dungeon, sizeof(pdungeon));
+		return;
+	}
 	if (LevelSeeds[currlevel])
 		SetRndSeed(*LevelSeeds[currlevel]);
 

@@ -1,3 +1,4 @@
+#include "dvlnet/async_runtime.h"
 /**
  * @file items.cpp
  *
@@ -72,6 +73,7 @@
 #include "sound_effect_enums.h"
 #include "spells.h"
 #include "stores.h"
+#include "survivors.h"
 #include "tables/itemdat.h"
 #include "tables/monstdat.h"
 #include "tables/objdat.h"
@@ -2469,7 +2471,11 @@ void InitItems()
 		ActiveItems[i] = i;
 	}
 
-	if (!setlevel) {
+	// Cooperative Survivors checkpoints retain the actual ground items across
+	// sector loads. Re-creating seeded level loot here would duplicate that loot
+	// on a revisit, including items already picked up or sold. Enemy and object
+	// drops still use their normal runtime paths.
+	if (!setlevel && !(gbIsMultiplayer && IsSurvivorsMode())) {
 		DiscardRandomValues(1);
 		if (Quests[Q_ROCK].IsAvailable())
 			SpawnRock();
@@ -3861,6 +3867,7 @@ void GetItemStr(Item &item)
 
 void CheckIdentify(Player &player, int cii)
 {
+	if (AsyncNetTargetItem(player,SpellID::Identify,static_cast<unsigned>(cii))) return;
 	Item *pi;
 
 	if (cii >= NUM_INVLOC)
@@ -3874,6 +3881,7 @@ void CheckIdentify(Player &player, int cii)
 
 void DoRepair(Player &player, int cii)
 {
+	if (AsyncNetTargetItem(player,SpellID::ItemRepair,static_cast<unsigned>(cii))) return;
 	Item *pi;
 
 	PlaySfxLoc(SfxID::SpellRepair, player.position.tile);
@@ -3890,6 +3898,7 @@ void DoRepair(Player &player, int cii)
 
 void DoRecharge(Player &player, int cii)
 {
+	if (AsyncNetTargetItem(player,SpellID::StaffRecharge,static_cast<unsigned>(cii))) return;
 	Item *pi;
 
 	if (cii >= NUM_INVLOC) {

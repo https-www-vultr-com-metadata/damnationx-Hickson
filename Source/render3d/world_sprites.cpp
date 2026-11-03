@@ -388,8 +388,12 @@ void AddPlayers(const CameraView &camera, const Basis &basis, bool (*skipPlayer)
 		if (!InRange(feet, camera))
 			continue;
 		ClxSprite sprite = player.currentSprite();
-		const uint8_t *current = player.AnimInfo.sprites->data();
-		const int frameIndex = player.AnimInfo.getFrameToUseForRendering();
+		// A Survivors attack/cast overlay is drawn instead of the stand/walk animation.
+		const bool action = player.survivorsActionSprite().has_value();
+		const uint8_t *current = action
+		    ? player.AnimationData[static_cast<size_t>(player.survivorsActionGraphic)].spritesForDirection(player.survivorsActionDirection).data()
+		    : player.AnimInfo.sprites->data();
+		const int frameIndex = action ? player.survivorsActionAnim.getFrameToUseForRendering() : player.AnimInfo.getFrameToUseForRendering();
 		bool found = false;
 		for (size_t g = 0; g < player.AnimationData.size() && !found; ++g) {
 			const PlayerAnimationData &data = player.AnimationData[g];

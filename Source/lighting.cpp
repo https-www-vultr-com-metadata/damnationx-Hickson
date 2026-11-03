@@ -21,6 +21,7 @@
 #include "engine/render/light_render.hpp"
 #include "engine/points_in_rectangle_range.hpp"
 #include "engine/world_tile.hpp"
+#include "levels/survivors_rolling_runtime.hpp"
 #include "levels/tile_properties.hpp"
 #include "objects.h"
 #include "player.h"
@@ -121,7 +122,7 @@ bool TileAllowsLight(Point position)
 void DoVisionFlags(Point position, MapExplorationType doAutomap, bool visible)
 {
 	if (doAutomap != MAP_EXP_NONE) {
-		if (dFlags[position.x][position.y] != DungeonFlag::None)
+		if (SurvivorsRollingActive() || dFlags[position.x][position.y] != DungeonFlag::None)
 			SetAutomapView(position, doAutomap);
 		dFlags[position.x][position.y] |= DungeonFlag::Explored;
 	}

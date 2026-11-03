@@ -55,6 +55,7 @@
 #include "gmenu.h"
 #include "headless_mode.hpp"
 #include "host/host_hooks.hpp"
+#include "host/host_api.hpp"
 #include "help.h"
 #include "inv.h"
 #include "items.h"
@@ -188,6 +189,15 @@ float LastFramePitch = 0.0F;
 float LastTargetX = 0.0F;
 float LastTargetZ = 0.0F;
 VrControl Vr;
+host::HostViewControl HostView {};
+bool HostMovementWasActive = false;
+
+bool HostViewActive()
+{
+	return (HostView.flags & host::kHostViewActive) != 0 && host::DrawsWorld3D()
+	    && (*GetOptions().Graphics.cameraMode != CameraMode::Isometric || (HostView.flags & host::kHostViewXr) != 0)
+	    && gbRunGame && MyPlayer != nullptr;
+}
 
 int CurrentLevelKey()
 {
@@ -541,12 +551,17 @@ void UpdateMovement()
 		forward = leftStickY;
 		strafe = leftStickX;
 	}
+	if (HostViewActive()) {
+		forward = HostView.moveForward;
+		strafe = HostView.moveStrafe;
+	}
 	if (Vr.active) {
 		forward += Vr.moveForward;
 		strafe += Vr.moveStrafe;
 	}
 
-	const bool blocked = MyPlayerIsDead || PauseMode != 0 || (!gbIsMultiplayer && gmenu_is_active()) || IsPlayerInStore()
+	const bool blocked = (HostViewActive() && (UiWantsCursor() || AltHeld() || (HostView.flags & host::kHostViewMouseLook) == 0))
+	    || MyPlayerIsDead || PauseMode != 0 || (!gbIsMultiplayer && gmenu_is_active()) || IsPlayerInStore()
 	    || qtextflag || player._pInvincible;
 	if (blocked || std::abs(forward) + std::abs(strafe) < 0.25F) {
 		StopMoving(player);
@@ -563,7 +578,7 @@ void UpdateMovement()
 	float fwdZ;
 	float rightX;
 	float rightZ;
-	GroundAxes(Vr.active ? Vr.moveYaw : S.yaw, fwdX, fwdZ, rightX, rightZ);
+	GroundAxes(HostViewActive() ? HostView.moveYaw : Vr.active ? Vr.moveYaw : S.yaw, fwdX, fwdZ, rightX, rightZ);
 	float dirX = fwdX * forward + rightX * strafe;
 	float dirZ = fwdZ * forward + rightZ * strafe;
 	const float len = std::sqrt(dirX * dirX + dirZ * dirZ);
@@ -1031,7 +1046,8 @@ uint32_t NowMs()
 
 bool IsMouseLook()
 {
-	return S.active && S.mouseLook;
+	return (HostViewActive() && (HostView.flags & host::kHostViewMouseLook) != 0 && !UiWantsCursor() && !AltHeld())
+	    || (S.active && S.mouseLook);
 }
 
 bool SkipIsometricWorld()
@@ -1041,6 +1057,8 @@ bool SkipIsometricWorld()
 
 void OnGameEnd()
 {
+	HostView = {};
+	HostMovementWasActive = false;
 	SetRelativeMouse(false);
 	S = State {};
 	Hud = HudState {};
@@ -1070,7 +1088,22 @@ bool ShowSlashOverlay()
 
 bool OwnsMovement()
 {
-	return S.active;
+	return S.active || HostViewActive();
+}
+
+void SetHostViewControl(const host::HostViewControl &control)
+{
+	HostView = control;
+	const auto finite = [](float v) { return std::isfinite(v) ? v : 0.0F; };
+	HostView.yaw = WrapAngle(finite(control.yaw));
+	HostView.pitch = std::clamp(finite(control.pitch), -kMaxPitch, kMaxPitch);
+	HostView.moveYaw = WrapAngle(finite(control.moveYaw));
+	HostView.moveForward = std::clamp(finite(control.moveForward), -1.0F, 1.0F);
+	HostView.moveStrafe = std::clamp(finite(control.moveStrafe), -1.0F, 1.0F);
+	if (HostViewActive()) {
+		S.yaw = HostView.yaw;
+		S.pitch = HostView.pitch;
+	}
 }
 
 void SetVrControl(const VrControl &control)
@@ -1154,6 +1187,19 @@ void SetHudWantsCursorQuery(HudWantsCursorQuery query)
 
 void ProcessInput()
 {
+	if (HostViewActive()) {
+		HostMovementWasActive = true;
+		S.yaw = HostView.yaw;
+		S.pitch = HostView.pitch;
+		UpdateMovement();
+        UpdateCombatFeedback();
+		return;
+	}
+	if (HostMovementWasActive) {
+		if (MyPlayer != nullptr)
+			StopMoving(*MyPlayer);
+		HostMovementWasActive = false;
+	}
 	SyncState();
 	if (!S.active)
 		return;
@@ -1306,7 +1352,7 @@ bool HandleMouseMotion(const SDL_Event &event)
 
 bool HandleGamepadLook(float stickX, float stickY)
 {
-	if (!IsMouseLook())
+	if (!IsMouseLook() || HostViewActive())
 		return false;
 	static uint32_t lastMs = 0;
 	const uint32_t now = NowMs();
@@ -1402,15 +1448,17 @@ bool HandleWorldClick(bool shift)
 	Player &player = *MyPlayer;
 	// Click-to-move on the floor under the crosshair: always in town, and in the dungeon with the orbit camera (Shift
 	// attacks in place there). WASD takes over again as soon as a key is pressed.
-	const bool orbit = S.mode == CameraMode::ThirdPerson && *GetOptions().Graphics.thirdPersonStyle == ThirdPersonStyle::Orbit;
+	const bool orbit = HostViewActive()
+	    ? *GetOptions().Graphics.cameraMode == CameraMode::ThirdPerson && (HostView.flags & host::kHostViewOrbit) != 0
+	    : S.mode == CameraMode::ThirdPerson && *GetOptions().Graphics.thirdPersonStyle == ThirdPersonStyle::Orbit;
 	if (leveltype == DTYPE_TOWN || (orbit && !shift)) {
-		if (S.pick.hitWorld && IsAnyOf(S.pick.kind, TargetKind::None, TargetKind::Trigger) && CanPlayerTakeFpvAction()) {
+		if (((HostViewActive() && host::PickedTarget()) || (S.pick.hitWorld && IsAnyOf(S.pick.kind, TargetKind::None, TargetKind::Trigger))) && CanPlayerTakeFpvAction()) {
 			LastPlayerAction = PlayerActionType::Walk;
 			NetSendCmdLoc(MyPlayerId, true, CMD_WALKXY, cursPosition);
 		}
 		return true;
 	}
-	if (TryMeleeAssist(player))
+	if (!HostViewActive() && TryMeleeAssist(player))
 		return true;
 	LastPlayerAction = PlayerActionType::Attack;
 	if (player.UsesRangedWeapon()) {
@@ -1425,6 +1473,19 @@ bool HandleWorldClick(bool shift)
 
 void Interact()
 {
+	if (HostViewActive() && IsMouseLook() && CanPlayerTakeFpvAction()) {
+		if (pcursitem != -1 && pcurs == CURSOR_HAND)
+			NetSendCmdLocParam1(true, invflag ? CMD_GOTOGETITEM : CMD_GOTOAGETITEM, cursPosition, pcursitem);
+		else if (ObjectUnderCursor != nullptr && !ObjectUnderCursor->IsDisabled())
+			NetSendCmdLoc(MyPlayerId, true, pcurs == CURSOR_DISARM ? CMD_DISARMXY : CMD_OPOBJXY, cursPosition);
+		else if (pcursmonst != -1 && leveltype == DTYPE_TOWN)
+			NetSendCmdLocParam1(true, CMD_TALKXY, cursPosition, pcursmonst);
+		else if (pcursmonst != -1 && CanTalkToMonst(Monsters[pcursmonst]))
+			NetSendCmdParam1(true, CMD_ATTACKID, pcursmonst);
+		else if (trigflag && host::PickedTarget())
+			NetSendCmdLoc(MyPlayerId, true, CMD_WALKXY, cursPosition);
+		return;
+	}
 	if (!S.active || !CanPlayerTakeFpvAction())
 		return;
 	if (S.target.kind == TargetKind::None || !S.target.inRange)
@@ -1459,7 +1520,7 @@ void Interact()
 
 void OnBeltItemUsed()
 {
-	if (!S.active || pcurs != CURSOR_TELEPORT)
+	if ((!S.active && !HostViewActive()) || pcurs != CURSOR_TELEPORT)
 		return;
 	// Scrolls cast at once at what the crosshair (or the Alt cursor) is on: no targeting cursor in first person.
 	TryIconCurs();
@@ -1467,7 +1528,7 @@ void OnBeltItemUsed()
 
 std::optional<Direction> DropDirection()
 {
-	if (!S.active)
+	if (!S.active && !HostViewActive())
 		return std::nullopt;
 	return YawToDirection(S.yaw);
 }
@@ -1484,10 +1545,12 @@ void ClearWorldArea(const Surface &out, int viewportHeight)
 		host::QueueWorldItemLabels(out.w(), rows); // embedded World3D: the host's camera, not this one
 		return;
 	}
-	if (!IsHighlightingLabelsEnabled() || !S.cameraValid)
+	if ((!IsHighlightingLabelsEnabled() && pcursitem < 0) || !S.cameraValid)
 		return;
 	for (uint8_t i = 0; i < ActiveItemCount; ++i) {
 		const int id = ActiveItems[i];
+		if (!ShouldShowItemLabel(id))
+			continue;
 		const Item &item = Items[id];
 		if (!IsTileVisible(item.position))
 			continue;

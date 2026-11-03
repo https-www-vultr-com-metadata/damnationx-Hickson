@@ -35,7 +35,7 @@ option(USE_SDL3 "Use SDL3 instead of SDL2" OFF)
 option(DEVILUTIONX_WEBGPU "Build the shared WebGPU client" OFF)
 cmake_dependent_option(DEVILUTIONX_XR "Build VR support: OpenXR on Android (Quest) and Windows, WebXR in the browser (docs/design/vr.md)" OFF "DEVILUTIONX_WEBGPU" OFF)
 option(NONET "Disable network support" OFF)
-option(DAMNATION_S1_BRIDGE "Debug: loopback bridge on 127.0.0.1:8793 for an external decision loop (macOS/Linux)" OFF)
+option(DAMNATION_S1_BRIDGE "Debug: loopback bridge on 127.0.0.1:8793 for an external decision loop" OFF)
 # Embedding API (Source/host/host_api.hpp, docs/design/bevy-host.md): also builds the game as the static library
 # damnationx_host for a host that owns the window, loop, input, audio and world rendering. Normal targets are unchanged.
 option(DAMNATIONX_HOST_LIB "Also build the game as a static library for an embedding host (Bevy)" OFF)
@@ -464,8 +464,8 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON) # for clang-tidy
 set(CMAKE_THREAD_PREFER_PTHREAD ON)
 set(THREADS_PREFER_PTHREAD_FLAG ON)
-if(EMSCRIPTEN)
-  # The browser target is deliberately single-threaded. CMake's stock
+if(EMSCRIPTEN AND NOT DAMNATIONX_HOST_LIB)
+  # The standalone browser target is deliberately single-threaded. CMake's stock
   # FindThreads adds -pthread, which makes Emscripten enable pthread support
   # despite the browser platform profile disabling it at link time.
   include(platforms/threads-stub/FindThreads)

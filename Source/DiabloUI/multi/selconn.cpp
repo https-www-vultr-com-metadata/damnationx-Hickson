@@ -1,3 +1,4 @@
+#include "host/host_frontend.hpp"
 #include <cstddef>
 #include <memory>
 #include <optional>
@@ -166,6 +167,7 @@ void SelconnSelect(size_t value)
 
 bool UiSelectProvider(GameData *gameData)
 {
+	host::FrontendScope frontendScope(4);
 	selconn_GameData = gameData;
 #ifdef DEVILUTIONX_LOBBY
 	if (!net::lobby::DeepLinkGameId().empty()) {

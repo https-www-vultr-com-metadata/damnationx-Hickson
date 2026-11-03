@@ -1,3 +1,4 @@
+#include "dvlnet/async_runtime.h"
 #include "towners.h"
 
 #include <algorithm>
@@ -204,6 +205,7 @@ void TownDead(Towner &towner)
 
 void TownerTalk(_speech_id message)
 {
+	if (AsyncNetIsRemoteInteraction()) return;
 	CowClicks = 0;
 	CowMsg = 0;
 	InitQTextMsg(message);

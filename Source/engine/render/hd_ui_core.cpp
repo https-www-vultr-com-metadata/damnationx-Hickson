@@ -1,4 +1,5 @@
 #include "engine/render/hd_ui_core.hpp"
+#include "utils/parse_int.hpp"
 
 #include <algorithm>
 #include <charconv>
@@ -6,6 +7,28 @@
 #include <limits>
 
 namespace devilution::hd_ui {
+
+bool IndexedSheetEncodingPreservesIndices(std::string_view bytes)
+{
+	if (bytes.starts_with(std::string_view("\x89PNG\r\n\x1a\n", 8)))
+		return true;
+	if (bytes.size() < 12 || bytes.substr(0, 4) != "RIFF" || bytes.substr(8, 4) != "WEBP")
+		return false;
+	for (size_t offset = 12; offset + 8 <= bytes.size();) {
+		const auto chunk = bytes.substr(offset, 4);
+		uint32_t size = 0;
+		for (size_t i = 0; i < 4; ++i)
+			size |= static_cast<uint32_t>(static_cast<uint8_t>(bytes[offset + 4 + i])) << (8 * i);
+		if (size > bytes.size() - offset - 8)
+			return false;
+		if (chunk == "VP8L")
+			return size != 0;
+		if (chunk == "VP8 ")
+			return false;
+		offset += 8 + static_cast<size_t>(size) + (size & 1U);
+	}
+	return false;
+}
 
 namespace {
 
@@ -28,7 +51,7 @@ std::vector<std::string_view> SplitFields(std::string_view line)
 bool ParseInt(std::string_view text, int &value)
 {
 	const char *end = text.data() + text.size();
-	const auto result = std::from_chars(text.data(), end, value);
+	const auto result = ParseDecimal(text.data(), end, value);
 	return result.ec == std::errc() && result.ptr == end;
 }
 

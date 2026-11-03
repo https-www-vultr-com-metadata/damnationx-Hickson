@@ -4,6 +4,7 @@
  * Implementation of missile functionality.
  */
 #include "missiles.h"
+#include "dvlnet/async_runtime.h"
 
 #include <algorithm>
 #include <array>
@@ -40,10 +41,12 @@
 #include "items.h"
 #include "levels/gendung.h"
 #include "levels/gendung_defs.hpp"
+#include "levels/survivors_rolling_runtime.hpp"
 #include "msg.h"
 #include "multi.h"
 #include "objects.h"
 #include "player.h"
+#include "plrmsg.h"
 #include "portal.h"
 #include "sound_effect_enums.h"
 #include "tables/itemdat.h"
@@ -329,7 +332,7 @@ bool MonsterMHit(const Player &player, Monster &monster, int mindam, int maxdam,
 	if (resist)
 		dam >>= 2;
 
-	if (&player == MyPlayer)
+	if (AsyncNetOwnsPlayer(player))
 		ApplyMonsterDamage(damageType, monster, dam);
 
 	if (monster.hasNoLife()) {
@@ -436,7 +439,7 @@ bool Plr2PlrMHit(const Player &player, Player &target, int mindam, int maxdam, i
 		dam /= 2;
 	if (resper > 0) {
 		dam -= (dam * resper) / 100;
-		if (&player == MyPlayer)
+		if (AsyncNetOwnsPlayer(player))
 			NetSendCmdDamage(true, target, dam, damageType);
 		target.Say(HeroSpeech::ArghClang);
 		return true;
@@ -446,7 +449,7 @@ bool Plr2PlrMHit(const Player &player, Player &target, int mindam, int maxdam, i
 		StartPlrBlock(target, GetDirection(target.position.tile, player.position.tile));
 		*blocked = true;
 	} else {
-		if (&player == MyPlayer)
+		if (AsyncNetOwnsPlayer(player))
 			NetSendCmdDamage(true, target, dam, damageType);
 		StartPlrHit(target, dam, false);
 	}
@@ -1186,7 +1189,7 @@ bool PlayerMHit(Player &player, Monster *monster, int dist, int mind, int maxd, 
 
 	if (resper > 0) {
 		dam -= dam * resper / 100;
-		if (&player == MyPlayer) {
+		if (AsyncNetOwnsPlayer(player)) {
 			ApplyPlrDamage(damageType, player, 0, 0, dam, deathReason);
 		}
 
@@ -1196,7 +1199,7 @@ bool PlayerMHit(Player &player, Monster *monster, int dist, int mind, int maxd, 
 		return true;
 	}
 
-	if (&player == MyPlayer) {
+	if (AsyncNetOwnsPlayer(player)) {
 		ApplyPlrDamage(damageType, player, 0, 0, dam, deathReason);
 	}
 
@@ -2114,7 +2117,9 @@ void AddTownPortal(Missile &missile, AddMissileParameter &parameter)
 			other.duration = 0;
 	}
 	PutMissile(missile);
-	if (missile.sourcePlayer() == MyPlayer && !missile._miDelFlag && leveltype != DTYPE_TOWN) {
+	if (missile.sourcePlayer() != nullptr && AsyncNetEnabled() && AsyncNetIsAuthority() && !missile._miDelFlag && leveltype != DTYPE_TOWN) {
+		ActivatePortal(*missile.sourcePlayer(), missile.position.tile, setlevel ? setlvlnum : currlevel, leveltype, setlevel);
+	} else if (missile.sourcePlayer() == MyPlayer && !missile._miDelFlag && leveltype != DTYPE_TOWN) {
 		if (!setlevel) {
 			NetSendCmdLocParam3(true, CMD_ACTIVATEPORTAL, missile.position.tile, currlevel, leveltype, 0);
 		} else {
@@ -2247,9 +2252,16 @@ void InitMissileAnimationFromMonster(Missile &mis, Direction midir, const Monste
 	const AnimStruct &anim = mon.type().getAnimData(graphic);
 	mis.setDirection(midir);
 	mis._miAnimFlags = MissileGraphicsFlags::None;
-	const ClxSpriteList sprites = *anim.spritesForDirection(midir);
-	const uint16_t width = sprites[0].width();
-	mis._miAnimData.emplace(sprites);
+	uint16_t width = anim.width;
+	if (HeadlessMode) {
+		// Charge physics uses the numeric animation metadata even when no
+		// rendering sprites were loaded by InitAllMonsterGFX.
+		mis._miAnimData = std::nullopt;
+	} else {
+		const ClxSpriteList sprites = *anim.spritesForDirection(midir);
+		width = sprites[0].width();
+		mis._miAnimData.emplace(sprites);
+	}
 	mis._miAnimDelay = anim.rate;
 	mis._miAnimLen = anim.frames;
 	mis._miAnimWidth = width;
@@ -2439,7 +2451,7 @@ void AddGolem(Missile &missile, AddMissileParameter &parameter)
 	if (!spawnPosition)
 		return;
 
-	if (&player != MyPlayer)
+	if (!AsyncNetOwnsPlayer(player))
 		return;
 
 	const auto spellLevel = static_cast<uint8_t>(missile._mispllvl);
@@ -2485,6 +2497,7 @@ void AddHealing(Missile &missile, AddMissileParameter & /*parameter*/)
 void AddHealOther(Missile &missile, AddMissileParameter & /*parameter*/)
 {
 	Player &player = Players[missile._misource];
+	AsyncNetOfferTargetedSpell(player,SpellID::HealOther);
 
 	missile._miDelFlag = true;
 	if (&player == MyPlayer) {
@@ -2519,6 +2532,7 @@ void AddElemental(Missile &missile, AddMissileParameter &parameter)
 void AddIdentify(Missile &missile, AddMissileParameter & /*parameter*/)
 {
 	Player &player = Players[missile._misource];
+	AsyncNetOfferTargetedSpell(player,SpellID::Identify);
 
 	missile._miDelFlag = true;
 	if (&player == MyPlayer) {
@@ -2608,6 +2622,7 @@ void AddRage(Missile &missile, AddMissileParameter &parameter)
 void AddItemRepair(Missile &missile, AddMissileParameter & /*parameter*/)
 {
 	Player &player = Players[missile._misource];
+	AsyncNetOfferTargetedSpell(player,SpellID::ItemRepair);
 
 	missile._miDelFlag = true;
 	if (&player == MyPlayer) {
@@ -2625,6 +2640,7 @@ void AddItemRepair(Missile &missile, AddMissileParameter & /*parameter*/)
 void AddStaffRecharge(Missile &missile, AddMissileParameter & /*parameter*/)
 {
 	Player &player = Players[missile._misource];
+	AsyncNetOfferTargetedSpell(player,SpellID::StaffRecharge);
 
 	missile._miDelFlag = true;
 	if (&player == MyPlayer) {
@@ -2642,6 +2658,7 @@ void AddStaffRecharge(Missile &missile, AddMissileParameter & /*parameter*/)
 void AddTrapDisarm(Missile &missile, AddMissileParameter & /*parameter*/)
 {
 	Player &player = Players[missile._misource];
+	AsyncNetOfferTargetedSpell(player,SpellID::TrapDisarm);
 
 	missile._miDelFlag = true;
 	if (&player == MyPlayer) {
@@ -2743,6 +2760,7 @@ void AddHolyBolt(Missile &missile, AddMissileParameter &parameter)
 void AddResurrect(Missile &missile, AddMissileParameter & /*parameter*/)
 {
 	Player &player = Players[missile._misource];
+	AsyncNetOfferTargetedSpell(player,SpellID::Resurrect);
 
 	if (&player == MyPlayer) {
 		NewCursor(CURSOR_RESURRECT);
@@ -2762,6 +2780,7 @@ void AddResurrectBeam(Missile &missile, AddMissileParameter &parameter)
 void AddTelekinesis(Missile &missile, AddMissileParameter & /*parameter*/)
 {
 	Player &player = Players[missile._misource];
+	AsyncNetOfferTargetedSpell(player,SpellID::Telekinesis);
 
 	missile._miDelFlag = true;
 	if (&player == MyPlayer)
@@ -2808,6 +2827,14 @@ Missile *AddMissile(WorldTilePosition src, WorldTilePosition dst, Direction midi
     mienemy_type micaster, int id, int midam, int spllvl,
     Missile *parent, std::optional<SfxID> lSFX)
 {
+	if (!SurvivorsRollingMissileSupported(mitype)) {
+		static bool warned = false;
+		if (!warned && micaster == TARGET_MONSTERS && id == MyPlayerId) {
+			EventPlrMsg("This spell is unavailable in Survivors mode.");
+			warned = true;
+		}
+		return nullptr;
+	}
 	if (Missiles.size() >= Missiles.max_size()) {
 		return nullptr;
 	}
@@ -4252,7 +4279,7 @@ void ProcessMissiles()
 void SetUpMissileAnimationData()
 {
 	for (auto &missile : Missiles) {
-		if (missile._miAnimType == MissileGraphicID::None)
+		if (missile._miAnimType == MissileGraphicID::None && missile._mitype != MissileID::Rhino)
 			continue;
 
 		if (missile._mitype != MissileID::Rhino) {

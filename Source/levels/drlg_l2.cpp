@@ -23,6 +23,7 @@
 #include "levels/gendung_defs.hpp"
 #include "objects.h"
 #include "tables/questdat.hpp"
+#include "survivors.h"
 #include "utils/is_of.hpp"
 #include "utils/status_macros.hpp"
 
@@ -2678,6 +2679,33 @@ bool PlaceStairs(lvl_entry entry)
 
 void GenerateLevel(lvl_entry entry)
 {
+	if (IsSurvivorsMode()) {
+		// Catacombs pattern conversion expects clean rectangular room edges.
+		// Irregular boundary notation makes disconnected interior wall patches,
+		// so vary the large room's edges with the level seed instead.
+		InitDungeonFlags();
+		memset(dungeon, 12, sizeof(dungeon));
+		DRLG_InitTrans();
+		SetPiece = {};
+		SetPieceRoom = {};
+		nRoomCnt = 0;
+		HallList.clear();
+		const uint32_t seed = GetLCGEngineState();
+		MapRoom(3 + (seed & 1), 3 + ((seed >> 1) & 1), 35 + ((seed >> 2) & 1), 35 + ((seed >> 3) & 1));
+		for (int y = 0; y < DMAXY; ++y)
+			for (int x = 0; x < DMAXX; ++x)
+				DoPatternCheck(x, y);
+		FixTilesPatterns();
+		FloodTransparencyValues(3);
+		FixTransparency();
+		FixDirtTiles();
+		Substitution();
+		SetPiece = {};
+		SetPieceRoom = {};
+		ViewPosition = { 56, 56 };
+		memcpy(pdungeon, dungeon, sizeof(pdungeon));
+		return;
+	}
 	if (LevelSeeds[currlevel])
 		SetRndSeed(*LevelSeeds[currlevel]);
 

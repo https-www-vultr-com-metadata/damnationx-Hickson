@@ -342,6 +342,8 @@ void AddL2Objs(int x1, int y1, int x2, int y2);
 void AddL3Objs(int x1, int y1, int x2, int y2);
 void AddCryptObjects(int x1, int y1, int x2, int y2);
 void InitObjects();
+/** Drops every object. Town has none, but the previous level's objects stay active otherwise, pointing at freed graphics. */
+void ClearObjects();
 std::expected<void, std::string> SetMapObjects(const uint16_t *dunData, int startx, int starty);
 /**
  * @brief Spawns an object of the given type at the map coordinates provided
@@ -349,6 +351,9 @@ std::expected<void, std::string> SetMapObjects(const uint16_t *dunData, int star
  * @param objPos tile coordinates
  */
 Object *AddObject(_object_id objType, Point objPos);
+// Remove an active rolling-world object by active-list index while retaining
+// its state in the rolling world for later restoration.
+void RemoveSurvivorsRollingObject(size_t activeIndex);
 bool UpdateTrapState(Object &trap);
 void OperateTrap(Object &trap);
 void ProcessObjects();

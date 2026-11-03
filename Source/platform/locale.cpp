@@ -11,6 +11,9 @@
 #include <SDL.h>
 #endif
 #include <jni.h>
+#ifdef DAMNATIONX_HOST_LIB
+#include "host/host_hooks.hpp"
+#endif
 #elif defined(__vita__)
 #include <cstring>
 
@@ -66,6 +69,37 @@ std::vector<std::string> GetLocales()
 {
 	std::vector<std::string> locales {};
 #if defined(__ANDROID__) && !defined(TERMUX)
+#ifdef DAMNATIONX_HOST_LIB
+    // A Bevy NativeActivity has no SDLActivity/getLocale method. Use the actual JVM supplied by the host.
+    auto *vm = static_cast<JavaVM *>(host::AndroidJavaVm);
+    JNIEnv *env = nullptr;
+    bool attached = false;
+    if (vm != nullptr && vm->GetEnv(reinterpret_cast<void **>(&env), JNI_VERSION_1_6) == JNI_EDETACHED) {
+        attached = vm->AttachCurrentThread(&env, nullptr) == JNI_OK;
+    }
+    if (env != nullptr) {
+        jclass localeClass = env->FindClass("java/util/Locale");
+        if (localeClass != nullptr) {
+            jmethodID getDefault = env->GetStaticMethodID(localeClass, "getDefault", "()Ljava/util/Locale;");
+            jmethodID toString = env->GetMethodID(localeClass, "toString", "()Ljava/lang/String;");
+            jobject locale = getDefault != nullptr ? env->CallStaticObjectMethod(localeClass, getDefault) : nullptr;
+            jstring text = locale != nullptr && toString != nullptr ? static_cast<jstring>(env->CallObjectMethod(locale, toString)) : nullptr;
+            if (text != nullptr && !env->ExceptionCheck()) {
+                const char *value = env->GetStringUTFChars(text, nullptr);
+                if (value != nullptr) {
+                    locales.emplace_back(value);
+                    env->ReleaseStringUTFChars(text, value);
+                }
+            }
+            if (text != nullptr) env->DeleteLocalRef(text);
+            if (locale != nullptr) env->DeleteLocalRef(locale);
+            env->DeleteLocalRef(localeClass);
+        }
+        if (env->ExceptionCheck()) env->ExceptionClear();
+    }
+    if (attached) vm->DetachCurrentThread();
+    if (locales.empty()) locales.emplace_back("en_US");
+#else
 #ifdef USE_SDL3
 	JNIEnv *env = (JNIEnv *)SDL_GetAndroidJNIEnv();
 	jobject activity = (jobject)SDL_GetAndroidActivity();
@@ -82,6 +116,7 @@ std::vector<std::string> GetLocales()
 	env->DeleteLocalRef(jLocale);
 	env->DeleteLocalRef(activity);
 	env->DeleteLocalRef(clazz);
+#endif // DAMNATIONX_HOST_LIB
 #elif defined(__vita__)
 	int32_t language = SCE_SYSTEM_PARAM_LANG_ENGLISH_US; // default to english
 	const char *vita_locales[] = {

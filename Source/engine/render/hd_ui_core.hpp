@@ -349,4 +349,7 @@ std::vector<uint8_t> BuildTrnLut(std::span<const uint8_t, 256> trn, std::span<co
 /** Texture divisor for UI sheets shown at `canvasPixelsPerUiPixel` (4x art): 1, 2 or 4. */
 int SelectUiTextureDivisor(float canvasPixelsPerUiPixel);
 
+/** Indexed sheets contain palette data, so lossy WebP/JPEG cannot be used as font replacements. */
+bool IndexedSheetEncodingPreservesIndices(std::string_view bytes);
+
 } // namespace devilution::hd_ui

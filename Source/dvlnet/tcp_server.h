@@ -46,6 +46,11 @@ private:
 		asio::ip::tcp::socket socket;
 		asio::steady_timer timer;
 		int timeout;
+		// Set once the connection is dropped or replaced. Asio handlers that were
+		// already queued (a timer tick that expired before cancel(), a receive
+		// completing with operation_aborted) must not act on a stale connection:
+		// its player slot may already belong to a new peer.
+		bool closed = false;
 		client_connection(asio::io_context &ioc)
 		    : socket(ioc)
 		    , timer(ioc)
