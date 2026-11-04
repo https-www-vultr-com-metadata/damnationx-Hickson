@@ -15,6 +15,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <format>
 #include <string_view>
@@ -631,7 +632,10 @@ std::string FormatGameSeed(const uint32_t gameSeed[4])
 
 void InitGameInfo()
 {
-	const xoshiro128plusplus gameGenerator = ReserveSeedSequence();
+	xoshiro128plusplus gameGenerator = ReserveSeedSequence();
+	// Test hook for unattended A/B runs: DAMNATIONX_HOST_GAME_SEED=N gives every new game the same dungeon seeds.
+	if (const char *fixedSeed = std::getenv("DAMNATIONX_HOST_GAME_SEED"); fixedSeed != nullptr && fixedSeed[0] != '\0')
+		gameGenerator = xoshiro128plusplus(static_cast<uint32_t>(std::strtoul(fixedSeed, nullptr, 10)));
 	gameGenerator.save(sgGameInitInfo.gameSeed);
 
 	sgGameInitInfo.size = sizeof(sgGameInitInfo);

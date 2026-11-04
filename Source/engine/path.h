@@ -40,6 +40,18 @@ extern const int PathDiagonalStepCost;
  */
 int FindPath(tl::function_ref<bool(Point, Point)> canStep, tl::function_ref<bool(Point)> posOk, Point startPosition, Point destinationPosition, int8_t *path, size_t maxPathLength, Point *reachableDestination = nullptr);
 
+/**
+ * @brief Resolve a clicked tile into the tile a walker should head for.
+ *
+ * A reachable tile is its own goal. A click on scenery the walker cannot enter (a wall, a roof, the Cathedral) or on
+ * ground it cannot reach is approached from the walker's side: the goal is the first tile on the straight line from the
+ * clicked tile back toward the walker that the walker can reach. Only when that line finds nothing does the closest
+ * reachable tile of the search win (see FindPath's `reachableDestination`), which may lie around the far side.
+ *
+ * @return The goal; `startPosition` when nothing better is reachable.
+ */
+Point FindWalkGoal(tl::function_ref<bool(Point, Point)> canStep, tl::function_ref<bool(Point)> posOk, Point startPosition, Point destinationPosition, int8_t *path, size_t maxPathLength);
+
 /** For iterating over the 8 possible movement directions */
 const Displacement PathDirs[8] = {
 	// clang-format off

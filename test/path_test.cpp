@@ -188,6 +188,42 @@ TEST(PathTest, ApproachBlockedAndDisconnectedTargets)
 	EXPECT_EQ(reached, (Point { 2, 3 }));
 }
 
+TEST(PathTest, WalkGoalApproachesClickedBuildingsFromTheWalkersSide)
+{
+	const auto canStep = [](Point, Point) { return true; };
+	// A building covers x=5..12, y=3..8 of an open 21x21 field; one walled-in courtyard tile sits inside it.
+	const Point courtyard { 7, 6 };
+	const auto inside = [](Point tile) { return tile.x >= 5 && tile.x <= 12 && tile.y >= 3 && tile.y <= 8; };
+	const auto posOk = [&](Point tile) {
+		return tile.x >= 0 && tile.x <= 20 && tile.y >= 0 && tile.y <= 20 && (!inside(tile) || tile == courtyard);
+	};
+	int8_t path[MaxPathLengthPlayer];
+	const Point hero { 14, 16 };
+	// A click near the far corner of the facade: the closest reachable tile by distance is around the far side,
+	// which sent the hero walking off around the building.
+	const Point facade { 6, 4 };
+	Point closest;
+	FindPath(canStep, posOk, hero, facade, path, MaxPathLengthPlayer, &closest);
+	EXPECT_TRUE(closest.x < 5 || closest.y < 3) << "fixture: the old goal lies beyond the building";
+	// The goal is the first reachable tile back toward the hero (the courtyard on that line is walkable but sealed).
+	const Point goal = FindWalkGoal(canStep, posOk, hero, facade, path, MaxPathLengthPlayer);
+	EXPECT_EQ(goal, (Point { 9, 9 }));
+	EXPECT_GT(FindPath(canStep, posOk, hero, goal, path, MaxPathLengthPlayer), 0);
+	// Reachable ground is its own goal.
+	EXPECT_EQ(FindWalkGoal(canStep, posOk, hero, Point { 2, 2 }, path, MaxPathLengthPlayer), (Point { 2, 2 }));
+	EXPECT_EQ(FindWalkGoal(canStep, posOk, hero, hero, path, MaxPathLengthPlayer), hero);
+	// Standing against the wall, a click deeper into the building keeps the hero in place instead of sending her round.
+	const Point againstWall { 5, 9 };
+	EXPECT_EQ(FindWalkGoal(canStep, posOk, againstWall, Point { 10, 5 }, path, MaxPathLengthPlayer), againstWall);
+	// A click on the facade wall itself walks along the front to the tile right in front of it.
+	EXPECT_EQ(FindWalkGoal(canStep, posOk, againstWall, Point { 10, 8 }, path, MaxPathLengthPlayer), (Point { 10, 9 }));
+	EXPECT_EQ(FindWalkGoal(canStep, posOk, hero, Point { 12, 8 }, path, MaxPathLengthPlayer), (Point { 12, 9 }));
+	// From the other side the same click is approached from that side.
+	const Point west { 1, 4 };
+	const Point fromWest = FindWalkGoal(canStep, posOk, west, Point { 9, 4 }, path, MaxPathLengthPlayer);
+	EXPECT_EQ(fromWest, (Point { 4, 4 }));
+}
+
 TEST(PathTest, ApproachHonorsStepConstraintsAndLengthLimit)
 {
 	int8_t path[8];

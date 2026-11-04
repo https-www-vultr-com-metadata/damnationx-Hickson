@@ -145,6 +145,47 @@ fn steam_cache_key(config: &[u8]) -> String {
         .map_or_else(|| format!("steam-{:016x}", fnv64(config)), str::to_owned)
 }
 
+/// Windows `canonicalize` returns verbatim `\\?\` paths, which Win32 does not
+/// normalize. CascLib joins `game\` + `\.build.info` and d2rtool joins names with
+/// `/`, so a verbatim storage path fails to open (CascLib error 2). This returns
+/// the plain spelling when it names the same file.
+fn plain_windows_path(path: &str) -> Option<String> {
+    let rest = path.strip_prefix(r"\\?\")?;
+    let plain = if let Some(unc) = rest.strip_prefix(r"UNC\") {
+        format!(r"\\{unc}")
+    } else {
+        let bytes = rest.as_bytes();
+        if bytes.len() < 3 || !bytes[0].is_ascii_alphabetic() || &bytes[1..3] != b":\\" {
+            return None;
+        }
+        rest.to_owned()
+    };
+    // Keep the verbatim form where the plain path would mean something else.
+    let reserved = |part: &str| {
+        let stem = part.split('.').next().unwrap_or("").trim_end();
+        let stem = stem.to_ascii_uppercase();
+        matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+            || ((stem.starts_with("COM") || stem.starts_with("LPT"))
+                && stem.len() == 4
+                && stem.as_bytes()[3].is_ascii_digit())
+    };
+    let parts_ok = rest
+        .split('\\')
+        .skip(1)
+        .filter(|part| !part.is_empty())
+        .all(|part| !part.ends_with(['.', ' ']) && !part.contains('/') && !reserved(part));
+    (plain.len() < 260 && parts_ok).then_some(plain)
+}
+
+fn plain_path(path: PathBuf) -> PathBuf {
+    if cfg!(windows) {
+        if let Some(plain) = path.to_str().and_then(plain_windows_path) {
+            return PathBuf::from(plain);
+        }
+    }
+    path
+}
+
 fn helper_error(output: &std::process::Output) -> String {
     format!(
         "d2rtool exited with {}: {}",
@@ -163,20 +204,22 @@ impl NativeStorage {
         cache: impl AsRef<Path>,
         tool: impl AsRef<Path>,
     ) -> Result<Self, String> {
-        let game = game
-            .as_ref()
-            .canonicalize()
-            .map_err(|e| format!("Invalid D2R folder: {e}"))?;
+        let game = plain_path(
+            game.as_ref()
+                .canonicalize()
+                .map_err(|e| format!("Invalid D2R folder: {e}"))?,
+        );
         let install = Install::detect(&game).ok_or(
             "Choose your Diablo II: Resurrected install folder. A Battle.net install has \
              .build.info and Data; a Steam install has Data/.build.config.",
         )?;
-        let tool = tool
-            .as_ref()
-            .canonicalize()
-            .map_err(|e| format!("D2R archive helper unavailable: {e}"))?;
+        let tool = plain_path(
+            tool.as_ref()
+                .canonicalize()
+                .map_err(|e| format!("D2R archive helper unavailable: {e}"))?,
+        );
         fs::create_dir_all(cache.as_ref()).map_err(|e| e.to_string())?;
-        let cache = cache.as_ref().canonicalize().map_err(|e| e.to_string())?;
+        let cache = plain_path(cache.as_ref().canonicalize().map_err(|e| e.to_string())?);
         if cache.starts_with(&game) {
             return Err("The conversion cache must be outside the D2R installation".into());
         }
@@ -467,6 +510,29 @@ mod tests {
             .unwrap()
             .join(format!("listfile-{key}.tsv"))
             .is_file());
+    }
+
+    #[test]
+    fn verbatim_windows_paths_become_plain_only_when_equivalent() {
+        assert_eq!(
+            plain_windows_path(r"\\?\E:\_stuff\diablo 1 (trygentic) (PC)\Diablo II Resurrected")
+                .as_deref(),
+            Some(r"E:\_stuff\diablo 1 (trygentic) (PC)\Diablo II Resurrected")
+        );
+        assert_eq!(
+            plain_windows_path(r"\\?\UNC\nas\games\D2R").as_deref(),
+            Some(r"\\nas\games\D2R")
+        );
+        for kept in [
+            r"C:\Games\D2R".to_string(),
+            r"\\?\Volume{1234}\D2R".to_string(),
+            r"\\?\C:\Games\con\D2R".to_string(),
+            r"\\?\C:\Games\COM1.txt".to_string(),
+            r"\\?\C:\Games\trailing.\D2R".to_string(),
+            format!(r"\\?\C:\{}", "a".repeat(300)),
+        ] {
+            assert_eq!(plain_windows_path(&kept), None, "{kept}");
+        }
     }
 
     #[test]

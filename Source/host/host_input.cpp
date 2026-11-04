@@ -539,8 +539,14 @@ Point WalkTarget(Point tile)
 	    && (HeldWalk.tile == start || FindPath(CanStep, posOk, start, HeldWalk.tile, path, MaxPathLengthPlayer - 1) > 0))
 		return HeldWalk.tile;
 	HeldWalk = {};
-	Point reachable = start;
-	FindPath(CanStep, posOk, start, tile, path, MaxPathLengthPlayer - 1, &reachable);
+	// A click on a building or other blocked scenery approaches it from the hero's side (see FindWalkGoal).
+	const Point reachable = FindWalkGoal(CanStep, posOk, start, tile, path, MaxPathLengthPlayer - 1);
+	static const bool Trace = [] {
+		const char *value = std::getenv("DAMNATIONX_TRACE_INPUT");
+		return value != nullptr && value[0] == '1';
+	}();
+	if (Trace && reachable != tile)
+		LogInfo("HostSubmitInput: walk to {},{} from {},{}: approach {},{}", tile.x, tile.y, start.x, start.y, reachable.x, reachable.y);
 	if (held && reachable != tile && !posOk(tile))
 		HeldWalk = { true, level, reachable };
 	return reachable;

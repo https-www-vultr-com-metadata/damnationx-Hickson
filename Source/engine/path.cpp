@@ -10,6 +10,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <optional>
 #include <utility>
 
@@ -298,6 +299,65 @@ int FindPath(tl::function_ref<bool(Point, Point)> canStep, tl::function_ref<bool
 		return length;
 	}
 	return 0; // no path
+}
+
+Point FindWalkGoal(tl::function_ref<bool(Point, Point)> canStep, tl::function_ref<bool(Point)> posOk, Point startPosition, Point destinationPosition, int8_t *path, size_t maxPathLength)
+{
+	Point closest = startPosition;
+	FindPath(canStep, posOk, startPosition, destinationPosition, path, maxPathLength, &closest);
+	if (closest == destinationPosition)
+		return closest;
+	// The closest reachable tile by straight-line distance happily lies around the far side of a building: a click on
+	// the Cathedral's facade or door used to send the hero around its corner. Approach from the walker's side instead.
+	const auto cost = [](Point a, Point b) { return GetHeuristicCost(PointT { a }, PointT { b }); };
+	// Each walkable candidate costs a search; a line through several disconnected pockets gives up early.
+	constexpr int MaxSearches = 8;
+	int searches = 0;
+	const auto reachable = [&](Point candidate) {
+		if (candidate == closest || candidate == startPosition)
+			return true;
+		++searches;
+		Point reached = startPosition;
+		FindPath(canStep, posOk, startPosition, candidate, path, maxPathLength, &reached);
+		return reached == candidate;
+	};
+	// A clicked wall tile: the open tile in front of it, on the walker's side (axis-aligned neighbours first).
+	const int towardWalker = cost(destinationPosition, startPosition);
+	std::array<Point, 8> neighbours;
+	size_t neighbourCount = 0;
+	for (const Displacement d : PathDirs) {
+		const Point neighbour = destinationPosition + d;
+		if (posOk(neighbour) && cost(neighbour, startPosition) < towardWalker)
+			neighbours[neighbourCount++] = neighbour;
+	}
+	std::sort(neighbours.begin(), neighbours.begin() + neighbourCount, [&](Point a, Point b) {
+		const int ca = cost(a, destinationPosition);
+		const int cb = cost(b, destinationPosition);
+		return ca != cb ? ca < cb : cost(a, startPosition) < cost(b, startPosition);
+	});
+	for (size_t i = 0; i < neighbourCount && searches < MaxSearches; ++i) {
+		if (reachable(neighbours[i]))
+			return neighbours[i];
+	}
+	// Deeper inside (the ground behind a facade, a roof, a doorway): walk the line back toward the walker and stop at
+	// the first tile it can reach, the near side of whatever was clicked.
+	const int dx = startPosition.x - destinationPosition.x;
+	const int dy = startPosition.y - destinationPosition.y;
+	const int steps = std::max(std::abs(dx), std::abs(dy));
+	for (int i = 1; i < steps && searches < MaxSearches; ++i) {
+		// Round to the nearest tile, symmetric for negative offsets.
+		const auto along = [&](int delta) {
+			const int scaled = 2 * delta * i;
+			return (scaled >= 0 ? scaled + steps : scaled - steps) / (2 * steps);
+		};
+		const Point candidate = destinationPosition + Displacement { along(dx), along(dy) };
+		if (posOk(candidate) && reachable(candidate))
+			return candidate;
+	}
+	// A line with no open tile ends at the walker itself: stay put rather than walk around the obstacle.
+	if (searches == 0 && steps > 0)
+		return startPosition;
+	return closest;
 }
 
 std::optional<Point> FindClosestValidPosition(tl::function_ref<bool(Point)> posOk, Point startingPosition, unsigned int minimumRadius, unsigned int maximumRadius)

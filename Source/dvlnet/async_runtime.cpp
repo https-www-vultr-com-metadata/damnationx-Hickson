@@ -1173,9 +1173,39 @@ bool IsIntent(_cmd_id cmd)
 	case CMD_TALKXY:
 	case CMD_NEWLVL:
 	case CMD_WARP:
+	case CMD_RETOWN:
 		return true;
 	default: return false;
 	}
+}
+
+bool IsDeadForRestart(const Player &player)
+{
+	// hasNoLife() is always false in town, so test the life and mode directly.
+	return player._pmode == PM_DEATH || (player._pHitPoints >> 6) <= 0;
+}
+
+// Peers share the host's level (see the CMD_NEWLVL rule in AsyncNetBeforeTick),
+// so a dead peer cannot restart in town by itself. It comes back beside the
+// host with the life and mana that Restart in Town gives. Items dropped at
+// the corpse stay on the ground for it to collect.
+void RespawnPeerBesideAuthority(Player &player)
+{
+	RemoveEnemyReferences(player);
+	RemovePlrMissiles(player);
+	FixPlrWalkTags(player);
+	ClrPlrPath(player);
+	player.destAction = ACTION_NONE;
+	player._pLvlChanging = false;
+	SetPlayerHitPoints(player, 64);
+	player._pMana = 0;
+	player._pManaBase = player._pMana - (player._pMaxMana - player._pMaxManaBase);
+	CalcPlrInv(player, false);
+	TargetSpells[player.getId()].ready = false;
+	player.position.tile = MyPlayer->position.tile;
+	player.position.future = player.position.tile;
+	InitPlayer(player, false);
+	SyncInitPlrPos(player);
 }
 } // namespace
 
@@ -1525,6 +1555,18 @@ void AsyncNetBeforeTick()
 			// Until independent per-level authority is supported, the party travels
 			// with the host. A peer cannot switch its collision world independently.
 			if (peer != 0 && (type == CMD_NEWLVL || type == CMD_WARP)) return;
+			// Esc or the Menu button on the death screen. The host restarts in
+			// town through the normal handler and the party follows it there; a
+			// peer respawns beside the host instead.
+			if (type == CMD_RETOWN) {
+				if (payload.size() != sizeof(TCmd) || !IsDeadForRestart(player)) return;
+				if (peer != 0) {
+					ApplyingCommand = true;
+					RespawnPeerBesideAuthority(player);
+					ApplyingCommand = false;
+					return;
+				}
+			}
 			RewindTicks[peer] = std::min({ net::async::MaxRewindTicks, static_cast<unsigned>(sgGameInitInfo.nTickRate) / 5U, Session.Tick() - rewind });
 			ApplyingCommand = true;
 			if (peer != MyPlayerId) {

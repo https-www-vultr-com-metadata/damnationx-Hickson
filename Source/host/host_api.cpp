@@ -233,6 +233,7 @@ HostTickResult HostTick(uint32_t elapsedMs)
 	// Test hooks for unattended runs (screenshots of later levels with a new hero):
 	// DAMNATIONX_HOST_START_LEVEL=N: once in town, go straight down to dungeon level N.
 	// DAMNATIONX_HOST_GOD=1: the local hero's life is refilled every tick.
+	// DAMNATIONX_HOST_LEVEL_SEED=N (with START_LEVEL): the same dungeon layouts every run.
 	static const int StartLevel = [] {
 		const char *value = std::getenv("DAMNATIONX_HOST_START_LEVEL");
 		return value != nullptr ? std::clamp(std::atoi(value), 0, 16) : 0;
@@ -241,10 +242,18 @@ HostTickResult HostTick(uint32_t elapsedMs)
 		const char *value = std::getenv("DAMNATIONX_HOST_GOD");
 		return value != nullptr && value[0] == '1';
 	}();
+	static const char *LevelSeed = std::getenv("DAMNATIONX_HOST_LEVEL_SEED");
 	static bool startLevelDone = false;
 	if (result.inGame != 0 && MyPlayer != nullptr && !gbIsMultiplayer) {
 		if (StartLevel > 0 && !startLevelDone && TotalTicksRun() > 30 && leveltype == DTYPE_TOWN) {
 			startLevelDone = true;
+			if (LevelSeed != nullptr) {
+				const uint32_t seed = static_cast<uint32_t>(std::strtoul(LevelSeed, nullptr, 10));
+				for (int i = 1; i < NUMLEVELS; ++i) {
+					DungeonSeeds[i] = seed * 2654435761U + static_cast<uint32_t>(i) * 40503U;
+					LevelSeeds[i] = std::nullopt;
+				}
+			}
 			LogInfo("DAMNATIONX_HOST_START_LEVEL: going to level {}", StartLevel);
 			StartNewLvl(*MyPlayer, WM_DIABNEXTLVL, StartLevel);
 		}
@@ -388,6 +397,11 @@ uint32_t HostApiVersionInUse()
 void HostSetExternalDoorModels(uint32_t mask)
 {
 	render3d::SetExternalDoorModels(mask);
+}
+
+void HostSetExternalDoorAperture(uint32_t family, uint32_t widthMilli, uint32_t heightMilli)
+{
+	render3d::SetExternalDoorAperture(family, static_cast<float>(widthMilli) / 1000.0F, static_cast<float>(heightMilli) / 1000.0F);
 }
 
 void HostSetRenderMode(HostRenderMode mode)

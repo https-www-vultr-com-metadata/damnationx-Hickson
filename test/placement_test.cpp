@@ -3,6 +3,7 @@
 
 #include <gtest/gtest.h>
 
+#include "render3d/fpv_contract.hpp"
 #include "render3d/placement.hpp"
 
 namespace devilution::render3d {
@@ -334,11 +335,15 @@ scale = 1.26,1,1.5
 	};
 	// Actual stock model intrados: x +/-0.2356 at its jamb, y0.8721 at apex.
 	const auto upgraded = opening();
-	EXPECT_GE(skm::TransformPoint(upgraded, { 0, 0.8721F, 0 }).y, 3.2F);
+	EXPECT_GE(skm::TransformPoint(upgraded, { 0, 0.8721F, 0 }).y, fpv::kDungeonOpeningHeight);
+	EXPECT_LE(skm::TransformPoint(upgraded, { 0, 1, 0 }).y, fpv::kWallHeight + 0.05F);
 	EXPECT_GE(skm::TransformPoint(upgraded, { 0.2356F, 0, 0 }).x - skm::TransformPoint(upgraded, { -0.2356F, 0, 0 }).x, 1.6F);
 	// A newly generated pack already has the dimensions; never scale it twice.
+	file.rules[0].scale = { 3.4F, 2.61F, 1.5F };
+	EXPECT_NEAR(skm::TransformPoint(opening(), { 0, 1, 0 }).y, 2.61F, 0.0001F);
+	// A pack generated for the earlier 3.65-tile walls comes down to the current wall.
 	file.rules[0].scale = { 3.4F, 3.67F, 1.5F };
-	EXPECT_NEAR(skm::TransformPoint(opening(), { 0, 1, 0 }).y, 3.67F, 0.0001F);
+	EXPECT_NEAR(skm::TransformPoint(opening(), { 0, 1, 0 }).y, 3.67F * fpv::kWallHeight / 3.65F, 0.0001F);
 	// Reusing the label for different art does not opt into this migration.
 	file.meshes[0].sha256 = std::string(64, 'a');
 	file.rules[0].scale = { 1.26F, 1.0F, 1.5F };

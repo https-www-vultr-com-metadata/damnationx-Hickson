@@ -711,11 +711,13 @@ pub fn convert_material(
                 p[2] = ((z * 0.5 + 0.5) * 255.).round() as u8;
                 p[3] = 255;
             }
-        } else {
+        } else if usage == "albedo" {
             for p in image.rgba.chunks_exact_mut(4) {
                 p[3] = 255;
             }
         }
+        // ORM alpha is D2R's terrain height (white = raised; it matches the normal map's slopes) and stays in the
+        // map for height-aware shading. Wall ORMs carry a constant 255 there.
         let png = encode_resized(&image, max)?;
         let target = format!("env/terrain/{stem}_{}.png", suffix.to_lowercase());
         hashes.insert(usage.into(), json!(format!("{:x}", Sha256::digest(&png))));
@@ -740,7 +742,7 @@ pub fn convert_material(
     );
     entry.insert("source".into(), json!(albedo));
     entry.insert("normal_convention".into(), json!("d2r_directx"));
-    entry.insert("channels".into(),json!({"albedo":"srgb","normal":"linear","orm":"linear: R=AO G=roughness B=metallic","height":"linear"}));
+    entry.insert("channels".into(),json!({"albedo":"srgb","normal":"linear","orm":"linear: R=AO G=roughness B=metallic A=height (white raised)","height":"linear"}));
     entry.insert("coverage".into(), json!("separate_material_weight"));
     entry.insert("emission".into(), json!("none"));
     entry.insert(

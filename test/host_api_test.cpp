@@ -371,6 +371,7 @@ void CheckDoorArchitectureAndSnapshotState()
 			Objects[index] = original;
 			ActiveObjectCount = count;
 			HostSetExternalDoorModels(0);
+			HostSetExternalDoorAperture(0, 0, 0);
 			render3d::InvalidateLevel();
 		}
 	} restore { index, count, original };
@@ -414,13 +415,32 @@ void CheckDoorArchitectureAndSnapshotState()
 	}
 	EXPECT_EQ(panelVertices, 16);
 	EXPECT_NEAR(highZ - lowZ, 1.6F, 0.0001F);
-	EXPECT_NEAR(top, 3.2F, 0.0001F);
+	EXPECT_NEAR(top, 2.2F, 0.0001F);
 	HostSetExternalDoorModels(1);
 	const HostFrame &external = HostSnapshot();
 	EXPECT_EQ(external.level.vertexCount + 16, nativeVertices);
 	EXPECT_EQ(external.level.indexCount + 24, nativeIndices);
 	EXPECT_TRUE(PosOkPlayer(*MyPlayer, MyPlayer->position.tile));
+	// A host-sized leaf (here 1.2 x 2.0 tiles) cuts the doorway to its own size: the lintel comes down to the
+	// leaf and the jambs close in, while collision stays native.
+	const auto lintelCorner = [&](const HostFrame &frame, float height, float padding) {
+		for (uint32_t i = 0; i < frame.level.vertexCount; ++i) {
+			const HostWorldVertex &v = frame.level.vertices[i];
+			if (std::abs(v.py - height) < 0.0001F && std::abs(v.pz - (door.position.y - padding)) < 0.0001F
+			    && v.px >= door.position.x - 0.0001F && v.px <= door.position.x + 1.0001F)
+				return true;
+		}
+		return false;
+	};
+	EXPECT_TRUE(lintelCorner(external, 2.2F, 0.3F));
+	HostSetExternalDoorAperture(0, 1200, 2000);
+	const HostFrame &fitted = HostSnapshot();
+	EXPECT_TRUE(lintelCorner(fitted, 2.0F, 0.1F));
+	EXPECT_FALSE(lintelCorner(fitted, 2.2F, 0.3F));
+	EXPECT_TRUE(PosOkPlayer(*MyPlayer, MyPlayer->position.tile));
 	HostSetExternalDoorModels(0);
+	EXPECT_TRUE(lintelCorner(HostSnapshot(), 2.2F, 0.3F)) << "a sized aperture applies only while the external leaf is drawn";
+	HostSetExternalDoorAperture(0, 0, 0);
 	EXPECT_EQ(HostSnapshot().level.vertexCount, nativeVertices) << "disabling external models restores the fallback door";
 }
 
@@ -1090,9 +1110,8 @@ TEST(HostApi, HundredTicksInTheCathedral)
 				const Point candidate { x, y };
 				if (posOk(candidate))
 					continue;
-				Point reached;
-				if (FindPath(CanStep, posOk, initial, candidate, path, MaxPathLengthPlayer - 1, &reached) > 0
-				    && reached.WalkingDistance(Point { 25, 29 }) < 12) {
+				const Point reached = FindWalkGoal(CanStep, posOk, initial, candidate, path, MaxPathLengthPlayer - 1);
+				if (reached != initial && reached.WalkingDistance(Point { 25, 29 }) < 12) {
 					roof = candidate;
 					approach = reached;
 					break;
@@ -1103,8 +1122,10 @@ TEST(HostApi, HundredTicksInTheCathedral)
 		Point alternate = roof;
 		for (const Displacement offset : { Displacement { 1, 0 }, Displacement { 0, 1 }, Displacement { -1, 0 }, Displacement { 0, -1 }, Displacement { 4, 0 }, Displacement { 0, 4 }, Displacement { 8, 0 }, Displacement { 0, 8 }, Displacement { 12, 0 }, Displacement { 0, 12 } }) {
 			const Point candidate = roof + offset;
-			Point reached;
-			if (!posOk(candidate) && FindPath(CanStep, posOk, initial, candidate, path, MaxPathLengthPlayer - 1, &reached) > 0 && reached != approach) {
+			if (posOk(candidate))
+				continue;
+			const Point reached = FindWalkGoal(CanStep, posOk, initial, candidate, path, MaxPathLengthPlayer - 1);
+			if (reached != initial && reached != approach) {
 				alternate = candidate;
 				break;
 			}
@@ -1152,6 +1173,31 @@ TEST(HostApi, HundredTicksInTheCathedral)
 		release.buttonsReleased = static_cast<uint32_t>(HostButton::Primary);
 		HostSubmitInput(release);
 		HostTick(50);
+	}
+
+	// Clicks on the Cathedral itself, from the clearing in front of it, as a World3D player sees it: the ground tiles under
+	// the pointer lie inside or behind the building. The goal must be on the near side, the doorway leading to the stairs,
+	// not around a corner where the closest reachable tile by distance happens to be.
+	{
+		const auto posOk = [](Point p) { return PosOkPlayer(*MyPlayer, p); };
+		int8_t path[MaxPathLengthPlayer];
+		const Point clearing { 30, 38 };
+		const Point stairs { 25, 29 };
+		ASSERT_TRUE(posOk(clearing));
+		// Ground tiles under the left tower, the portal arch, the nave roof, the right tower, the side wall and the door.
+		for (const Point clicked : { Point { 19, 25 }, Point { 20, 22 }, Point { 22, 16 }, Point { 25, 24 }, Point { 28, 22 }, Point { 23, 25 } }) {
+			Point closest;
+			FindPath(CanStep, posOk, clearing, clicked, path, MaxPathLengthPlayer - 1, &closest);
+			const Point goal = FindWalkGoal(CanStep, posOk, clearing, clicked, path, MaxPathLengthPlayer - 1);
+			std::cout << "[  NOTE    ] Cathedral click " << clicked.x << ',' << clicked.y << ": goal " << goal.x << ',' << goal.y
+			          << " (closest reachable " << closest.x << ',' << closest.y << ")\n";
+			ASSERT_TRUE(posOk(goal) || goal == stairs);
+			EXPECT_GT(FindPath(CanStep, posOk, clearing, goal, path, MaxPathLengthPlayer - 1), 0);
+			EXPECT_LE(goal.WalkingDistance(stairs), 5) << "a click on the Cathedral front must stay at its front";
+			EXPECT_LE(goal.WalkingDistance(clearing), closest.WalkingDistance(clearing)) << "never farther round than the old goal";
+		}
+		const Point door = FindWalkGoal(CanStep, posOk, clearing, Point { 23, 25 }, path, MaxPathLengthPlayer - 1);
+		EXPECT_LE(door.WalkingDistance(stairs), 1) << "the doorway click heads for the stairs";
 	}
 
 	// Into the Cathedral, as taking the stairs does.

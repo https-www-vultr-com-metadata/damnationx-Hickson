@@ -372,6 +372,9 @@ void HostSetRenderMode(HostRenderMode mode);
 /** Loaded external door model mask (L1/L2/L3/L5 left/right); render panels only.
  * Clear when models are disabled, unavailable, or the host leaves World3D. */
 void HostSetExternalDoorModels(uint32_t mask);
+/** Masonry aperture, in thousandths of a tile, that a loaded external door leaf of `family` (0 L1, 1 L2, 2 L3,
+ * 3 L5) fills while its mask bit is set. Zero restores the shared aperture; render panels only. */
+void HostSetExternalDoorAperture(uint32_t family, uint32_t widthMilli, uint32_t heightMilli);
 HostRenderMode HostGetRenderMode();
 /** Called (on the game thread, inside HostTick) when the player changes the mode in the settings menu; nullptr removes. */
 using HostRenderModeCallback = void (*)(HostRenderMode mode, void *user);

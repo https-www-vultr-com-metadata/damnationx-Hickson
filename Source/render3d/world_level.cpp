@@ -41,6 +41,7 @@
 #include "levels/trigs.h"
 #include "render3d/placement_runtime.hpp"
 #include "objects.h"
+#include "towners.h"
 #include "render3d/fpv_contract.hpp"
 #include "utils/log.hpp"
 #include "utils/sdl_wrap.h"
@@ -53,6 +54,8 @@ namespace {
 bool ForceRebuild = true;
 uint64_t LastStateHash = 0;
 uint32_t ExternalDoorModels = 0;
+// Masonry aperture (width, height in tiles) per external door family (L1, L2, L3, L5); zero keeps the shared contract.
+std::array<std::array<float, 2>, 4> ExternalDoorApertures {};
 
 std::array<std::array<uint8_t, 4>, 256> ArtPalette {};
 uint64_t ArtPaletteHash = 0;
@@ -95,6 +98,17 @@ bool ExternalDoorModel(_object_id type)
 		if (type == Types[i])
 			return (ExternalDoorModels & (1U << i)) != 0;
 	return false;
+}
+
+// The doorway an external leaf fills: its own width and height when the host sent them, else the shared aperture.
+std::array<float, 2> DoorOpening(_object_id type)
+{
+	constexpr _object_id Types[] = { OBJ_L1LDOOR, OBJ_L1RDOOR, OBJ_L2LDOOR, OBJ_L2RDOOR, OBJ_L3LDOOR, OBJ_L3RDOOR, OBJ_L5LDOOR, OBJ_L5RDOOR };
+	for (size_t i = 0; i < std::size(Types); ++i) {
+		if (type == Types[i] && ExternalDoorModel(type) && ExternalDoorApertures[i / 2][0] > 0.0F)
+			return ExternalDoorApertures[i / 2];
+	}
+	return { fpv::kDungeonOpeningWidth, fpv::kDungeonOpeningHeight };
 }
 
 uint64_t ComputeStateHash()
@@ -208,7 +222,7 @@ const PieceImage &GetPieceImage(uint16_t piece, bool withoutGround = false)
 
 // ---- Atlas slots -------------------------------------------------------------------------------------------
 
-enum class SlotKind : uint8_t { Square, Wall, Card };
+enum class SlotKind : uint8_t { Square, Wall, Card, Art }; // Art: a whole building composite (ArtComposites)
 
 struct Slot {
 	SlotKind kind = SlotKind::Square;
@@ -481,23 +495,119 @@ int WallSlotEither(uint16_t piece, int preferredSide)
 	return slot;
 }
 
-/** Roof tile art: a 32 x 32 crop of the roof area of a tall town piece (the thatch above the facade), opaque. */
-int RoofSlot(uint16_t piece)
+/** A 32 x 32 window of a piece image used as roof art. */
+struct RoofCrop {
+	uint16_t piece = 0;
+	int x0 = 16;
+	int y0 = 0;
+};
+
+/** Opaque art texels (not the black void) in the 32 x 32 window of `image` at (x0, y0). */
+int RoofWindowCoverage(const PieceImage &image, int x0, int y0)
 {
-	const auto it = Atlas.roofSlotOfPiece.find(piece);
-	if (it != Atlas.roofSlotOfPiece.end())
-		return it->second;
-	const PieceImage &image = GetPieceImage(piece);
-	int top = image.height - 32;
-	for (int y = 0; y < image.height && top == image.height - 32; ++y) {
-		for (int x = 16; x < 48; ++x) {
-			if (image.opaque[static_cast<size_t>(y) * 64 + x] != 0) {
-				top = y;
-				break;
-			}
+	int covered = 0;
+	for (int v = 0; v < 32; ++v) {
+		for (int u = 0; u < 32; ++u) {
+			const size_t i = static_cast<size_t>(y0 + v) * 64 + x0 + u;
+			if (image.opaque[i] != 0 && !IsVoidColor(image.index[i]))
+				++covered;
 		}
 	}
-	const int y0 = std::clamp(top + 10, 0, std::max(0, image.height - 32));
+	return covered;
+}
+
+/**
+ * The roof art of a house: thatch (or slate) from the top of its tallest columns. Tall town pieces are drawn as one
+ * 32 px column (the left or the right half of the 64 px piece, rarely both), with the roof above the facade, so the
+ * window must sit inside the drawn column: a window straddling both halves is half empty. Picks the highest window that
+ * is (nearly) fully covered, a few rows below its column's outline and ridge, over the floor diamond; the coverage asked
+ * for drops in steps when no column is fully covered (thatch with dark gaps or a column a little narrower than 32 px).
+ */
+RoofCrop FindRoofCrop(const std::vector<uint16_t> &pieces)
+{
+	constexpr int SkipTop = 4;
+	RoofCrop best;
+	int bestAbove = -1;
+	for (const int minCoverage : { 1000, 940, 860, 760 }) { // of 1024
+		for (const uint16_t piece : pieces) {
+			const PieceImage &image = GetPieceImage(piece);
+			const int lastY0 = image.height - 32 - 32; // the window stays above the floor diamond
+			for (int x0 = 0; x0 <= 32; x0 += 4) {
+				for (int y0 = 0; y0 <= lastY0; y0 += 2) {
+					if (RoofWindowCoverage(image, x0, y0) < minCoverage)
+						continue;
+					const int y = std::min(lastY0, y0 + SkipTop);
+					const int above = image.height - (y + 32);
+					if (above > bestAbove && RoofWindowCoverage(image, x0, y) >= minCoverage) {
+						bestAbove = above;
+						best = { piece, x0, y };
+					}
+					break;
+				}
+			}
+		}
+		if (bestAbove >= 0)
+			break;
+	}
+	if (bestAbove < 0 && !pieces.empty()) {
+		// No covered column: the old crop of the first (tallest) piece, holes filled with its average colour.
+		const PieceImage &image = GetPieceImage(pieces.front());
+		int top = image.height - 32;
+		for (int y = 0; y < image.height && top == image.height - 32; ++y) {
+			for (int x = 16; x < 48; ++x) {
+				if (image.opaque[static_cast<size_t>(y) * 64 + x] != 0) {
+					top = y;
+					break;
+				}
+			}
+		}
+		best = { pieces.front(), 16, std::clamp(top + 10, 0, std::max(0, image.height - 32)) };
+	}
+	return best;
+}
+
+/**
+ * Whether a piece's art above its floor diamond is part of a building rather than foliage or a sign: a solid 32 x 32
+ * block of wall or roof art, or compact art (eave wedges, roof slabs): most of its texels inside the shape. Foliage is
+ * lacy (most of its texels border a hole), and trunks, posts and signs are thin.
+ */
+bool IsBuildingArt(uint16_t piece)
+{
+	const PieceImage &image = GetPieceImage(piece);
+	const int floorTop = image.height - 32;
+	for (int x0 = 0; x0 <= 32; x0 += 4) {
+		for (int y0 = 0; y0 + 32 <= floorTop; y0 += 4) {
+			if (RoofWindowCoverage(image, x0, y0) >= 900)
+				return true;
+		}
+	}
+	const auto opaqueAt = [&](int x, int y) {
+		return x >= 0 && x < 64 && y >= 0 && y < floorTop && image.opaque[static_cast<size_t>(y) * 64 + x] != 0;
+	};
+	int texels = 0;
+	int interior = 0;
+	for (int y = 0; y < floorTop; ++y) {
+		for (int x = 0; x < 64; ++x) {
+			if (!opaqueAt(x, y))
+				continue;
+			++texels;
+			if (opaqueAt(x - 1, y) && opaqueAt(x + 1, y) && opaqueAt(x, y - 1) && opaqueAt(x, y + 1))
+				++interior;
+		}
+	}
+	return texels >= 48 && interior * 5 >= texels * 3;
+}
+
+/** Roof tile art: a 32 x 32 crop of the roof area of a house's tall pieces (FindRoofCrop), opaque. */
+int RoofSlot(const RoofCrop &crop)
+{
+	// Piece images are at most 256 rows tall, so y0 fits in 10 bits; x0 is a multiple of 4 up to 32.
+	const uint32_t key = static_cast<uint32_t>(crop.piece) << 16 | static_cast<uint32_t>(crop.x0 / 4) << 10 | static_cast<uint32_t>(crop.y0);
+	const auto it = Atlas.roofSlotOfPiece.find(key);
+	if (it != Atlas.roofSlotOfPiece.end())
+		return it->second;
+	const PieceImage &image = GetPieceImage(crop.piece);
+	const int y0 = crop.y0;
 	Slot slot;
 	slot.kind = SlotKind::Square;
 	slot.rgba.assign(32 * 32 * 4, 0);
@@ -505,8 +615,8 @@ int RoofSlot(uint16_t piece)
 	uint32_t count = 0;
 	for (int v = 0; v < 32; ++v) {
 		for (int u = 0; u < 32; ++u) {
-			const size_t i = static_cast<size_t>(y0 + v) * 64 + 16 + u;
-			if (image.opaque[i] == 0)
+			const size_t i = static_cast<size_t>(y0 + v) * 64 + crop.x0 + u;
+			if (image.opaque[i] == 0 || IsVoidColor(image.index[i]))
 				continue;
 			PutPixel(slot.rgba, 32, u, v, image.index[i]);
 			const auto &c = ArtPalette[image.index[i]];
@@ -525,7 +635,7 @@ int RoofSlot(uint16_t piece)
 	}
 	Atlas.squares.push_back(std::move(slot));
 	const int result = static_cast<int>(Atlas.squares.size()) - 1;
-	Atlas.roofSlotOfPiece[piece] = result;
+	Atlas.roofSlotOfPiece[key] = result;
 	return result;
 }
 
@@ -826,7 +936,11 @@ void BuildDungeon(LevelGeometry &geometry, MeshBuilder &mesh)
 			const DoorInfo &doorInfo = door(x, y);
 			const bool passage = archFacing != 0 || doorInfo.present;
 			const bool alongY = doorInfo.present ? doorInfo.left : archFacing == static_cast<uint8_t>(tile_geometry::Face::SE);
-			constexpr float PassagePadding = (fpv::kDungeonOpeningWidth - 1.0F) * 0.5F;
+			// An external door leaf keeps the shared model scale; the masonry aperture fits that leaf instead.
+			const std::array<float, 2> opening = doorInfo.present
+			    ? DoorOpening(Objects[doorObject[static_cast<size_t>(y) * kGridSize + x]]._otype)
+			    : std::array<float, 2> { fpv::kDungeonOpeningWidth, fpv::kDungeonOpeningHeight };
+			const float PassagePadding = (opening[0] - 1.0F) * 0.5F;
 			const int stairs = stairsAt[static_cast<size_t>(y) * kGridSize + x];
 			if (stairs == 0) {
 				if (!passage)
@@ -880,10 +994,10 @@ void BuildDungeon(LevelGeometry &geometry, MeshBuilder &mesh)
 				}
 			}
 
-			// Doors and open arches use the same hero-sized masonry aperture.
+			// Open arches and native door panels share the hero-sized masonry aperture; external leaves bring their own.
 			if (passage) {
-				constexpr float DoorTop = fpv::kDungeonOpeningHeight;
-				constexpr float lintelBottom = fpv::kDungeonOpeningHeight;
+				const float DoorTop = opening[1];
+				const float lintelBottom = opening[1];
 				// The wall the doorway is cut into runs along y (plane x = const) for SE arches and left doors.
 				const int wallSide = alongY ? 0 : 1;
 				int slot = -1;
@@ -928,9 +1042,9 @@ void BuildDungeon(LevelGeometry &geometry, MeshBuilder &mesh)
 					} else if (!externalPanel) {
 						// Swung open against the jamb.
 						if (alongY)
-							AddBox(mesh, { fx + 0.5F, 0.0F, fz - PassagePadding + 0.02F }, { fx + 0.5F + fpv::kDungeonOpeningWidth, panelTop, fz - PassagePadding + 0.12F }, panelTop, doorSlot, doorSlot, -1, slotHeight, 0.9F);
+							AddBox(mesh, { fx + 0.5F, 0.0F, fz - PassagePadding + 0.02F }, { fx + 0.5F + opening[0], panelTop, fz - PassagePadding + 0.12F }, panelTop, doorSlot, doorSlot, -1, slotHeight, 0.9F);
 						else
-							AddBox(mesh, { fx - PassagePadding + 0.02F, 0.0F, fz + 0.5F }, { fx - PassagePadding + 0.12F, panelTop, fz + 0.5F + fpv::kDungeonOpeningWidth }, panelTop, doorSlot, doorSlot, -1, slotHeight, 0.9F);
+							AddBox(mesh, { fx - PassagePadding + 0.02F, 0.0F, fz + 0.5F }, { fx - PassagePadding + 0.12F, panelTop, fz + 0.5F + opening[0] }, panelTop, doorSlot, doorSlot, -1, slotHeight, 0.9F);
 					}
 				}
 			}
@@ -1017,9 +1131,6 @@ void DumpTownCells(const char *path)
 //  - every other tall piece (trees, the well, signs, fences) becomes a pair of crossed upright cards carrying the
 //    piece image itself.
 
-constexpr float kTownPixelsPerUnit = 118.0F;
-constexpr float kTownEave = 1.05F;
-constexpr float kFacadePixelsPerUnit = 80.0F; // facade art up to the eave (the iso walls are ~80 px tall)
 constexpr float kWaterLevel = 0.0F; // the creek is flat: its art carries the channel and the banks
 
 struct TownGroup {
@@ -1402,7 +1513,8 @@ void DumpCardGroup(const char *dir, const std::vector<TownCard> &cards, int anch
  * trunk, a post) anchors one, and the other pieces join the nearest anchor at most two steps in front of them and six
  * across (a crown spans up to six pieces). Pieces no solid anchor takes anchor on the front-most, tallest of them.
  */
-void AddTownCards(MeshBuilder &mesh, const std::vector<uint8_t> &cardCell, const std::vector<int> &pieceHeight, const std::vector<int> &smallObjectOf)
+void AddTownCards(MeshBuilder &mesh, const std::vector<uint8_t> &cardCell, const std::vector<int> &pieceHeight, const std::vector<int> &smallObjectOf,
+    const std::vector<uint8_t> &artRegion, std::vector<uint8_t> &toArt)
 {
 	const auto index = [](int x, int y) { return static_cast<size_t>(y) * kGridSize + x; };
 	std::vector<int> groupOf(static_cast<size_t>(kGridSize) * kGridSize, -1);
@@ -1507,7 +1619,17 @@ void AddTownCards(MeshBuilder &mesh, const std::vector<uint8_t> &cardCell, const
 					if (anchorOf[i] == static_cast<int>(a))
 						cards.push_back({ group[i].first, group[i].second, dPiece[group[i].first][group[i].second] });
 				}
+				// An object wholly inside a built house's art region (a sign, a post, a crown on the house's cells) is part of the
+				// house's composite at the art's angle (AddArtRelief): its card belongs to the reconstructed houses then.
+				const bool art = std::all_of(cards.begin(), cards.end(), [&](const TownCard &card) { return artRegion[index(card.x, card.y)] != 0; });
+				const size_t firstVertex = mesh.vertices.size();
 				AddCardGroup(mesh, cards, group[a].first, group[a].second, 1.0F);
+				if (art) {
+					for (size_t v = firstVertex; v < mesh.vertices.size(); ++v)
+						mesh.vertices[v].vertex.flags |= kVertexTownHouse;
+					for (const TownCard &card : cards)
+						toArt[index(card.x, card.y)] = 1;
+				}
 				if (const char *dir = std::getenv("DVL_W3D_DUMP_TREES"); dir != nullptr && dir[0] != '\0')
 					DumpCardGroup(dir, cards, group[a].first, group[a].second);
 			}
@@ -1515,41 +1637,217 @@ void AddTownCards(MeshBuilder &mesh, const std::vector<uint8_t> &cardCell, const
 	}
 }
 
-/** A gable roof over [x0, x1] x [z0, z1] from the eave up to the ridge, with gable end walls. */
-void AddGableRoof(MeshBuilder &mesh, float x0, float z0, float x1, float z1, float eave, float ridgeY, int roofSlot, int gableSlotX, int gableSlotZ)
+/** A rectangle of house cells, inclusive. */
+struct HouseRect {
+	int x0, y0, x1, y1;
+};
+
+/**
+ * Covers the volume cells of a house with rectangles, each of which gets its own gable roof: repeatedly the rectangle
+ * inside the volume that covers the most still uncovered cells, the smallest on a tie. Rectangles may overlap (cross
+ * gables where two wings meet); the smallest one keeps a ragged edge a narrow annex next to the main roof instead of a
+ * second roof of nearly the same size crossing it.
+ */
+std::vector<HouseRect> HouseRects(const std::vector<std::pair<int, int>> &cells, int minX, int minY, int maxX, int maxY)
 {
-	const uint32_t flags = PackVertexFlags(0, 0.85F);
-	const float slotBottom = static_cast<float>(Atlas.wallSlotHeight) - 1.0F;
-	const float slotTop = static_cast<float>(Atlas.wallSlotHeight) - 60.0F;
-	if ((x1 - x0) >= (z1 - z0)) {
-		const float zm = (z0 + z1) * 0.5F;
-		const float half = (z1 - z0) * 0.5F;
-		const Vec3 nFront = Normalize({ 0.0F, half, -(ridgeY - eave) });
-		const Vec3 nBack = Normalize({ 0.0F, half, ridgeY - eave });
-		for (float x = x0; x < x1 - 1e-3F; x += 1.0F) {
-			const float xe = std::min(x + 1.0F, x1);
-			const float sEnd = 32.0F * (xe - x) - kInset;
-			mesh.Quad({ x, eave, z0 }, { xe, eave, z0 }, { xe, ridgeY, zm }, { x, ridgeY, zm }, kInset, 32.0F - kInset, sEnd, kInset, nFront, SlotKind::Square, roofSlot, flags);
-			mesh.Quad({ x, eave, z1 }, { xe, eave, z1 }, { xe, ridgeY, zm }, { x, ridgeY, zm }, kInset, 32.0F - kInset, sEnd, kInset, nBack, SlotKind::Square, roofSlot, flags);
+	const int w = maxX - minX + 1;
+	const int h = maxY - minY + 1;
+	std::vector<uint8_t> in(static_cast<size_t>(w) * h, 0);
+	for (const auto &[x, y] : cells)
+		in[static_cast<size_t>(y - minY) * w + (x - minX)] = 1;
+	std::vector<uint8_t> covered(in.size(), 0);
+	// Prefix sums: of volume cells (fixed) and of uncovered volume cells (per round).
+	const auto prefix = [&](const auto &value) {
+		std::vector<int> sum(static_cast<size_t>(w + 1) * (h + 1), 0);
+		for (int y = 0; y < h; ++y)
+			for (int x = 0; x < w; ++x)
+				sum[static_cast<size_t>(y + 1) * (w + 1) + x + 1] = value(x, y) + sum[static_cast<size_t>(y) * (w + 1) + x + 1]
+				    + sum[static_cast<size_t>(y + 1) * (w + 1) + x] - sum[static_cast<size_t>(y) * (w + 1) + x];
+		return sum;
+	};
+	const auto area = [&](const std::vector<int> &sum, int x0, int y0, int x1, int y1) {
+		return sum[static_cast<size_t>(y1 + 1) * (w + 1) + x1 + 1] - sum[static_cast<size_t>(y0) * (w + 1) + x1 + 1]
+		    - sum[static_cast<size_t>(y1 + 1) * (w + 1) + x0] + sum[static_cast<size_t>(y0) * (w + 1) + x0];
+	};
+	const std::vector<int> volume = prefix([&](int x, int y) { return static_cast<int>(in[static_cast<size_t>(y) * w + x]); });
+	std::vector<HouseRect> rects;
+	int left = static_cast<int>(cells.size());
+	while (left > 0 && rects.size() < 8) {
+		const std::vector<int> open = prefix([&](int x, int y) {
+			const size_t i = static_cast<size_t>(y) * w + x;
+			return in[i] != 0 && covered[i] == 0 ? 1 : 0;
+		});
+		HouseRect best { 0, 0, -1, -1 };
+		int bestNew = 0;
+		int bestArea = 0;
+		for (int y0 = 0; y0 < h; ++y0)
+			for (int x0 = 0; x0 < w; ++x0)
+				for (int y1 = y0; y1 < h; ++y1)
+					for (int x1 = x0; x1 < w; ++x1) {
+						const int a = (x1 - x0 + 1) * (y1 - y0 + 1);
+						if (area(volume, x0, y0, x1, y1) != a) {
+							break; // wider rectangles from this corner leave the volume too
+						}
+						const int fresh = area(open, x0, y0, x1, y1);
+						if (fresh > bestNew || (fresh == bestNew && fresh > 0 && a < bestArea)) {
+							bestNew = fresh;
+							bestArea = a;
+							best = { x0, y0, x1, y1 };
+						}
+					}
+		if (bestNew == 0)
+			break;
+		for (int y = best.y0; y <= best.y1; ++y)
+			for (int x = best.x0; x <= best.x1; ++x)
+				covered[static_cast<size_t>(y) * w + x] = 1;
+		left -= bestNew;
+		rects.push_back({ best.x0 + minX, best.y0 + minY, best.x1 + minX, best.y1 + minY });
+	}
+	return rects;
+}
+
+/**
+ * Rows of facade art below the eave of one wall half: the lowest unprojected row (above the wall foot) from which the
+ * roof's thatch takes over, -1 when the half shows no such line. `thatch` marks the palette entries of the roof art that
+ * the wall's own foot does not use.
+ */
+int FacadeEaveRows(uint16_t piece, int side, const std::array<bool, 256> &thatch)
+{
+	const PieceImage &image = GetPieceImage(piece);
+	int run = 0;
+	for (int h = 0; h < image.height; ++h) {
+		int opaque = 0;
+		int roof = 0;
+		for (int u = 0; u < 32; ++u) {
+			const int c = side == 0 ? u : 32 + u;
+			const int foot = side == 0 ? u / 2 : (31 - u) / 2;
+			const int row = image.height - 1 - (h + foot);
+			if (row < 0)
+				continue;
+			const size_t i = static_cast<size_t>(row) * 64 + c;
+			if (image.opaque[i] == 0)
+				continue;
+			++opaque;
+			roof += thatch[image.index[i]] ? 1 : 0;
 		}
-		for (const float x : { x0 + 0.2F, x1 - 0.2F }) {
-			mesh.Triangle({ x, eave, z0 + 0.2F }, { x, eave, z1 - 0.2F }, { x, ridgeY, zm }, kInset, slotBottom, 32.0F - kInset, slotBottom, 16.0F, slotTop,
-			    { x < (x0 + x1) * 0.5F ? -1.0F : 1.0F, 0.0F, 0.0F }, SlotKind::Wall, gableSlotX, PackVertexFlags(0, 0.75F));
+		run = opaque >= 16 && roof * 2 >= opaque ? run + 1 : 0;
+		if (run == 4)
+			return h - 3 >= 32 ? h - 3 : -1;
+	}
+	return -1;
+}
+
+/** Vertical rows of town art per world unit: the card scale (AddCardGroup), so walls keep the 2D art's proportions. */
+constexpr float kTownRowsPerUnit = 64.0F / 1.41421356F * 0.8660254F;
+/** Roof rise per unit from the wall to the ridge: 45 degrees, a thatched cottage's pitch. */
+constexpr float kHousePitch = 1.0F;
+/**
+ * The facade art is lit for the classic view's fixed light; in 3D the walls facing the camera face away from the town's
+ * key light and only take ambient, so a little extra albedo keeps their timber and windows readable.
+ */
+constexpr float kHouseWallAlbedo = 1.6F;
+
+/**
+ * Gable roof over the cell rectangle [x0, x1] x [z0, z1] (cell borders). The walls stand on the centre line of the edge
+ * cells, so the roof passes through the wall top half a cell in from the border and overhangs the walls by that half
+ * cell, never past the house's own cells (towners and the hero walk right next to them). Thatch repeats every unit along
+ * the ridge and up the slope; eaves and ridge get a thin edge, and the gable ends are walls textured with facade art at
+ * the facade's scale.
+ */
+void AddHouseRoof(MeshBuilder &mesh, float x0, float z0, float x1, float z1, float eave, float pitch, float maxRise, int roofSlot, int gableSlot,
+    float gableRow0)
+{
+	const bool alongX = (x1 - x0) >= (z1 - z0);
+	// Local frame: `a` along the ridge, `b` across it (b = 0 on the ridge).
+	const float a0 = alongX ? x0 : z0;
+	const float a1 = alongX ? x1 : z1;
+	const float bc = alongX ? (z0 + z1) * 0.5F : (x0 + x1) * 0.5F;
+	const float halfSpan = (alongX ? z1 - z0 : x1 - x0) * 0.5F;
+	const float wallHalf = std::max(0.2F, halfSpan - 0.5F);
+	const float rise = std::min(maxRise, pitch * wallHalf);
+	const float slopeK = rise / wallHalf; // drop per unit away from the ridge
+	const float ridge = eave + rise;
+	const auto heightAt = [&](float d) { return ridge - slopeK * std::abs(d); };
+	const auto point = [&](float a, float y, float b) { return alongX ? Vec3 { a, y, bc + b } : Vec3 { bc + b, y, a }; };
+	const float edgeY = heightAt(halfSpan);
+	const float slopeLen = std::sqrt(halfSpan * halfSpan + (ridge - edgeY) * (ridge - edgeY));
+	const int bands = std::max(1, static_cast<int>(std::ceil(slopeLen - 1e-3F)));
+	const float bandTexels = 32.0F * slopeLen / static_cast<float>(bands);
+	for (const float sign : { -1.0F, 1.0F }) {
+		const Vec3 n = Normalize(alongX ? Vec3 { 0.0F, halfSpan, sign * (ridge - edgeY) } : Vec3 { sign * (ridge - edgeY), halfSpan, 0.0F });
+		for (float a = a0; a < a1 - 1e-3F; a += 1.0F) {
+			const float ae = std::min(a + 1.0F, a1);
+			const float sEnd = 32.0F * (ae - a) - kInset;
+			for (int k = 0; k < bands; ++k) {
+				const float d0 = halfSpan * (1.0F - static_cast<float>(k) / static_cast<float>(bands));
+				const float d1 = halfSpan * (1.0F - static_cast<float>(k + 1) / static_cast<float>(bands));
+				// Darker toward the eaves, as under the thatch's own overhang.
+				const float albedo = 0.85F + 0.2F * static_cast<float>(k) / static_cast<float>(std::max(1, bands - 1));
+				mesh.Quad(point(a, heightAt(d0), sign * d0), point(ae, heightAt(d0), sign * d0), point(ae, heightAt(d1), sign * d1), point(a, heightAt(d1), sign * d1),
+				    kInset, 32.0F - kInset, sEnd, std::max(kInset, 32.0F - bandTexels + kInset), n, SlotKind::Square, roofSlot, PackVertexFlags(0, albedo));
+			}
 		}
-	} else {
-		const float xm = (x0 + x1) * 0.5F;
-		const float half = (x1 - x0) * 0.5F;
-		const Vec3 nLeft = Normalize({ -(ridgeY - eave), half, 0.0F });
-		const Vec3 nRight = Normalize({ ridgeY - eave, half, 0.0F });
-		for (float z = z0; z < z1 - 1e-3F; z += 1.0F) {
-			const float ze = std::min(z + 1.0F, z1);
-			const float sEnd = 32.0F * (ze - z) - kInset;
-			mesh.Quad({ x0, eave, z }, { x0, eave, ze }, { xm, ridgeY, ze }, { xm, ridgeY, z }, kInset, 32.0F - kInset, sEnd, kInset, nLeft, SlotKind::Square, roofSlot, flags);
-			mesh.Quad({ x1, eave, z }, { x1, eave, ze }, { xm, ridgeY, ze }, { xm, ridgeY, z }, kInset, 32.0F - kInset, sEnd, kInset, nRight, SlotKind::Square, roofSlot, flags);
+		// Eave edge: a short drop below the roof's lower edge, so the thatch reads as a layer rather than a sheet.
+		const Vec3 down = alongX ? Vec3 { 0.0F, 0.0F, sign } : Vec3 { sign, 0.0F, 0.0F };
+		for (float a = a0; a < a1 - 1e-3F; a += 1.0F) {
+			const float ae = std::min(a + 1.0F, a1);
+			mesh.Quad(point(a, edgeY, sign * halfSpan), point(ae, edgeY, sign * halfSpan), point(ae, edgeY - 0.14F, sign * halfSpan), point(a, edgeY - 0.14F, sign * halfSpan),
+			    kInset, 2.0F, 32.0F * (ae - a) - kInset, 6.0F, down, SlotKind::Square, roofSlot, PackVertexFlags(0, 0.55F));
 		}
-		for (const float z : { z0 + 0.2F, z1 - 0.2F }) {
-			mesh.Triangle({ x0 + 0.2F, eave, z }, { x1 - 0.2F, eave, z }, { xm, ridgeY, z }, kInset, slotBottom, 32.0F - kInset, slotBottom, 16.0F, slotTop,
-			    { 0.0F, 0.0F, z < (z0 + z1) * 0.5F ? -1.0F : 1.0F }, SlotKind::Wall, gableSlotZ, PackVertexFlags(0, 0.75F));
+	}
+	// Ridge cap: a narrow raised saddle along the ridge.
+	for (float a = a0; a < a1 - 1e-3F; a += 1.0F) {
+		const float ae = std::min(a + 1.0F, a1);
+		for (const float sign : { -1.0F, 1.0F }) {
+			const Vec3 n = Normalize(alongX ? Vec3 { 0.0F, 1.0F, sign } : Vec3 { sign, 1.0F, 0.0F });
+			mesh.Quad(point(a, ridge - 0.04F, sign * 0.16F), point(ae, ridge - 0.04F, sign * 0.16F), point(ae, ridge + 0.08F, 0.0F), point(a, ridge + 0.08F, 0.0F),
+			    kInset, 20.0F, 32.0F * (ae - a) - kInset, 26.0F, n, SlotKind::Square, roofSlot, PackVertexFlags(0, 0.62F));
+		}
+	}
+	// Gable ends on the wall line, half a cell in from the rectangle's ends, as unit-wide strips (wall slots are one unit
+	// wide) up to the roof line, and the barge edge along the roof's end.
+	const int slotHeight = Atlas.wallSlotHeight;
+	const auto tOf = [&](float y) {
+		return std::clamp(static_cast<float>(slotHeight) - 1.0F - (gableRow0 + (y - eave) * kTownRowsPerUnit), 0.0F, static_cast<float>(slotHeight) - 1.0F);
+	};
+	for (const float end : { a0 + 0.5F, a1 - 0.5F }) {
+		const float outward = end < (a0 + a1) * 0.5F ? -1.0F : 1.0F;
+		const Vec3 n = alongX ? Vec3 { outward, 0.0F, 0.0F } : Vec3 { 0.0F, 0.0F, outward };
+		for (float b = -wallHalf; b < wallHalf - 1e-3F; b += 1.0F) {
+			const float be = std::min(b + 1.0F, wallHalf);
+			// Split at the ridge so each strip's top is one straight roof line.
+			const float splits[3] = { b, (b < 0.0F && be > 0.0F) ? 0.0F : be, be };
+			for (int s = 0; s < 2; ++s) {
+				const float p = splits[s];
+				const float q = splits[s + 1];
+				if (q - p < 1e-3F)
+					continue;
+				const float sp = 32.0F * (p - b) + kInset;
+				const float sq = std::max(sp, 32.0F * (q - b) - kInset);
+				const float yp = heightAt(p);
+				const float yq = heightAt(q);
+				// Quad p-bottom, q-bottom, q-top, p-top; its t is linear in y, so the two top corners take their own rows.
+				const auto base = static_cast<uint32_t>(mesh.vertices.size());
+				const Vec3 ps[4] = { point(end, eave, p), point(end, eave, q), point(end, yq, q), point(end, yp, p) };
+				const float ss[4] = { sp, sq, sq, sp };
+				const float ts[4] = { tOf(eave), tOf(eave), tOf(yq), tOf(yp) };
+				for (int i = 0; i < 4; ++i) {
+					PendingVertex v;
+					v.vertex = { ps[i].x, ps[i].y, ps[i].z, 0.0F, 0.0F, n.x, n.y, n.z, PackVertexFlags(0, 1.4F) };
+					v.kind = SlotKind::Wall;
+					v.slot = gableSlot;
+					v.s = ss[i];
+					v.t = ts[i];
+					mesh.vertices.push_back(v);
+				}
+				mesh.indices.insert(mesh.indices.end(), { base, base + 1, base + 2, base, base + 2, base + 3 });
+			}
+		}
+		// Barge edge: the roof's end seen edge on, a thin band under both slopes.
+		const float ae = outward < 0.0F ? a0 : a1;
+		for (const float sign : { -1.0F, 1.0F }) {
+			mesh.Quad(point(ae, ridge, 0.0F), point(ae, edgeY, sign * halfSpan), point(ae, edgeY - 0.14F, sign * halfSpan), point(ae, ridge - 0.14F, 0.0F),
+			    kInset, 2.0F, 30.0F, 6.0F, n, SlotKind::Square, roofSlot, PackVertexFlags(0, 0.55F));
 		}
 	}
 }
@@ -1570,15 +1868,39 @@ void AddPyramidRoof(MeshBuilder &mesh, float x0, float z0, float x1, float z1, f
 	}
 }
 
-void BuildHouse(LevelGeometry &geometry, MeshBuilder &mesh, const TownGroup &group, const std::vector<int> &groupOf, int id, bool cathedral)
+/**
+ * One built house: walls on the outline of its volume cells (the cells of the group inside a full 2 x 2 block of it;
+ * one-cell fences and posts stay cut-out cards), with the edge pieces' own facade art at the art's proportions up to the
+ * eave the art shows, and a gable roof per rectangle of the volume (HouseRects). `volume` marks the cells over the grid.
+ */
+void BuildHouse(LevelGeometry &geometry, MeshBuilder &mesh, const TownGroup &group, const std::vector<uint8_t> &volume, bool cathedral)
 {
-	const auto inGroup = [&](int x, int y) {
-		return x >= 0 && y >= 0 && x < kGridSize && y < kGridSize && groupOf[static_cast<size_t>(y) * kGridSize + x] == id;
+	const auto inVolume = [&](int x, int y) {
+		return x >= 0 && y >= 0 && x < kGridSize && y < kGridSize && volume[static_cast<size_t>(y) * kGridSize + x] != 0;
 	};
-	// Facade art of the group: the left halves (SE faces, +x) and right halves (SW faces, +y) of its pieces.
+	std::vector<std::pair<int, int>> cells;
+	int minX = kGridSize, minY = kGridSize, maxX = -1, maxY = -1;
+	for (const auto &[x, y] : group.cells) {
+		if (!inVolume(x, y))
+			continue;
+		cells.emplace_back(x, y);
+		minX = std::min(minX, x);
+		minY = std::min(minY, y);
+		maxX = std::max(maxX, x);
+		maxY = std::max(maxY, y);
+	}
+	if (cells.empty())
+		return;
+	// Facade art: the left halves (SE faces, +x) and right halves (SW faces, +y) of the front edge pieces.
+	struct FacadeHalf {
+		uint16_t piece;
+		int side;
+		int slot;
+	};
+	std::vector<FacadeHalf> facades;
 	std::vector<int> facadeX;
 	std::vector<int> facadeZ;
-	uint16_t tallest = dPiece[group.cells.front().first][group.cells.front().second];
+	uint16_t tallest = dPiece[cells.front().first][cells.front().second];
 	int tallestHeight = -1;
 	for (const auto &[x, y] : group.cells) {
 		const uint16_t piece = dPiece[x][y];
@@ -1587,54 +1909,116 @@ void BuildHouse(LevelGeometry &geometry, MeshBuilder &mesh, const TownGroup &gro
 			tallestHeight = height;
 			tallest = piece;
 		}
-		// Only the front edge pieces carry facades; inner pieces show roof.
-		if (!inGroup(x + 1, y)) {
-			if (const int slot = WallSlot(piece, 0); slot >= 0)
+		if (!inVolume(x, y))
+			continue;
+		if (!inVolume(x + 1, y)) {
+			if (const int slot = WallSlot(piece, 0); slot >= 0) {
 				facadeX.push_back(slot);
+				facades.push_back({ piece, 0, slot });
+			}
 		}
-		if (!inGroup(x, y + 1)) {
-			if (const int slot = WallSlot(piece, 1); slot >= 0)
+		if (!inVolume(x, y + 1)) {
+			if (const int slot = WallSlot(piece, 1); slot >= 0) {
 				facadeZ.push_back(slot);
+				facades.push_back({ piece, 1, slot });
+			}
 		}
 	}
 	if (facadeX.empty())
 		facadeX = facadeZ;
 	if (facadeZ.empty())
 		facadeZ = facadeX;
-	const int roofSlot = RoofSlot(tallest);
-	const float eave = cathedral ? kTownEave * 1.6F : kTownEave;
-	const int slotHeight = Atlas.wallSlotHeight;
-
+	std::vector<uint16_t> roofPieces { tallest };
 	for (const auto &[x, y] : group.cells) {
+		if (std::find(roofPieces.begin(), roofPieces.end(), dPiece[x][y]) == roofPieces.end())
+			roofPieces.push_back(dPiece[x][y]);
+	}
+	const RoofCrop crop = FindRoofCrop(roofPieces);
+	const int roofSlot = RoofSlot(crop);
+
+	// The eave: where the facades' thatch begins. Thatch colours are the roof art's main palette entries that the walls'
+	// own feet (the bottom rows, always wall) do not use.
+	std::array<int, 256> roofCount {};
+	{
+		const PieceImage &image = GetPieceImage(crop.piece);
+		for (int v = 0; v < 32; ++v)
+			for (int u = 0; u < 32; ++u) {
+				const size_t i = static_cast<size_t>(crop.y0 + v) * 64 + crop.x0 + u;
+				if (image.opaque[i] != 0)
+					++roofCount[image.index[i]];
+			}
+	}
+	std::array<int, 256> footCount {};
+	int footTotal = 0;
+	for (const FacadeHalf &f : facades) {
+		const PieceImage &image = GetPieceImage(f.piece);
+		for (int h = 0; h < 20; ++h)
+			for (int u = 0; u < 32; ++u) {
+				const int c = f.side == 0 ? u : 32 + u;
+				const int foot = f.side == 0 ? u / 2 : (31 - u) / 2;
+				const int row = image.height - 1 - (h + foot);
+				if (row < 0)
+					continue;
+				const size_t i = static_cast<size_t>(row) * 64 + c;
+				if (image.opaque[i] != 0) {
+					++footCount[image.index[i]];
+					++footTotal;
+				}
+			}
+	}
+	std::array<bool, 256> thatch {};
+	for (int i = 0; i < 256; ++i)
+		thatch[i] = roofCount[i] >= 6 && footCount[i] * 100 <= footTotal;
+	std::vector<int> eaves;
+	for (const FacadeHalf &f : facades) {
+		if (const int rows = FacadeEaveRows(f.piece, f.side, thatch); rows > 0)
+			eaves.push_back(rows);
+	}
+	int eaveRows = cathedral ? 150 : 96;
+	if (!eaves.empty()) {
+		std::nth_element(eaves.begin(), eaves.begin() + static_cast<std::ptrdiff_t>(eaves.size() / 2), eaves.end());
+		eaveRows = eaves[eaves.size() / 2];
+	}
+	const float eave = std::clamp(static_cast<float>(eaveRows) / kTownRowsPerUnit, cathedral ? 3.0F : 1.9F, cathedral ? 4.6F : 3.4F);
+	eaveRows = static_cast<int>(eave * kTownRowsPerUnit + 0.5F);
+	const int slotHeight = Atlas.wallSlotHeight;
+	const std::vector<HouseRect> rects = HouseRects(cells, minX, minY, maxX, maxY);
+	if (std::getenv("DVL_W3D_DUMP_TOWN") != nullptr) {
+		Log("render3d: built house {}..{} x {}..{}: eave {} rows ({} facades measured), {} roof rects, roof crop piece {} x{} y{}", minX, maxX, minY, maxY,
+		    eaveRows, eaves.size(), rects.size(), crop.piece, crop.x0, crop.y0);
+		for (const HouseRect &r : rects)
+			Log("render3d:   roof rect {}..{} x {}..{}", r.x0, r.x1, r.y0, r.y1);
+	}
+
+	for (const auto &[x, y] : cells) {
 		geometry.occluders[static_cast<size_t>(y) * kGridSize + x] = PackOccluder(0.0F, eave);
 		const float fx = static_cast<float>(x);
 		const float fz = static_cast<float>(y);
 		struct Side {
 			int dx, dy, axis;
-			float c;
 			Vec3 normal;
 			int artSide;
 		};
 		const Side sides[4] = {
-			{ 1, 0, 0, fx + 1.0F, { 1, 0, 0 }, 0 },
-			{ -1, 0, 0, fx, { -1, 0, 0 }, 0 },
-			{ 0, 1, 1, fz + 1.0F, { 0, 0, 1 }, 1 },
-			{ 0, -1, 1, fz, { 0, 0, -1 }, 1 },
+			{ 1, 0, 0, { 1, 0, 0 }, 0 },
+			{ -1, 0, 0, { -1, 0, 0 }, 0 },
+			{ 0, 1, 1, { 0, 0, 1 }, 1 },
+			{ 0, -1, 1, { 0, 0, -1 }, 1 },
 		};
 		for (const Side &side : sides) {
-			if (inGroup(x + side.dx, y + side.dy))
+			if (inVolume(x + side.dx, y + side.dy))
 				continue;
 			// The iso art stands its walls on the centre line of the edge cells: the face plane is inset by half a
 			// cell; along the edge each end stops at the cell centre (convex corner), at the cell border (straight)
 			// or half a cell beyond it (concave corner), so the faces meet.
-			const int ex = side.axis == 0 ? 0 : 1; // edge direction
+			const int ex = side.axis == 0 ? 0 : 1;
 			const int ey = side.axis == 0 ? 1 : 0;
 			const auto endOffset = [&](int sign) {
 				const int nx = x + ex * sign;
 				const int ny = y + ey * sign;
-				if (!inGroup(nx, ny))
+				if (!inVolume(nx, ny))
 					return -0.5F;
-				return inGroup(nx + side.dx, ny + side.dy) ? 0.5F : 0.0F;
+				return inVolume(nx + side.dx, ny + side.dy) ? 0.5F : 0.0F;
 			};
 			const float plane = side.axis == 0 ? fx + 0.5F : fz + 0.5F;
 			const float cellStart = side.axis == 0 ? fz : fx;
@@ -1649,34 +2033,226 @@ void BuildHouse(LevelGeometry &geometry, MeshBuilder &mesh, const TownGroup &gro
 			}
 			if (slot >= 0)
 				++Atlas.wallUse[slot];
-			const float artHeight = slot >= 0 ? std::max(eave, static_cast<float>(Atlas.walls[slot].textureHeight) / kFacadePixelsPerUnit) : eave;
-			AddWallFace(mesh, side.axis, plane, spanStart, spanEnd, 0.0F, eave, artHeight, side.normal, slot, slotHeight, 1.0F);
+			// The facade's rows up to the eave fill the wall, at the art's own proportions.
+			const int textureHeight = slot >= 0 ? Atlas.walls[slot].textureHeight : slotHeight;
+			const float fullHeight = eave * static_cast<float>(textureHeight) / static_cast<float>(std::max(1, std::min(eaveRows, textureHeight)));
+			AddWallFace(mesh, side.axis, plane, spanStart, spanEnd, 0.0F, eave, std::max(eave, fullHeight), side.normal, slot, slotHeight, kHouseWallAlbedo);
 		}
 	}
-	// The roof overhangs the walls (on the edge cells' centre lines) a little.
-	const float x0 = static_cast<float>(group.minX) + 0.25F;
-	const float x1 = static_cast<float>(group.maxX + 1) - 0.25F;
-	const float z0 = static_cast<float>(group.minY) + 0.25F;
-	const float z1 = static_cast<float>(group.maxY + 1) - 0.25F;
-	const float half = std::min(x1 - x0, z1 - z0) * 0.5F;
-	const float ridge = eave + std::min(half * 0.85F, cathedral ? 2.6F : 1.5F);
-	AddGableRoof(mesh, x0, z0, x1, z1, eave, ridge, roofSlot, facadeX.empty() ? -1 : facadeX.front(), facadeZ.empty() ? -1 : facadeZ.front());
+	// Gables show the facade's middle band (timber and plaster, rarely the door), at the wall's scale.
+	const int gableSlot = facadeX.empty() ? -1 : facadeX.front();
+	const float gableRow0 = static_cast<float>(eaveRows) * 0.3F;
+	float highestRidge = eave;
+	for (const HouseRect &r : rects) {
+		const float span = static_cast<float>(std::min(r.x1 - r.x0, r.y1 - r.y0) + 1);
+		const float maxRise = cathedral ? 3.0F : 2.2F;
+		AddHouseRoof(mesh, static_cast<float>(r.x0), static_cast<float>(r.y0), static_cast<float>(r.x1 + 1), static_cast<float>(r.y1 + 1), eave, kHousePitch, maxRise,
+		    roofSlot, gableSlot, gableRow0);
+		highestRidge = std::max(highestRidge, eave + std::min(maxRise, kHousePitch * std::max(0.2F, span * 0.5F - 0.5F)));
+	}
 	if (cathedral) {
-		// Bell tower on the front corner (toward the town).
-		const float tx0 = static_cast<float>(group.maxX) - 2.1F;
-		const float tz0 = static_cast<float>(group.maxY) - 2.1F;
-		const float tx1 = tx0 + 2.6F;
-		const float tz1 = tz0 + 2.6F;
-		const float top = ridge + 2.2F;
+		// Bell tower on the front corner (toward the town), inside the volume.
+		const float tx1 = static_cast<float>(maxX) + 0.5F;
+		const float tz1 = static_cast<float>(maxY) + 0.5F;
+		const float tx0 = tx1 - 2.6F;
+		const float tz0 = tz1 - 2.6F;
+		const float top = highestRidge + 2.2F;
 		const int slotX = facadeX.empty() ? -1 : facadeX.back();
 		const int slotZ = facadeZ.empty() ? -1 : facadeZ.back();
-		const float art = slotX >= 0 ? static_cast<float>(Atlas.walls[slotX].textureHeight) / kTownPixelsPerUnit : top;
+		const float art = slotX >= 0 ? static_cast<float>(Atlas.walls[slotX].textureHeight) / kTownRowsPerUnit : top;
 		AddBox(mesh, { tx0, 0.0F, tz0 }, { tx1, top, tz1 }, std::max(art, 1.0F), slotX, slotZ, -1, slotHeight, 0.95F);
 		AddPyramidRoof(mesh, tx0 - 0.2F, tz0 - 0.2F, tx1 + 0.2F, tz1 + 0.2F, top, top + 2.4F, roofSlot);
 	}
 }
 
-void BuildTown(LevelGeometry &geometry, MeshBuilder &mesh)
+// ---- Tristram building art at the classic projection ---------------------------------------------------------
+//
+// The default 3D camera looks at the town from the iso art's own angle (yaw 45 degrees, pitch about 30), so a house can
+// be shown as its original pixels instead of a reconstruction. Every building's pieces are painted, in the classic
+// renderer's order, into one composite image of the classic screen (ArtComposite), and that image is laid on a relief:
+// a mesh over the composite whose points sit at the classic screen position of their pixel, at a depth taken from the
+// pieces that drew it. Any point on the line of sight of a classic screen pixel projects back onto that pixel, so from
+// the art's angle the relief shows the 2D art pixel for pixel whatever the depths are; the depths only decide occlusion
+// and how the picture bends for other cameras. Because the relief is one continuous surface per building, the
+// perspective of the 3D camera (and the legacy look's steeper pitch) only stretches the picture a little; separate
+// per-piece panels tore apart where pieces of different depth meet.
+//
+// The depth of a pixel is the back edge of the cell whose piece drew it (plane x = i under the left image half, plane
+// y = j under the right half): the whole floor diamond lies in front of it, the classic painter's order follows (a piece
+// hides what stands in the cells behind it; an actor in its own cell or the cells in front stands in front of it), and a
+// wall reaches the ground exactly on its cell's edge. The relief's vertices average the depths around them, so steps
+// between a roof edge and the wall behind become short slopes rather than cracks.
+//
+// Classic screen coordinates (pixels, y down) of a world point (x, h, z): sx = 32 (x - z), sy = 16 (x + z) - h * RowsPerUnit.
+// With u = x + z, a screen point and a depth give the world point back: x = (u + sx / 32) / 2, z = (u - sx / 32) / 2,
+// h = (16 u - sy) / RowsPerUnit; larger u is nearer the camera and higher up the line of sight.
+
+/** Vertical rows of town art per world unit: the card scale (AddCardGroup), the 30 degree view of the 2:1 art. */
+constexpr float kArtRowsPerUnit = 64.0F / 1.41421356F * 0.8660254F;
+/** Relief grid step in composite pixels. */
+constexpr int kArtBlock = 8;
+
+/** One building's art at the classic projection: palette indices, coverage and depth (u) per pixel. */
+struct ArtComposite {
+	int x0 = 0, y0 = 0; // classic screen position of pixel (0, 0)
+	int width = 0, height = 0;
+	std::vector<uint8_t> index;
+	std::vector<uint8_t> opaque;
+	std::vector<float> depth;
+	std::vector<uint8_t> rgba; // filled by AddArtRelief, width x height (padded to 32 in the atlas)
+};
+
+std::vector<ArtComposite> ArtComposites;
+
+/** World point of a classic screen point at depth u. */
+Vec3 ArtWorldPoint(float sx, float sy, float u)
+{
+	return { (u + sx / 32.0F) * 0.5F, (16.0F * u - sy) / kArtRowsPerUnit, (u - sx / 32.0F) * 0.5F };
+}
+
+/**
+ * Paints the pieces of `cells` (one building) into a composite in the classic order (back rows first) and lays it on a
+ * relief mesh in `art`. Only what a piece draws above its floor diamond is building art: the diamond is ground, which
+ * the ground mesh shows.
+ */
+void AddArtRelief(MeshBuilder &art, const std::vector<std::pair<int, int>> &cells)
+{
+	if (cells.empty())
+		return;
+	const int pieceHeight = GetPieceImage(dPiece[cells.front().first][cells.front().second]).height;
+	int minX = 1 << 30, minY = 1 << 30, maxX = -(1 << 30), maxY = -(1 << 30);
+	for (const auto &[i, j] : cells) {
+		const int left = (i - j) * 32 - 32;
+		const int bottom = (i + j + 2) * 16;
+		minX = std::min(minX, left);
+		maxX = std::max(maxX, left + 64);
+		minY = std::min(minY, bottom - pieceHeight);
+		maxY = std::max(maxY, bottom - 16);
+	}
+	ArtComposite composite;
+	composite.x0 = minX;
+	composite.y0 = minY;
+	composite.width = maxX - minX;
+	composite.height = maxY - minY;
+	const size_t pixels = static_cast<size_t>(composite.width) * composite.height;
+	composite.index.assign(pixels, 0);
+	composite.opaque.assign(pixels, 0);
+	composite.depth.assign(pixels, 0.0F);
+	std::vector<std::pair<int, int>> order = cells;
+	std::stable_sort(order.begin(), order.end(), [](const auto &a, const auto &b) { return a.first + a.second < b.first + b.second; });
+	bool any = false;
+	for (const auto &[i, j] : order) {
+		const PieceImage &image = GetPieceImage(dPiece[i][j]);
+		const int left = (i - j) * 32 - 32 - composite.x0;
+		const int top = (i + j + 2) * 16 - image.height - composite.y0;
+		for (int r = 0; r < image.height; ++r) {
+			const float rowUp = static_cast<float>(image.height - 1 - r) + 0.5F; // pixel centre, rows up from the bottom
+			const int y = top + r;
+			if (y < 0 || y >= composite.height)
+				continue;
+			for (int c = 0; c < 64; ++c) {
+				const size_t p = static_cast<size_t>(r) * 64 + c;
+				if (image.opaque[p] == 0)
+					continue;
+				const float column = static_cast<float>(c) + 0.5F;
+				// The back edges of the diamond: row 16 at the outer columns, row 32 at the top corner.
+				const float foot = c < 32 ? 16.0F + column * 0.5F : 16.0F + (64.0F - column) * 0.5F;
+				if (rowUp < foot)
+					continue;
+				const int x = left + c;
+				if (x < 0 || x >= composite.width)
+					continue;
+				const size_t q = static_cast<size_t>(y) * composite.width + x;
+				const float sx = static_cast<float>(composite.x0 + x) + 0.5F;
+				composite.index[q] = image.index[p];
+				composite.opaque[q] = 1;
+				composite.depth[q] = c < 32 ? 2.0F * static_cast<float>(i) - sx / 32.0F : 2.0F * static_cast<float>(j) + sx / 32.0F;
+				any = true;
+			}
+		}
+	}
+	if (!any)
+		return;
+
+	// Relief vertices on a kArtBlock grid: the mean depth of the art within one block around them, never below the ground.
+	const int gw = composite.width / kArtBlock + 1;
+	const int gh = composite.height / kArtBlock + 2;
+	std::vector<float> vertexDepth(static_cast<size_t>(gw) * gh, 0.0F);
+	std::vector<uint8_t> vertexKnown(static_cast<size_t>(gw) * gh, 0);
+	for (int gy = 0; gy < gh; ++gy) {
+		for (int gx = 0; gx < gw; ++gx) {
+			double sum = 0.0;
+			int count = 0;
+			for (int y = std::max(0, (gy - 1) * kArtBlock); y < std::min(composite.height, (gy + 1) * kArtBlock); ++y) {
+				for (int x = std::max(0, (gx - 1) * kArtBlock); x < std::min(composite.width, (gx + 1) * kArtBlock); ++x) {
+					const size_t q = static_cast<size_t>(y) * composite.width + x;
+					if (composite.opaque[q] != 0) {
+						sum += composite.depth[q];
+						++count;
+					}
+				}
+			}
+			if (count == 0)
+				continue;
+			const float sy = static_cast<float>(composite.y0 + gy * kArtBlock);
+			const size_t g = static_cast<size_t>(gy) * gw + gx;
+			vertexDepth[g] = std::max(static_cast<float>(sum / count), sy / 16.0F);
+			vertexKnown[g] = 1;
+		}
+	}
+	const int slot = static_cast<int>(ArtComposites.size());
+	const uint32_t flags = PackVertexFlags(kVertexTownArt | kVertexBillboard);
+	// The relief faces the iso camera; its lighting normal is straight up, like the ground: the 2D town lights a house
+	// exactly like the ground it stands on (the art carries its own shading), and both sides of a house the same.
+	const Vec3 up { 0.0F, 1.0F, 0.0F };
+	const auto corner = [&](int gx, int gy) {
+		const float sx = static_cast<float>(composite.x0 + gx * kArtBlock);
+		const float sy = static_cast<float>(composite.y0 + gy * kArtBlock);
+		return ArtWorldPoint(sx, sy, vertexDepth[static_cast<size_t>(gy) * gw + gx]);
+	};
+	for (int by = 0; by * kArtBlock < composite.height; ++by) {
+		for (int bx = 0; bx * kArtBlock < composite.width; ++bx) {
+			bool shown = false;
+			for (int y = by * kArtBlock; y < std::min(composite.height, (by + 1) * kArtBlock) && !shown; ++y) {
+				for (int x = bx * kArtBlock; x < std::min(composite.width, (bx + 1) * kArtBlock) && !shown; ++x)
+					shown = composite.opaque[static_cast<size_t>(y) * composite.width + x] != 0;
+			}
+			if (!shown)
+				continue;
+			// A block with art has art within one block of each of its corners.
+			if (vertexKnown[static_cast<size_t>(by) * gw + bx] == 0 || vertexKnown[static_cast<size_t>(by) * gw + bx + 1] == 0
+			    || vertexKnown[static_cast<size_t>(by + 1) * gw + bx] == 0 || vertexKnown[static_cast<size_t>(by + 1) * gw + bx + 1] == 0)
+				continue;
+			const float s0 = static_cast<float>(bx * kArtBlock);
+			const float t0 = static_cast<float>(by * kArtBlock);
+			const float s1 = s0 + static_cast<float>(kArtBlock);
+			const float t1 = t0 + static_cast<float>(kArtBlock);
+			const Vec3 p00 = corner(bx, by);
+			const Vec3 p10 = corner(bx + 1, by);
+			const Vec3 p11 = corner(bx + 1, by + 1);
+			const Vec3 p01 = corner(bx, by + 1);
+			art.Triangle(p00, p10, p11, s0, t0, s1, t0, s1, t1, up, SlotKind::Art, slot, flags);
+			art.Triangle(p00, p11, p01, s0, t0, s1, t1, s0, t1, up, SlotKind::Art, slot, flags);
+		}
+	}
+	const auto &palette = CurrentArtPalette();
+	composite.rgba.assign(pixels * 4, 0);
+	for (size_t q = 0; q < pixels; ++q) {
+		if (composite.opaque[q] == 0)
+			continue;
+		const auto &color = palette[composite.index[q]];
+		composite.rgba[q * 4 + 0] = color[0];
+		composite.rgba[q * 4 + 1] = color[1];
+		composite.rgba[q * 4 + 2] = color[2];
+		composite.rgba[q * 4 + 3] = 255;
+	}
+	composite.index.clear();
+	composite.opaque.clear();
+	composite.depth.clear();
+	ArtComposites.push_back(std::move(composite));
+}
+
+void BuildTown(LevelGeometry &geometry, MeshBuilder &mesh, MeshBuilder &art)
 {
 	PieceStatsCache.clear();
 	if (const char *dump = std::getenv("DVL_W3D_DUMP_TOWN"); dump != nullptr && dump[0] != '\0')
@@ -1802,6 +2378,60 @@ void BuildTown(LevelGeometry &geometry, MeshBuilder &mesh)
 			smallObject[i] = smallObject[i] != 0 || pieceHeight[index(x, y)] > 32 ? 1 : 0;
 	}
 	std::vector<int> smallObjectOf(static_cast<size_t>(kGridSize) * kGridSize, -1);
+	// Built houses (not replaced by a placed mesh) stand on their volume: the cells of the group inside a full 2 x 2 block
+	// of it. One-cell fences and posts joined to a house stay cut-out cards like the town's other fences; the roofs cover
+	// only volume cells, so no towner or hero tile is ever under one.
+	// Towners stand in porches and open forges that the iso art draws under an eave, some on solid tiles (Griswold at
+	// his anvil): the cells around them stay open, so no wall or roof is built over or right next to a towner.
+	std::vector<uint8_t> townerSpace(static_cast<size_t>(kGridSize) * kGridSize, 0);
+	for (const Towner &towner : Towners) {
+		for (int dy = -1; dy <= 1; ++dy)
+			for (int dx = -1; dx <= 1; ++dx) {
+				const int x = towner.position.x + dx;
+				const int y = towner.position.y + dy;
+				if (x >= 0 && y >= 0 && x < kGridSize && y < kGridSize)
+					townerSpace[index(x, y)] = 1;
+			}
+	}
+	std::vector<uint8_t> houseVolume(static_cast<size_t>(kGridSize) * kGridSize, 0);
+	std::vector<uint8_t> replacedHouse(groups.size(), 0);
+	for (size_t i = 0; i < groups.size(); ++i) {
+		if (isHouse[i] == 0)
+			continue;
+		replacedHouse[i] = std::any_of(groups[i].cells.begin(), groups[i].cells.end(), [](const auto &cell) { return PlacementHidesTile(cell.first, cell.second); }) ? 1 : 0;
+		if (replacedHouse[i] != 0)
+			continue;
+		const auto same = [&](int x, int y) {
+			return x >= 0 && y >= 0 && x < kGridSize && y < kGridSize && groupOf[index(x, y)] == static_cast<int>(i) && townerSpace[index(x, y)] == 0;
+		};
+		for (const auto &[x, y] : groups[i].cells) {
+			for (int oy = -1; oy <= 0 && houseVolume[index(x, y)] == 0; ++oy)
+				for (int ox = -1; ox <= 0; ++ox)
+					if (same(x + ox, y + oy) && same(x + ox + 1, y + oy) && same(x + ox, y + oy + 1) && same(x + ox + 1, y + oy + 1)) {
+						houseVolume[index(x, y)] = 1;
+						break;
+					}
+		}
+	}
+	// Around a built house (its bounding box and the ring of cells next to its volume) the iso art spills eaves, roof
+	// corners and gable ends onto other cells. As cards those stood up through or beside the roof as dark slanted panels,
+	// so there only building art is dropped (IsBuildingArt); trees, signs and fences stay.
+	std::vector<uint8_t> nearBuiltHouse(static_cast<size_t>(kGridSize) * kGridSize, 0);
+	for (size_t i = 0; i < groups.size(); ++i) {
+		if (isHouse[i] == 0 || replacedHouse[i] != 0)
+			continue;
+		for (int y = groups[i].minY; y <= groups[i].maxY; ++y)
+			for (int x = groups[i].minX; x <= groups[i].maxX; ++x)
+				nearBuiltHouse[index(x, y)] = 1;
+		for (const auto &[x, y] : groups[i].cells) {
+			if (houseVolume[index(x, y)] == 0)
+				continue;
+			for (int dy = -1; dy <= 1; ++dy)
+				for (int dx = -1; dx <= 1; ++dx)
+					if (x + dx >= 0 && y + dy >= 0 && x + dx < kGridSize && y + dy < kGridSize)
+						nearBuiltHouse[index(x + dx, y + dy)] = 1;
+		}
+	}
 	for (int y = 0; y < kGridSize; ++y) {
 		for (int x = 0; x < kGridSize; ++x) {
 			const uint16_t piece = dPiece[x][y];
@@ -1809,7 +2439,7 @@ void BuildTown(LevelGeometry &geometry, MeshBuilder &mesh)
 			const float fz = static_cast<float>(y);
 			geometry.occluders[index(x, y)] = 0;
 			const int group = groupOf[index(x, y)];
-			if (group >= 0 && isHouse[static_cast<size_t>(group)] != 0)
+			if (houseVolume[index(x, y)] != 0 || (group >= 0 && isHouse[static_cast<size_t>(group)] != 0 && replacedHouse[static_cast<size_t>(group)] != 0))
 				continue;
 			if (water[index(x, y)] != 0) {
 				// Level with the ground: the creek cells include the painted banks, so lowering whole cells cut a per-cell
@@ -1822,10 +2452,14 @@ void BuildTown(LevelGeometry &geometry, MeshBuilder &mesh)
 			// placed mesh replaces spills its porch and awning art one row past its front (+x / +y) edge: as a card that
 			// art stood next to the mesh as a dark wedge (the smithy's forge beside Griswold).
 			const bool frontOfPlacedHouse = PlacementHidesTile(x - 1, y) || PlacementHidesTile(x, y - 1);
-			if (pieceHeight[index(x, y)] >= 56 && !PlacementHidesTile(x, y) && !frontOfPlacedHouse) {
+			const bool builtHouseArt = nearBuiltHouse[index(x, y)] != 0 && IsBuildingArt(piece);
+			if (pieceHeight[index(x, y)] >= 56 && !PlacementHidesTile(x, y) && !frontOfPlacedHouse && !builtHouseArt) {
 				const PieceStats &stats = CachedPieceStats(piece);
-				if (tile_geometry::GetPieceGeometry(piece).faces == 0 || stats.density < 0.6F)
+				if (tile_geometry::GetPieceGeometry(piece).faces == 0 || stats.density < 0.6F) {
 					cardCell[index(x, y)] = 1;
+					if (nearBuiltHouse[index(x, y)] != 0 && std::getenv("DVL_W3D_DUMP_TOWN") != nullptr)
+						Log("render3d: card next to a house at {},{} (piece {})", x, y, piece);
+				}
 			}
 			// Small solid objects (the well, boulders, stones) stand up as one card object, all their pieces.
 			if (group >= 0 && smallObject[static_cast<size_t>(group)] != 0 && !PlacementHidesTile(x, y) && !frontOfPlacedHouse) {
@@ -1834,19 +2468,88 @@ void BuildTown(LevelGeometry &geometry, MeshBuilder &mesh)
 			}
 		}
 	}
+	// The original art of the built houses (AddArtRelief) covers the art region: the cells of a house group and around one
+	// (nearBuiltHouse: eaves, porches and gables spill onto the cells next to the volume). Its pieces form one composite
+	// per building (art cells within two cells of each other), cut-out objects wholly inside it included (their cards then
+	// belong to the reconstructed houses), with the floor of the volume cells, which the built house covers otherwise. The
+	// host shows it instead of the built houses while the camera keeps the art's angle.
+	// Only for the town without an art pack's 3D houses: a pack that replaces any house keeps the town as it was.
+	const bool townArt = std::getenv("DVL_W3D_NO_TOWN_ART") == nullptr
+	    && std::none_of(replacedHouse.begin(), replacedHouse.end(), [](uint8_t replaced) { return replaced != 0; });
+	std::vector<uint8_t> artRegion(static_cast<size_t>(kGridSize) * kGridSize, 0);
+	std::vector<uint8_t> artCards(artRegion.size(), 0);
+	for (int y = 0; y < kGridSize && townArt; ++y) {
+		for (int x = 0; x < kGridSize; ++x) {
+			const size_t at = index(x, y);
+			const int group = groupOf[at];
+			const bool builtGroup = group >= 0 && isHouse[static_cast<size_t>(group)] != 0 && replacedHouse[static_cast<size_t>(group)] == 0;
+			artRegion[at] = (builtGroup || nearBuiltHouse[at] != 0) && !PlacementHidesTile(x, y) ? 1 : 0;
+		}
+	}
 	if (std::getenv("DVL_W3D_NO_TOWN_CARDS") == nullptr) // debugging: the town without its cut-out objects
-		AddTownCards(mesh, cardCell, pieceHeight, smallObjectOf);
+		AddTownCards(mesh, cardCell, pieceHeight, smallObjectOf, artRegion, artCards);
+	ArtComposites.clear();
+	if (townArt) {
+		std::vector<uint8_t> artCell(static_cast<size_t>(kGridSize) * kGridSize, 0);
+		for (int y = 0; y < kGridSize; ++y) {
+			for (int x = 0; x < kGridSize; ++x) {
+				const size_t at = index(x, y);
+				if (artRegion[at] == 0)
+					continue;
+				if (houseVolume[at] != 0)
+					AddHorizontal(art, static_cast<float>(x), static_cast<float>(y), static_cast<float>(x) + 1.0F, static_cast<float>(y) + 1.0F, 0.0F, true,
+					    FloorSlot(dPiece[x][y]), 1.0F, kVertexTownArt);
+				if ((cardCell[at] == 0 || artCards[at] != 0) && pieceHeight[at] > 0)
+					artCell[at] = 1;
+			}
+		}
+		std::vector<uint8_t> seen(artCell.size(), 0);
+		for (int y = 0; y < kGridSize; ++y) {
+			for (int x = 0; x < kGridSize; ++x) {
+				if (artCell[index(x, y)] == 0 || seen[index(x, y)] != 0)
+					continue;
+				std::vector<std::pair<int, int>> building { { x, y } };
+				seen[index(x, y)] = 1;
+				for (size_t k = 0; k < building.size(); ++k) {
+					const auto [cx, cy] = building[k];
+					for (int dy = -2; dy <= 2; ++dy) {
+						for (int dx = -2; dx <= 2; ++dx) {
+							const int nx = cx + dx;
+							const int ny = cy + dy;
+							if (nx < 0 || ny < 0 || nx >= kGridSize || ny >= kGridSize || artCell[index(nx, ny)] == 0 || seen[index(nx, ny)] != 0)
+								continue;
+							seen[index(nx, ny)] = 1;
+							building.emplace_back(nx, ny);
+						}
+					}
+				}
+				AddArtRelief(art, building);
+			}
+		}
+		if (std::getenv("DVL_W3D_DUMP_TOWN") != nullptr)
+			Log("render3d: town art {} buildings, {} triangles", ArtComposites.size(), art.indices.size() / 3);
+	}
 	for (size_t i = 0; i < groups.size(); ++i) {
 		if (isHouse[i] == 0)
 			continue;
-		// A placed mesh that hides any cell of a house replaces the whole block; its ground is drawn instead.
-		const bool replaced = std::any_of(groups[i].cells.begin(), groups[i].cells.end(), [](const auto &cell) { return PlacementHidesTile(cell.first, cell.second); });
-		if (!replaced) {
-			BuildHouse(geometry, mesh, groups[i], groupOf, static_cast<int>(i), static_cast<int>(i) == cathedral);
+		if (replacedHouse[i] == 0) {
+			const size_t first = mesh.vertices.size();
+			BuildHouse(geometry, mesh, groups[i], houseVolume, static_cast<int>(i) == cathedral);
+			for (size_t v = first; v < mesh.vertices.size(); ++v)
+				mesh.vertices[v].vertex.flags |= kVertexTownHouse;
 			continue;
 		}
+		// A placed mesh that hides any cell of a house replaces the whole block; its ground is drawn instead.
 		for (const auto &[x, y] : groups[i].cells)
 			AddHorizontal(mesh, static_cast<float>(x), static_cast<float>(y), static_cast<float>(x) + 1.0F, static_cast<float>(y) + 1.0F, 0.0F, true, FloorSlot(dPiece[x][y]), 1.0F);
+	}
+	if (std::getenv("DVL_W3D_DUMP_TOWN") != nullptr) {
+		// Towners must never stand under a built roof: roofs cover volume cells only.
+		for (const Towner &towner : Towners) {
+			const Point p = towner.position;
+			const bool covered = p.x >= 0 && p.y >= 0 && p.x < kGridSize && p.y < kGridSize && houseVolume[index(p.x, p.y)] != 0;
+			Log("render3d: towner {} at {},{}{}", static_cast<int>(towner._ttype), p.x, p.y, covered ? " UNDER A BUILT HOUSE" : "");
+		}
 	}
 }
 
@@ -1932,7 +2635,37 @@ void ResolveAtlas(LevelGeometry &geometry, MeshBuilder &mesh)
 	const int wallRegion = wallRows * Atlas.wallSlotHeight;
 	const int cardRows = std::min(cardRowsWanted, std::max(0, (kMaxAtlasHeight - squareRegion - wallRegion) / Atlas.wallSlotHeight));
 	const int cardRegion = cardRows * Atlas.wallSlotHeight;
-	const int height = std::max(32, squareRegion + wallRegion + cardRegion);
+	// Building composites (town art) on shelves below the cards, 32-aligned like every slot so the mips never mix two.
+	// The region starts with a transparent 32 x 32 block: art that does not fit the atlas samples it and is cut out.
+	const int artTop = squareRegion + wallRegion + cardRegion;
+	std::vector<std::array<int, 2>> artOrigin(ArtComposites.size(), { -1, -1 });
+	int artRegion = 0;
+	if (!ArtComposites.empty()) {
+		const auto align = [](int v) { return (v + 31) / 32 * 32; };
+		int shelfX = 32;
+		int shelfY = 0;
+		int shelfHeight = 32;
+		for (size_t i = 0; i < ArtComposites.size(); ++i) {
+			const int w = align(ArtComposites[i].width);
+			const int h = align(ArtComposites[i].height);
+			if (w > kAtlasWidth)
+				continue;
+			if (shelfX + w > kAtlasWidth) {
+				shelfY += shelfHeight;
+				shelfX = 0;
+				shelfHeight = 0;
+			}
+			if (artTop + shelfY + h > kMaxAtlasHeight) {
+				Log("render3d: town art composite {} ({} x {}) does not fit the level atlas", i, ArtComposites[i].width, ArtComposites[i].height);
+				continue;
+			}
+			artOrigin[i] = { shelfX, artTop + shelfY };
+			shelfX += w;
+			shelfHeight = std::max(shelfHeight, h);
+		}
+		artRegion = shelfY + shelfHeight;
+	}
+	const int height = std::max(32, artTop + artRegion);
 	geometry.atlasWidth = kAtlasWidth;
 	geometry.atlasHeight = static_cast<uint32_t>(height);
 	geometry.atlasRgba.assign(static_cast<size_t>(kAtlasWidth) * height * 4, 0);
@@ -1973,6 +2706,15 @@ void ResolveAtlas(LevelGeometry &geometry, MeshBuilder &mesh)
 		slotOrigin(SlotKind::Card, static_cast<int>(i), ox, oy);
 		blit(Atlas.cards[i], ox, oy, 64, Atlas.wallSlotHeight);
 	}
+	for (size_t i = 0; i < ArtComposites.size(); ++i) {
+		const ArtComposite &art = ArtComposites[i];
+		if (artOrigin[i][0] < 0)
+			continue;
+		for (int r = 0; r < art.height; ++r) {
+			std::memcpy(&geometry.atlasRgba[(static_cast<size_t>(artOrigin[i][1] + r) * kAtlasWidth + artOrigin[i][0]) * 4], &art.rgba[static_cast<size_t>(r) * art.width * 4],
+			    static_cast<size_t>(art.width) * 4);
+		}
+	}
 	BuildAtlasMips(geometry);
 
 	geometry.vertices.clear();
@@ -1983,6 +2725,15 @@ void ResolveAtlas(LevelGeometry &geometry, MeshBuilder &mesh)
 		int slot = pending.slot;
 		if (pending.kind == SlotKind::Wall && slot < 0)
 			slot = defaultWall;
+		if (pending.kind == SlotKind::Art) {
+			// A composite that did not fit samples the transparent block at the start of the art region.
+			const bool placed = slot >= 0 && static_cast<size_t>(slot) < artOrigin.size() && artOrigin[static_cast<size_t>(slot)][0] >= 0;
+			WorldVertex vertex = pending.vertex;
+			vertex.u = (placed ? static_cast<float>(artOrigin[static_cast<size_t>(slot)][0]) + pending.s : 16.0F) * invW;
+			vertex.v = (placed ? static_cast<float>(artOrigin[static_cast<size_t>(slot)][1]) + pending.t : static_cast<float>(artTop) + 16.0F) * invH;
+			geometry.vertices.push_back(vertex);
+			continue;
+		}
 		int ox, oy;
 		slotOrigin(pending.kind, slot, ox, oy);
 		WorldVertex vertex = pending.vertex;
@@ -2022,6 +2773,20 @@ void SetExternalDoorModels(uint32_t mask)
 	mask &= 0xFFU;
 	if (mask != ExternalDoorModels) {
 		ExternalDoorModels = mask;
+		ForceRebuild = true;
+	}
+}
+
+void SetExternalDoorAperture(uint32_t family, float width, float height)
+{
+	if (family >= ExternalDoorApertures.size())
+		return;
+	// Native collision is one tile wide; the masonry never narrows below it or rises past the arch contract.
+	const std::array<float, 2> aperture = width > 0.0F && height > 0.0F
+	    ? std::array<float, 2> { std::clamp(width, 1.0F, 2.4F), std::clamp(height, 1.2F, fpv::kDungeonOpeningHeight) }
+	    : std::array<float, 2> { 0.0F, 0.0F };
+	if (aperture != ExternalDoorApertures[family]) {
+		ExternalDoorApertures[family] = aperture;
 		ForceRebuild = true;
 	}
 }
@@ -2127,10 +2892,20 @@ bool UpdateLevelGeometry(LevelGeometry &geometry)
 	mesh.vertices.reserve(200000);
 	mesh.indices.reserve(300000);
 	ResolveLevelPlacements();
+	MeshBuilder art;
+	ArtComposites.clear();
 	if (geometry.isTown)
-		BuildTown(geometry, mesh);
+		BuildTown(geometry, mesh, art);
 	else
 		BuildDungeon(geometry, mesh);
+	// The town art goes after the whole main mesh (vertices and indices), so the main range stays exactly what it was.
+	geometry.mainIndexCount = static_cast<uint32_t>(mesh.indices.size());
+	if (!art.indices.empty()) {
+		const auto base = static_cast<uint32_t>(mesh.vertices.size());
+		mesh.vertices.insert(mesh.vertices.end(), art.vertices.begin(), art.vertices.end());
+		for (const uint32_t i : art.indices)
+			mesh.indices.push_back(base + i);
+	}
 	ApplyPlacementOccluders(geometry.occluders);
 	ResolveAtlas(geometry, mesh);
 	++geometry.generation;

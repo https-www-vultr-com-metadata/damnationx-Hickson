@@ -34,6 +34,12 @@ enum WorldVertexFlag : uint32_t {
 	kVertexBillboard = 1U << 3,   // lit with a camera-facing normal
 	kVertexWater = 1U << 4,       // river surface: moonlit ripple sheen
 	kVertexSoft = 1U << 5,        // biased toward the low-frequency mips (ceilings)
+	/** Tristram building art at the classic projection (BuildTown): drawn by the host at the default isometric camera
+	 * only. These vertices and their triangles come after LevelGeometry::mainIndexCount; renderers that do not switch
+	 * views draw the main range and never see them. */
+	kVertexTownArt = 1U << 6,
+	/** Reconstructed Tristram house (walls, roofs): the fallback the host shows when the camera turns off the art's angle. */
+	kVertexTownHouse = 1U << 7,
 };
 
 constexpr uint32_t PackVertexFlags(uint32_t flags, float albedoScale = 1.0F)
@@ -59,6 +65,8 @@ constexpr uint32_t PackOccluder(float bottom, float top)
 struct LevelGeometry {
 	std::vector<WorldVertex> vertices;
 	std::vector<uint32_t> indices;
+	/** Indices of the main mesh: the town art (kVertexTownArt) follows, with its vertices after every main vertex. */
+	uint32_t mainIndexCount = 0;
 	uint32_t atlasWidth = 0;
 	uint32_t atlasHeight = 0;
 	std::vector<uint8_t> atlasRgba; // atlasWidth * atlasHeight * 4
@@ -77,6 +85,9 @@ struct LevelGeometry {
 /** External loaded door models replace native panels only; bits follow the
  * L1/L2/L3/L5 left/right families. Collision and closed-door occlusion stay native. */
 void SetExternalDoorModels(uint32_t mask);
+/** Masonry aperture (tiles) a loaded external door leaf of `family` (0 L1, 1 L2, 2 L3, 3 L5) fills while its
+ * mask bit is set; zero width or height restores the shared aperture. Clamped to one tile wide and the arch height. */
+void SetExternalDoorAperture(uint32_t family, float width, float height);
 
 /** Rebuilds `geometry` when the level state hash changed (or after InvalidateLevel). Returns true when rebuilt. */
 bool UpdateLevelGeometry(LevelGeometry &geometry);

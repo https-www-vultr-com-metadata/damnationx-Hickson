@@ -530,7 +530,8 @@ bool UploadLevel()
 		return false;
 	wgpuQueueWriteBuffer(Gpu.queue, Gpu.levelVertices, 0, Level.vertices.data(), Level.vertices.size() * sizeof(WorldVertex));
 	wgpuQueueWriteBuffer(Gpu.queue, Gpu.levelIndices, 0, Level.indices.data(), Level.indices.size() * sizeof(uint32_t));
-	Gpu.levelIndexCount = static_cast<uint32_t>(Level.indices.size());
+	// The town art after the main range is for the host's view switch; this renderer draws the main mesh.
+	Gpu.levelIndexCount = Level.mainIndexCount != 0 ? std::min<uint32_t>(Level.mainIndexCount, static_cast<uint32_t>(Level.indices.size())) : static_cast<uint32_t>(Level.indices.size());
 	const auto levels = static_cast<uint32_t>(1 + Level.atlasMips.size());
 	if (Gpu.levelAtlasWidth != Level.atlasWidth || Gpu.levelAtlasHeight != Level.atlasHeight || Gpu.levelAtlasLevels != levels) {
 		ReleaseBindGroups();

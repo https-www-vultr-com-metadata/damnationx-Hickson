@@ -55,6 +55,7 @@ EMSCRIPTEN_KEEPALIVE void dx_host_shutdown() { HostShutdown(); }
 EMSCRIPTEN_KEEPALIVE const char * dx_host_sound_path(uint32_t sound_id) { return HostSoundPath(sound_id); }
 EMSCRIPTEN_KEEPALIVE uint32_t dx_host_read_asset(const char * path, uint8_t * buffer, uint32_t capacity) { return HostReadAsset(path, buffer, capacity); }
 EMSCRIPTEN_KEEPALIVE void dx_host_set_external_door_models(uint32_t mask) { HostSetExternalDoorModels(mask); }
+EMSCRIPTEN_KEEPALIVE void dx_host_set_external_door_aperture(uint32_t family, uint32_t width, uint32_t height) { HostSetExternalDoorAperture(family, width, height); }
 EMSCRIPTEN_KEEPALIVE void dx_host_set_render_mode(HostRenderMode mode) { HostSetRenderMode(mode); }
 EMSCRIPTEN_KEEPALIVE HostRenderMode dx_host_get_render_mode() { return HostGetRenderMode(); }
 EMSCRIPTEN_KEEPALIVE uint32_t dx_host_installed_packs() { return HostInstalledPacks(); }

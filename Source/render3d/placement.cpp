@@ -1,6 +1,7 @@
 // Adapted from Douglas Opan's diablo-3d town map manifest (Source/engine/render/town_editor_map.cpp); modified for
 // DamnationX (see placement.hpp).
 #include "render3d/placement.hpp"
+#include "render3d/fpv_contract.hpp"
 #include "utils/parse_int.hpp"
 
 #include <algorithm>
@@ -581,14 +582,24 @@ std::vector<ResolvedPlacement> ResolvePlacements(const PlacementFile &file, cons
 		// Upgrade the two pinned, normalised stock meshes in already-installed
 		// packs. New packs carry these dimensions in their rules. Custom meshes
 		// and deliberately authored instance transforms remain untouched.
-		if (rule.mesh >= 0 && static_cast<size_t>(rule.mesh) < file.meshes.size() && rule.scale.y < 2.0F) {
+		// Packs generated for the earlier 3.65-tile walls (y 3.67 / 3.65) come down to the current wall height.
+		if (rule.mesh >= 0 && static_cast<size_t>(rule.mesh) < file.meshes.size()) {
 			const PlacementMesh &mesh = file.meshes[static_cast<size_t>(rule.mesh)];
+			constexpr float WallRatio = fpv::kWallHeight / 3.65F;
 			if (mesh.id == "arch_stone" && mesh.sha256 == "8a902f99745b65f5b99f8717c3a982eb2d5eb0a3c4f449f9fa24de5c0c0c0c30") {
-				rule.scale.x *= 3.4F / 1.26F;
-				rule.scale.y *= 3.67F;
+				if (rule.scale.y < 2.0F) {
+					rule.scale.x *= 3.4F / 1.26F;
+					rule.scale.y *= 3.67F * WallRatio;
+				} else if (rule.scale.y > fpv::kWallHeight + 0.5F) {
+					rule.scale.y *= WallRatio;
+				}
 			} else if (mesh.id == "door_arch_wooden" && mesh.sha256 == "4c4be068c681a6d9ed9b38d180cdba56e8147043de69d5f2540cc0c55d81828d") {
-				rule.scale.x *= 4.0F / 2.3F;
-				rule.scale.y *= 3.65F / 0.95F;
+				if (rule.scale.y < 2.0F) {
+					rule.scale.x *= 4.0F / 2.3F;
+					rule.scale.y *= fpv::kWallHeight / 0.95F;
+				} else if (rule.scale.y > fpv::kWallHeight + 0.5F) {
+					rule.scale.y *= WallRatio;
+				}
 			}
 		}
 		if (!LevelMatches(rule, level))
