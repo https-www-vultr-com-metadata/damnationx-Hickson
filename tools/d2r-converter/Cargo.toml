@@ -13,3 +13,7 @@ toml = "0.8"
 png = "0.17"
 image = { version = "0.25", default-features = false }
 sha2 = "0.10"
+
+[dev-dependencies]
+# Checks the KTX2 files the converter writes with the parser Bevy uses.
+ktx2 = "0.5"

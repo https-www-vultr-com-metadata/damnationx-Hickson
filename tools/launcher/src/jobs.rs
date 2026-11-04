@@ -30,6 +30,8 @@ pub struct D2rImportRequest {
     /// from the published glb tree until the whole import validates.
     pub cache_dir: PathBuf,
     pub importer_dir: PathBuf,
+    /// Full converter output for diagnosing failures; None keeps it in memory only.
+    pub log_file: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug)]
@@ -803,11 +805,81 @@ fn incomplete_conversion(line: &str) -> bool {
                 .is_ok_and(|n| n != 0))
 }
 
+/// Full output of the importer's child processes, kept on disk so a failure can
+/// be diagnosed after the launcher's short live log has scrolled or closed.
+#[derive(Clone)]
+struct ProcessLog {
+    path: PathBuf,
+    file: Arc<Mutex<File>>,
+}
+
+impl ProcessLog {
+    /// Starts a fresh log for one import. A log that cannot be created is
+    /// reported but never blocks the import.
+    fn create(path: &Path, reporter: &Reporter) -> Option<Self> {
+        let opened = path
+            .parent()
+            .map_or(Ok(()), fs::create_dir_all)
+            .and_then(|_| File::create(path));
+        match opened {
+            Ok(file) => Some(Self {
+                path: path.to_path_buf(),
+                file: Arc::new(Mutex::new(file)),
+            }),
+            Err(error) => {
+                reporter.log(format!(
+                    "Cannot write the converter log {}: {error}",
+                    path.display()
+                ));
+                None
+            }
+        }
+    }
+
+    fn line(&self, text: &str) {
+        if let Ok(mut file) = self.file.lock() {
+            let _ = writeln!(file, "{text}");
+        }
+    }
+}
+
+/// The line that best explains a failed importer: its own `error:` line when it
+/// printed one, else the last stderr line that is not progress chatter.
+#[derive(Default)]
+struct FailureReason {
+    explicit: Option<String>,
+    last: Option<String>,
+}
+
+impl FailureReason {
+    fn observe(&mut self, line: &str) {
+        let line = line.trim();
+        if line.is_empty() {
+            return;
+        }
+        if line.contains(": error: ") || line.starts_with("error: ") {
+            self.explicit = Some(line.to_owned());
+        } else if !(line.starts_with('[')
+            || line.starts_with("Reusing complete model")
+            || line.starts_with("Converted ")
+            || line.starts_with("mapping: "))
+        {
+            self.last = Some(line.to_owned());
+        }
+    }
+
+    fn line(&self) -> Option<&str> {
+        self.explicit.as_deref().or(self.last.as_deref())
+    }
+}
+
 fn read_output(
     mut input: impl Read + Send + 'static,
     reporter: Reporter,
     tail: Arc<Mutex<VecDeque<String>>>,
     incomplete: Arc<AtomicBool>,
+    log: Option<ProcessLog>,
+    reason: Option<Arc<Mutex<FailureReason>>>,
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         let mut buffer = [0u8; 2048];
@@ -818,6 +890,14 @@ fn read_output(
                 .to_string();
             if incomplete_conversion(&text) {
                 incomplete.store(true, Ordering::Release);
+            }
+            if let Some(log) = &log {
+                log.line(&text);
+            }
+            if let Some(reason) = &reason {
+                if let Ok(mut reason) = reason.lock() {
+                    reason.observe(&text);
+                }
             }
             reporter.log(&text);
             if let Ok(mut tail) = tail.lock() {
@@ -848,22 +928,85 @@ fn read_output(
     })
 }
 
+/// NTSTATUS values a child exits with when Windows itself stopped it. A player
+/// sees these as large hex exit codes, so name the usual cause.
+fn windows_status_meaning(code: u32) -> Option<&'static str> {
+    Some(match code {
+        0xC000_0135 => "a required DLL was not found; install the Microsoft Visual C++ 2015-2022 x64 Redistributable",
+        0xC000_007B => "a DLL is for the wrong architecture or damaged; reinstall the Microsoft Visual C++ 2015-2022 x64 Redistributable",
+        0xC000_0139 | 0xC000_0142 => "a required DLL failed to load",
+        0xC000_0005 => "it crashed with an access violation",
+        0xC000_00FD => "it crashed with a stack overflow",
+        0xC000_0409 => "it aborted on an internal check",
+        0xC000_0017 | 0xC000_009A => "the system ran out of memory",
+        0xC000_0022 => "access was denied; antivirus may be blocking it",
+        _ => return None,
+    })
+}
+
+fn describe_exit(program: &Path, status: std::process::ExitStatus) -> String {
+    let name = program.file_name().map_or_else(
+        || program.display().to_string(),
+        |n| n.to_string_lossy().into_owned(),
+    );
+    match status
+        .code()
+        .and_then(|code| windows_status_meaning(code as u32))
+    {
+        Some(meaning) => format!("{name} exited with {status} ({meaning})"),
+        None => format!("{name} exited with {status}"),
+    }
+}
+
+/// Failure text for the launcher notice: the reason first, then where the full
+/// output is. Without a log file, the last output lines stand in for it.
+fn failure_message(
+    exit: &str,
+    reason: Option<&str>,
+    log: Option<&Path>,
+    tail: &[String],
+) -> String {
+    let mut message = match reason {
+        Some(reason) => format!("{reason}\n{exit}."),
+        None => format!("{exit} without an error message."),
+    };
+    match log {
+        Some(log) => message.push_str(&format!(" Full log: {}", log.display())),
+        None => {
+            let start = tail.len().saturating_sub(8);
+            for line in &tail[start..] {
+                message.push('\n');
+                message.push_str(line);
+            }
+        }
+    }
+    message
+}
+
 fn run(
     program: &Path,
     args: &[OsString],
     cwd: &Path,
     environment: &[(OsString, OsString)],
     reporter: &Reporter,
+    log: Option<&ProcessLog>,
 ) -> Result<Vec<String>, String> {
     reporter.check()?;
-    reporter.log(format!(
+    let command_line = format!(
         "Running {} {}",
         program.display(),
         args.iter()
             .map(|a| a.to_string_lossy())
             .collect::<Vec<_>>()
             .join(" ")
-    ));
+    );
+    if let Some(log) = log {
+        log.line(&format!(
+            "\n{command_line}\n(working folder {})",
+            cwd.display()
+        ));
+    }
+    reporter.log(command_line);
     let mut command = Command::new(program);
     command
         .args(args)
@@ -882,9 +1025,19 @@ fn run(
         use std::os::windows::process::CommandExt;
         command.creation_flags(0x08000000);
     }
-    let mut child = command
-        .spawn()
-        .map_err(|e| format!("Cannot start {}: {e}", program.display()))?;
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            let message = format!(
+                "Cannot start {}: {error}. Re-extract the full package; if antivirus quarantined it, restore it or allow it.",
+                program.display()
+            );
+            if let Some(log) = log {
+                log.line(&message);
+            }
+            return Err(message);
+        }
+    };
     let group = match ChildGroup::new(&child) {
         Ok(group) => group,
         Err(error) => {
@@ -897,31 +1050,36 @@ fn run(
     };
     let tail = Arc::new(Mutex::new(VecDeque::new()));
     let incomplete = Arc::new(AtomicBool::new(false));
+    let reason = Arc::new(Mutex::new(FailureReason::default()));
     let output = read_output(
         child.stdout.take().unwrap(),
         reporter.clone(),
         tail.clone(),
         incomplete.clone(),
+        log.cloned(),
+        None,
     );
     let errors = read_output(
         child.stderr.take().unwrap(),
         reporter.clone(),
         tail.clone(),
         incomplete.clone(),
+        log.cloned(),
+        Some(reason.clone()),
     );
     let result = loop {
         if reporter.check().is_err() {
             group.kill();
             let _ = child.kill();
             let _ = child.wait();
-            break Err("Cancelled; importer and helper processes stopped".into());
+            break Err("Cancelled; importer and helper processes stopped".to_string());
         }
         match child.try_wait() {
             Ok(Some(status)) => {
                 break if status.success() {
                     Ok(())
                 } else {
-                    Err(format!("{} exited with {status}", program.display()))
+                    Err(describe_exit(program, status))
                 }
             }
             Ok(None) => thread::sleep(Duration::from_millis(50)),
@@ -944,21 +1102,24 @@ fn run(
         .iter()
         .cloned()
         .collect::<Vec<_>>();
-    result.map_err(|e| {
-        format!(
-            "{e}\n{}",
-            lines
-                .iter()
-                .rev()
-                .take(8)
-                .cloned()
-                .collect::<Vec<_>>()
-                .into_iter()
-                .rev()
-                .collect::<Vec<_>>()
-                .join("\n")
-        )
-    })?;
+    if let Some(log) = log {
+        log.line(&match &result {
+            Ok(()) => "Finished successfully".to_string(),
+            Err(error) => error.clone(),
+        });
+    }
+    if let Err(exit) = result {
+        if reporter.check().is_err() {
+            return Err(exit);
+        }
+        let reason = reason.lock().ok();
+        return Err(failure_message(
+            &exit,
+            reason.as_ref().and_then(|reason| reason.line()),
+            log.map(|log| log.path.as_path()),
+            &lines,
+        ));
+    }
     if incomplete.load(Ordering::Acquire) {
         return Err("Importer reported failed conversions or unresolved mapping problems; previous installation preserved".into());
     }
@@ -1076,15 +1237,85 @@ fn import_d2r_with_converter(
     if !has_recipes {
         return Err("Importer recipes are missing; choose resources/d2r-import or the repository's tools/d2r-import".into());
     }
+    let log = request
+        .log_file
+        .as_deref()
+        .and_then(|path| ProcessLog::create(path, reporter));
+    if let Some(log) = &log {
+        log.line(&format!(
+            "DamnationX launcher {} on {} {}\nD2R install: {}\nCache: {}\nImporter: {}\nConverter: {}",
+            env!("CARGO_PKG_VERSION"),
+            std::env::consts::OS,
+            std::env::consts::ARCH,
+            request.game_dir.display(),
+            request.cache_dir.display(),
+            request.importer_dir.display(),
+            converter
+                .as_ref()
+                .map_or_else(|| "unavailable".into(), |c| c.display().to_string()),
+        ));
+        reporter.log(format!("Converter log: {}", log.path.display()));
+    }
+    let result = convert_d2r(request, reporter, converter, log.as_ref());
+    if let (Err(error), Some(log)) = (&result, &log) {
+        log.line(&format!("\nImport failed: {error}"));
+    }
+    match (result, &log) {
+        (Err(error), Some(log)) if !error.contains("Full log: ") && reporter.check().is_ok() => {
+            Err(format!("{error}\nFull log: {}", log.path.display()))
+        }
+        (result, _) => result,
+    }
+}
+
+/// On Windows the converter needs the Visual C++ runtime DLLs that ship beside
+/// the launcher, not beside the converter in resources/d2r-import/bin. Without
+/// the system-wide redistributable it could not start (0xC0000135), so put the
+/// launcher folder first on the child's DLL search path.
+fn converter_environment() -> Vec<(OsString, OsString)> {
+    if !cfg!(windows) {
+        return Vec::new();
+    }
+    let Some(folder) = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(Path::to_path_buf))
+    else {
+        return Vec::new();
+    };
+    let existing = std::env::var_os("PATH").unwrap_or_default();
+    let paths = std::iter::once(folder).chain(std::env::split_paths(&existing));
+    std::env::join_paths(paths)
+        .map(|joined| vec![(OsString::from("PATH"), joined)])
+        .unwrap_or_default()
+}
+
+fn convert_d2r(
+    request: &D2rImportRequest,
+    reporter: &Reporter,
+    converter: Option<PathBuf>,
+    log: Option<&ProcessLog>,
+) -> Result<PathBuf, String> {
     let destination = request.cache_dir.join("glb");
     let mut stage = Stage::new(&destination)?;
     let mut work = crate::d2r_resume::Work::open(&request.cache_dir, &request.game_dir)?;
-    let cache = work.cache.canonicalize().map_err(|e| e.to_string())?;
-    let game = request.game_dir.canonicalize().map_err(|e| e.to_string())?;
-    let importer = request
-        .importer_dir
-        .canonicalize()
-        .map_err(|e| e.to_string())?;
+    let cache = work.cache.canonicalize().map_err(|e| {
+        format!(
+            "Cannot open the conversion cache {}: {e}",
+            work.cache.display()
+        )
+    })?;
+    let game = request.game_dir.canonicalize().map_err(|e| {
+        format!(
+            "Cannot open the D2R folder {}: {e}",
+            request.game_dir.display()
+        )
+    })?;
+    let importer = request.importer_dir.canonicalize().map_err(|e| {
+        format!(
+            "Cannot open the importer folder {}: {e}",
+            request.importer_dir.display()
+        )
+    })?;
     reporter.log(format!(
         "Conversion work is retained at {} for retries after failure or cancellation",
         cache.display()
@@ -1171,7 +1402,14 @@ fn import_d2r_with_converter(
                 args.push(importer.join(recipe).into_os_string());
             }
             reporter.progress(label, index as u64, Some(steps.len() as u64));
-            run(&converter, &args, &importer, &[], reporter)?;
+            run(
+                &converter,
+                &args,
+                &importer,
+                &converter_environment(),
+                reporter,
+                log,
+            )?;
             let status = assets::inspect(&AssetPaths {
                 d2r_dir: Some(cache.join("glb")),
                 ..Default::default()
@@ -1367,7 +1605,14 @@ fn import_d2r_sounds(
         result_root = payload;
     }
     reporter.progress("Importing owned D2R classic and remastered sounds", 0, None);
-    run(&program, &args, program.parent().unwrap(), &[], reporter)?;
+    run(
+        &program,
+        &args,
+        program.parent().unwrap(),
+        &[],
+        reporter,
+        None,
+    )?;
     for (index, name) in assets::D2R_SOUND_PACKS.iter().enumerate() {
         reporter.check()?;
         reporter.progress("Validating imported sound packs", index as u64, Some(2));
@@ -1552,6 +1797,7 @@ echo 'Imported 1 classic and 1 remastered sound'
             game_dir: game,
             cache_dir: temp.path().join("cache"),
             importer_dir: temp.path().join("no recipes"),
+            log_file: None,
         };
         // The install is accepted; the request stops at the missing recipes instead.
         let error = import_d2r_with_converter(&request, &reporter(), None).unwrap_err();
@@ -1954,6 +2200,80 @@ echo 'Imported 1 classic and 1 remastered sound'
             assert!(!incomplete_conversion(line));
         }
     }
+    #[test]
+    fn failure_reason_prefers_the_converters_error_line_over_progress() {
+        let mut reason = FailureReason::default();
+        for line in [
+            "[1/114] Converting hero",
+            "warning: slow disk",
+            "Reusing complete model x",
+        ] {
+            reason.observe(line);
+        }
+        assert_eq!(reason.line(), Some("warning: slow disk"));
+        reason.observe("d2r-convert: error: mapping-all: d2rtool could not open the D2R archives");
+        reason.observe("[2/114] Converting rogue");
+        assert_eq!(
+            reason.line(),
+            Some("d2r-convert: error: mapping-all: d2rtool could not open the D2R archives")
+        );
+        assert!(windows_status_meaning(0xC000_0135)
+            .unwrap()
+            .contains("Visual C++"));
+    }
+    /// A failing converter's whole output lands in the log file, and the notice
+    /// leads with its error line and names the log instead of a bare exit code.
+    #[cfg(unix)]
+    #[test]
+    fn failed_converter_reports_its_reason_and_log_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let program = temp.path().join("d2r-convert");
+        fs::write(
+            &program,
+            "#!/bin/sh\necho '[1/2] Converting hero' >&2\necho stdout line\necho 'd2r-convert: error: mapping-all: Cannot write /x: No space left on device' >&2\nexit 1\n",
+        )
+        .unwrap();
+        fs::set_permissions(&program, fs::Permissions::from_mode(0o755)).unwrap();
+        let log_path = temp.path().join("launcher/d2r-convert.log");
+        let log = ProcessLog::create(&log_path, &reporter()).unwrap();
+        let error = run(
+            &program,
+            &["mapping-all".into()],
+            temp.path(),
+            &[],
+            &reporter(),
+            Some(&log),
+        )
+        .unwrap_err();
+        let mut lines = error.lines();
+        assert_eq!(
+            lines.next(),
+            Some("d2r-convert: error: mapping-all: Cannot write /x: No space left on device")
+        );
+        let exit = lines.next().unwrap();
+        assert!(
+            exit.starts_with("d2r-convert exited with exit status: 1."),
+            "{exit}"
+        );
+        assert!(
+            exit.ends_with(&format!("Full log: {}", log_path.display())),
+            "{exit}"
+        );
+        let written = fs::read_to_string(&log_path).unwrap();
+        for expected in [
+            "Running ",
+            "[1/2] Converting hero",
+            "stdout line",
+            "No space left",
+            "exit status: 1",
+        ] {
+            assert!(
+                written.contains(expected),
+                "{expected} missing from {written}"
+            );
+        }
+    }
     #[cfg(unix)]
     #[test]
     fn rust_importer_transaction_validates_phases_and_preserves_published_assets_on_failure() {
@@ -2003,6 +2323,7 @@ echo 'Imported 1 classic and 1 remastered sound'
             game_dir: game.clone(),
             cache_dir: cache.clone(),
             importer_dir: importer,
+            log_file: None,
         };
         let dest = import_d2r(&request, &reporter()).unwrap();
         let original = fs::read(dest.join("mapping.resolved.json")).unwrap();
@@ -2042,6 +2363,7 @@ echo 'Imported 1 classic and 1 remastered sound'
             game_dir: game,
             cache_dir: cache,
             importer_dir: importer,
+            log_file: None,
         };
         let dest = import_d2r_with_converter(&request, &reporter(), Some(converter)).unwrap();
         let status = assets::inspect(&AssetPaths {
@@ -2111,6 +2433,7 @@ echo 'Imported 1 classic and 1 remastered sound'
                     ),
                 ],
                 &worker_reporter,
+                None,
             )
         });
         let deadline = Instant::now() + Duration::from_secs(4);

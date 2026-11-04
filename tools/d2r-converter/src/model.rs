@@ -50,6 +50,19 @@ fn vector(v: &Value) -> Result<Vec<f64>, String> {
         .map(number)
         .collect()
 }
+/// Ground dressing baked into an object model: D2R's alpha-blended terrain decals (the sand and grunge
+/// under the Act 2 `chest_3`). Without D2R's blend shader they import as opaque quads, and their desert
+/// textures never match a Diablo floor, so they are left out.
+fn is_ground_dressing(material: &Value) -> bool {
+    material["Maps"].as_array().into_iter().flatten().any(|map| {
+        map["Usage"].as_str() == Some("AlbedoTexture")
+            && map["Map"]["Texture"]["FromFileName"].as_str().is_some_and(|path| {
+                let path = path.replace('\\', "/").to_ascii_lowercase();
+                path.contains("env/texture/global/decal/") || path.contains("env/texture/terrain/")
+            })
+    })
+}
+
 fn f32bytes(values: &[f64]) -> Vec<u8> {
     values
         .iter()
@@ -498,6 +511,12 @@ where
                 if tri.iter().any(|i| *i as usize >= verts.len()) {
                     return Err("triangle index outside vertex buffer".into());
                 }
+                let group_material = mats
+                    .get(group["MaterialIndex"].as_u64().unwrap_or(0) as usize)
+                    .and_then(|x| x.get("Material"));
+                if group_material.is_some_and(is_ground_dressing) {
+                    continue;
+                }
                 let bytes: Vec<u8> = tri.iter().flat_map(|i| i.to_le_bytes()).collect();
                 let acc = g.accessor(&bytes, UINT, tri.len(), 1, false, None, Some(34963))?;
                 let mut prim = json!({"attributes":attrs,"indices":acc});
@@ -527,7 +546,7 @@ where
                                     *t
                                 } else {
                                     let t = match texture_png(path, kind)? {
-                                        Some(bytes) => Some(g.image_png(&bytes, path)?),
+                                        Some(bytes) => Some(g.image(&bytes, path)?),
                                         None => None,
                                     };
                                     textures.insert(key, t);
@@ -794,5 +813,14 @@ mod tests {
             .contains(&json!(holder_id)));
         let mesh_node = &nodes[holder["children"][0].as_u64().unwrap() as usize];
         assert!(mesh_node.get("skin").is_none());
+    }
+
+    #[test]
+    fn terrain_decals_baked_into_objects_are_ground_dressing() {
+        let material = |path: &str| json!({"Maps":[{"Usage":"AlbedoTexture","Map":{"Texture":{"FromFileName":path}}}]});
+        assert!(is_ground_dressing(&material("data/hd/env/texture/global/decal/act2/town/decal_sand_fade01_ALB.texture")));
+        assert!(is_ground_dressing(&material("Data\\HD\\env\\texture\\terrain\\act2\\town\\act2_town_sand_base01_alb.texture")));
+        assert!(!is_ground_dressing(&material("data/hd/objects/chests/chest_3/texture/chest_3_alb.texture")));
+        assert!(!is_ground_dressing(&material("data/hd/objects/traps/floor_trap/texture/floor_trap_alb.texture")));
     }
 }

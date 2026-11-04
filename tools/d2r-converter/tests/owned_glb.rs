@@ -24,23 +24,24 @@ fn validate(path: &std::path::Path) -> (BTreeMap<String, BTreeSet<String>>, usiz
         let bytes = binary
             .get(off..off + size)
             .expect("image bufferView outside GLB");
-        let decoder = png::Decoder::new(bytes);
-        let mut reader = decoder.read_info().expect("invalid PNG");
-        let mut pixels = vec![0; reader.output_buffer_size()];
-        let info = reader.next_frame(&mut pixels).expect("PNG decode failed");
-        pixels.truncate(info.buffer_size());
-        if info.color_type == png::ColorType::Rgb {
-            pixels = pixels
-                .chunks_exact(3)
-                .flat_map(|p| [p[0], p[1], p[2], 255])
-                .collect();
-        }
-        let hash = format!(
-            "{}x{}:{:x}",
-            info.width,
-            info.height,
-            Sha256::digest(&pixels)
-        );
+        let (width, height, pixels) = if d2r_converter::texture::is_ktx2(bytes) {
+            let image = d2r_converter::texture::decode_ktx2(bytes).expect("invalid KTX2");
+            (image.width, image.height, image.rgba)
+        } else {
+            let decoder = png::Decoder::new(bytes);
+            let mut reader = decoder.read_info().expect("invalid PNG");
+            let mut pixels = vec![0; reader.output_buffer_size()];
+            let info = reader.next_frame(&mut pixels).expect("PNG decode failed");
+            pixels.truncate(info.buffer_size());
+            if info.color_type == png::ColorType::Rgb {
+                pixels = pixels
+                    .chunks_exact(3)
+                    .flat_map(|p| [p[0], p[1], p[2], 255])
+                    .collect();
+            }
+            (info.width, info.height, pixels)
+        };
+        let hash = format!("{width}x{height}:{:x}", Sha256::digest(&pixels));
         by_name
             .entry(
                 image["name"]
@@ -98,7 +99,7 @@ fn validate_owned_glb_and_compare_legacy_images() {
         .iter()
         .filter(|(n, v)| old.get(*n).is_some_and(|old| old == *v))
         .count();
-    eprintln!("validated {new_count} new and {old_count} legacy PNG references; {equal}/{names} shared names decode identically");
+    eprintln!("validated {new_count} new and {old_count} legacy image references; {equal}/{names} shared names decode identically");
     for (name, hashes) in &new {
         if let Some(previous) = old.get(name) {
             if previous != hashes {

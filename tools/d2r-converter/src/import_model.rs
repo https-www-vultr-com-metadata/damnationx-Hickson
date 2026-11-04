@@ -46,12 +46,19 @@ fn png_with_dye(
     dyes: &BTreeMap<String, String>,
     limit: u32,
 ) -> Result<Option<Vec<u8>>, String> {
-    let mut image = texture::decode(&access.read(path)?, 0)?;
+    let source = access.read(path)?;
+    let dye = dyes
+        .iter()
+        .find(|(needle, _)| path.to_lowercase().contains(&needle.to_lowercase()))
+        .filter(|_| usage == "albedo");
+    if dye.is_none() {
+        if let Some(ktx2) = texture::gpu_texture(&source, usage, limit)? {
+            return Ok(Some(ktx2));
+        }
+    }
+    let mut image = texture::decode(&source, 0)?;
     if usage == "albedo" {
-        if let Some((_, color)) = dyes
-            .iter()
-            .find(|(needle, _)| path.to_lowercase().contains(&needle.to_lowercase()))
-        {
+        if let Some((_, color)) = dye {
             let color = color.strip_prefix('#').ok_or("Invalid dye color")?;
             if color.len() != 6 || !color.is_ascii() {
                 return Err("Invalid dye color".into());

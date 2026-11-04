@@ -581,7 +581,7 @@ mod combine_tests {
         let indices = g
             .accessor(&[0; 6], crate::gltf::USHORT, 3, 1, false, None, None)
             .unwrap();
-        let texture = g.image_png(b"png", "asset").unwrap();
+        let texture = g.image(b"png", "asset").unwrap();
         let material = g
             .add(
                 "materials",
@@ -783,7 +783,11 @@ fn environment_png(
     usage: &str,
     max: u32,
 ) -> Result<Option<Vec<u8>>, String> {
-    let mut image = crate::texture::decode(&access.read(path)?, 0)?;
+    let source = access.read(path)?;
+    if let Some(ktx2) = crate::texture::gpu_texture(&source, usage, max.max(1))? {
+        return Ok(Some(ktx2));
+    }
+    let mut image = crate::texture::decode(&source, 0)?;
     if usage == "normal" {
         for pixel in image.rgba.chunks_exact_mut(4) {
             let x = f32::from(pixel[3]) / 127.5 - 1.;

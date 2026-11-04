@@ -2,7 +2,14 @@
 use crate::model::{self, Part};
 use serde_json::{json, Value};
 
+/// Whether more than 1% of an embedded image (PNG or KTX2) is under half alpha.
 fn alpha_coverage(png: &[u8]) -> Result<bool, String> {
+    if crate::texture::is_ktx2(png) {
+        let image = crate::texture::decode_ktx2(png)?;
+        let count = image.rgba.len() / 4;
+        let transparent = image.rgba.chunks_exact(4).filter(|p| p[3] < 128).count();
+        return Ok(count > 0 && transparent * 100 > count);
+    }
     let mut decoder = png::Decoder::new(png);
     decoder.set_transformations(png::Transformations::EXPAND | png::Transformations::STRIP_16);
     let mut reader = decoder.read_info().map_err(|e| e.to_string())?;

@@ -53,6 +53,11 @@ impl SoundPack {
     }
 }
 
+/// Bump to make every player's next launch clear the D2R import and convert it again,
+/// for converter changes an old import cannot pick up (generation 1: GPU-compressed
+/// textures and runtime lower-detail models).
+const FORCED_REIMPORT: u32 = 1;
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 struct Settings {
@@ -77,6 +82,8 @@ struct Settings {
     rt_quality: String,
     sound_pack: SoundPack,
     legacy_options: String,
+    /// The last [`FORCED_REIMPORT`] generation this player's import was refreshed for.
+    reimport_generation: u32,
 }
 
 impl Default for Settings {
@@ -101,6 +108,7 @@ impl Default for Settings {
             rt_quality: "low".into(),
             sound_pack: SoundPack::Original,
             legacy_options: Launcher::defaults().text(),
+            reimport_generation: 0,
         }
     }
 }
@@ -463,11 +471,12 @@ fn launch_plan(
                 },
             ),
         );
-        let d2r = ready
-            .d2r_mapping
-            .path
-            .as_ref()
-            .or(ready.d2r_environment.path.as_ref());
+        // Only a folder that holds a valid import: a D2R install folder entered as
+        // the models folder would make the game look for imports that aren't there.
+        let d2r = [&ready.d2r_mapping, &ready.d2r_environment]
+            .into_iter()
+            .find(|status| status.ready)
+            .and_then(|status| status.path.as_ref());
         if !settings.use_d2r {
             // The host finds the managed import by default; --d2r off makes it ignore all of it.
             push("--d2r", OsStr::new("off"));
@@ -568,6 +577,9 @@ struct DesktopLauncher {
     confirm_clear: bool,
     game_process: Option<std::process::Child>,
     game_log: Option<PathBuf>,
+    /// Choices to put back once a forced re-import finishes: clearing and importing
+    /// reset them.
+    forced_restore: Option<(bool, bool, bool, SoundPack)>,
     #[cfg(feature = "trainer")]
     trainer: Option<PathBuf>,
 }
@@ -608,11 +620,96 @@ impl DesktopLauncher {
             confirm_clear: false,
             game_process: None,
             game_log: None,
+            forced_restore: None,
             #[cfg(feature = "trainer")]
             trainer: _trainer,
         };
         result.refresh();
+        result.queue_forced_reimport();
         result
+    }
+
+    /// First launch of a build with a newer [`FORCED_REIMPORT`]: clear the old D2R
+    /// import (including the converter's extraction cache) and convert it again
+    /// from the player's install, sounds included when they were imported.
+    fn queue_forced_reimport(&mut self) {
+        if self.settings.reimport_generation >= FORCED_REIMPORT {
+            return;
+        }
+        let cache = self.paths.d2r_cache.clone();
+        let sounds_imported = assets::D2R_SOUND_PACKS
+            .iter()
+            .any(|name| self.paths.sound_mods.join(name).exists());
+        let art_imported = cache.join(d2r_cache::ART_STAMP).is_file() || cache.join("glb").is_dir();
+        if !art_imported && !sounds_imported {
+            // Nothing imported yet: the first import is already current.
+            self.settings.reimport_generation = FORCED_REIMPORT;
+            return;
+        }
+        let saved_install = std::fs::read_to_string(cache.join("game_dir.txt"))
+            .ok()
+            .map(|text| PathBuf::from(text.trim()));
+        let Some(game) = self
+            .settings
+            .d2r_install
+            .clone()
+            .into_iter()
+            .chain(saved_install)
+            .find(|path| assets::is_d2r_install(path))
+        else {
+            // Without the install the import could not be rebuilt; keep it and try next launch.
+            self.log("D2R import update skipped: the D2R installation was not found".into());
+            return;
+        };
+        let art = art_imported
+            .then(|| {
+                assets::select_importer(self.settings.importer.as_deref(), &assets::detect().importers)
+                    .map(|importer| {
+                        JobRequest::ImportD2r(D2rImportRequest {
+                            game_dir: game.clone(),
+                            cache_dir: cache.clone(),
+                            importer_dir: importer,
+                            log_file: Some(self.paths.config_dir.join("d2r-convert.log")),
+                        })
+                    })
+            })
+            .flatten();
+        if art_imported && art.is_none() {
+            self.log("D2R import update skipped: the importer files were not found".into());
+            return;
+        }
+        let sounds = sounds_imported
+            .then(|| sound_import_request(&self.settings, &self.paths, game.clone()).ok())
+            .flatten()
+            .map(JobRequest::ImportD2rSounds);
+        let protected = [
+            Some(game.clone()),
+            self.settings.data_dir.clone(),
+            Some(self.paths.hd_dir.clone()),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        self.settings.d2r_install = Some(game);
+        self.settings.reimport_generation = FORCED_REIMPORT;
+        self.forced_restore = Some((
+            self.settings.use_d2r,
+            self.settings.use_models,
+            self.settings.use_environment,
+            self.settings.sound_pack,
+        ));
+        self.log("This version converts D2R art differently; clearing and re-importing it once".into());
+        self.notice = Some((
+            false,
+            "Updating your D2R import for this version (smaller textures). This runs once.".into(),
+        ));
+        self.queued_jobs.push_back(JobRequest::ClearD2r {
+            cache_dir: cache.clone(),
+            sound_mods: self.paths.sound_mods.clone(),
+            protected,
+        });
+        self.queued_jobs.extend(art);
+        self.queued_jobs.extend(sounds);
     }
 
     fn start(&mut self, request: JobRequest) {
@@ -805,6 +902,16 @@ impl DesktopLauncher {
             self.job = None;
             self.progress = None;
             self.cancelling = false;
+            if self.queued_jobs.is_empty() {
+                if let Some((use_d2r, use_models, use_environment, sound_pack)) =
+                    self.forced_restore.take()
+                {
+                    self.settings.use_d2r = use_d2r;
+                    self.settings.use_models = use_models;
+                    self.settings.use_environment = use_environment;
+                    self.settings.sound_pack = sound_pack;
+                }
+            }
             if !self.close_after_job {
                 if let Some(next) = self.queued_jobs.pop_front() {
                     self.start(next);
@@ -915,6 +1022,7 @@ impl DesktopLauncher {
             game_dir: game,
             cache_dir: self.paths.d2r_cache.clone(),
             importer_dir: importer,
+            log_file: Some(self.paths.config_dir.join("d2r-convert.log")),
         }));
     }
 
@@ -1820,6 +1928,61 @@ mod tests {
         assert_eq!(plan.game, game.canonicalize().unwrap());
     }
 
+
+    /// The first launch of a build with a newer FORCED_REIMPORT clears and rebuilds
+    /// an existing import once, and does nothing for players without one.
+    #[test]
+    fn forced_reimport_runs_once_for_existing_imports() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let paths = CachePaths {
+            config_dir: root.join("config"),
+            hd_dir: root.join("hd"),
+            d2r_cache: root.join("d2r-models"),
+            sound_mods: root.join("mods"),
+        };
+        let install = root.join("D2R");
+        std::fs::create_dir_all(install.join("Data")).unwrap();
+        std::fs::write(install.join(".build.info"), "Version!STRING:0\n3.3\n").unwrap();
+        let importer = root.join("d2r-import");
+        std::fs::create_dir_all(&importer).unwrap();
+        std::fs::write(importer.join("mapping.toml"), "").unwrap();
+        std::fs::write(importer.join("env_mapping.toml"), "").unwrap();
+        let settings = Settings {
+            d2r_install: Some(install.clone()),
+            importer: Some(importer),
+            use_environment: false,
+            ..Default::default()
+        };
+        let launcher = |settings: &Settings| {
+            DesktopLauncher::new(settings.clone(), paths.clone(), root.join("settings.json"), None, None)
+        };
+
+        // Nothing imported yet: the first import is already current.
+        let fresh = launcher(&settings);
+        assert_eq!(fresh.settings.reimport_generation, FORCED_REIMPORT);
+        assert!(fresh.queued_jobs.is_empty());
+
+        // An older import is cleared, then converted again from the same install.
+        std::fs::create_dir_all(paths.d2r_cache.join("glb")).unwrap();
+        let old = launcher(&settings);
+        assert_eq!(old.settings.reimport_generation, FORCED_REIMPORT);
+        assert!(matches!(old.queued_jobs.front(), Some(JobRequest::ClearD2r { .. })));
+        assert!(matches!(
+            old.queued_jobs.get(1),
+            Some(JobRequest::ImportD2r(request)) if request.game_dir == install
+        ));
+        assert_eq!(old.forced_restore, Some((true, true, false, SoundPack::Original)));
+
+        // Once refreshed, later launches leave it alone.
+        let current = launcher(&Settings { reimport_generation: FORCED_REIMPORT, ..settings.clone() });
+        assert!(current.queued_jobs.is_empty() && current.forced_restore.is_none());
+
+        // Without the install the import is kept and the update waits.
+        let missing = launcher(&Settings { d2r_install: None, ..settings });
+        assert_eq!(missing.settings.reimport_generation, 0);
+        assert!(missing.queued_jobs.is_empty());
+    }
     #[test]
     fn d2r_switch_flips_art_interface_and_sounds_without_import() {
         let temp = tempfile::tempdir().unwrap();
@@ -1846,6 +2009,18 @@ mod tests {
         assert!(has(&on, ["--d2r-models", "on"]) && has(&on, ["--d2r-env", "on"]));
         assert!(on.iter().any(|a| a == "--d2r-dir"));
         assert!(on.iter().any(|a| a == "Mods.d2r-sounds-advanced=1"));
+        // A models folder without a valid import (such as the D2R install folder)
+        // is not passed on when characters and world assets are switched off.
+        let (mapping, environment) = (status.d2r_mapping.ready, status.d2r_environment.ready);
+        status.d2r_mapping.ready = false;
+        status.d2r_environment.ready = false;
+        settings.use_models = false;
+        settings.use_environment = false;
+        assert!(!args(&settings, &status).iter().any(|a| a == "--d2r-dir"));
+        settings.use_models = true;
+        settings.use_environment = true;
+        status.d2r_mapping.ready = mapping;
+        status.d2r_environment.ready = environment;
         settings.use_d2r = false;
         let off = args(&settings, &status);
         assert!(has(&off, ["--d2r-models", "off"]) && has(&off, ["--d2r-env", "off"]));

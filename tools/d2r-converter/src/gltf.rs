@@ -100,11 +100,17 @@ impl Gltf {
         }
         self.add("accessors", acc)
     }
-    pub fn image_png(&mut self, png: &[u8], name: &str) -> Result<usize, String> {
-        let view = self.view(png, None)?;
+    /// Embeds an encoded image (PNG, or KTX2 from [`crate::texture::gpu_texture`]) and adds a texture for it.
+    pub fn image(&mut self, bytes: &[u8], name: &str) -> Result<usize, String> {
+        let mime = if crate::texture::is_ktx2(bytes) {
+            "image/ktx2"
+        } else {
+            "image/png"
+        };
+        let view = self.view(bytes, None)?;
         let source = self.add(
             "images",
-            json!({"bufferView":view,"mimeType":"image/png","name":name}),
+            json!({"bufferView":view,"mimeType":mime,"name":name}),
         )?;
         if self.doc["samplers"].as_array().unwrap().is_empty() {
             self.add(
@@ -157,7 +163,7 @@ mod tests {
                 .unwrap(),
             0
         );
-        g.image_png(&[9, 8], "image").unwrap();
+        g.image(&[9, 8], "image").unwrap();
         let bytes = g.finish().unwrap();
         assert_eq!(&bytes[..4], b"glTF");
         assert_eq!(

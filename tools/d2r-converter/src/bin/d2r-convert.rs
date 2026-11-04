@@ -35,18 +35,66 @@ fn resumable_model(directory: &Path, spec: &mapping::ModelSpec) -> Option<serde_
     Some(sidecar)
 }
 
-fn run() -> Result<(), String> {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+fn read_recipe(path: &str) -> Result<String, String> {
+    std::fs::read_to_string(path).map_err(|e| format!("Cannot read recipe {path}: {e}"))
+}
+
+fn create_dir(path: &Path) -> Result<(), String> {
+    std::fs::create_dir_all(path)
+        .map_err(|e| format!("Cannot create folder {}: {e}", path.display()))
+}
+
+/// Writes one converted file, creating its folder. Errors name the file, so a
+/// full disk or a blocked folder is reported as such rather than a bare OS error.
+fn write_output(path: &Path, bytes: impl AsRef<[u8]>) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        create_dir(parent)?;
+    }
+    std::fs::write(path, bytes).map_err(|e| format!("Cannot write {}: {e}", path.display()))
+}
+
+fn json(value: &serde_json::Value) -> Result<Vec<u8>, String> {
+    serde_json::to_vec_pretty(value).map_err(|e| e.to_string())
+}
+
+/// Arguments as UTF-8. A path Windows cannot express in UTF-8 is reported
+/// instead of panicking (which would exit with 101 and no explanation).
+fn arguments() -> Result<Vec<String>, String> {
+    std::env::args_os()
+        .skip(1)
+        .enumerate()
+        .map(|(index, arg)| {
+            arg.into_string().map_err(|arg| {
+                format!(
+                    "Argument {} is not valid Unicode: {}",
+                    index + 1,
+                    arg.to_string_lossy()
+                )
+            })
+        })
+        .collect()
+}
+
+/// The single line the launcher shows: every failure exits 1 after printing it.
+fn error_line(command: Option<&str>, error: &str) -> String {
+    let text = error.split_whitespace().collect::<Vec<_>>().join(" ");
+    match command {
+        Some(command) => format!("d2r-convert: error: {command}: {text}"),
+        None => format!("d2r-convert: error: {text}"),
+    }
+}
+
+fn run(args: &[String]) -> Result<(), String> {
     if !((args.len() == 5 && ["convert", "mapping-all", "environment"].contains(&args[0].as_str()))
         || (args.len() == 6 && args[0] == "mapping")
         || (args.len() == 4 && ["ui", "portal"].contains(&args[0].as_str())))
     {
-        return Err("Usage: d2r-convert convert GAME_DIR CACHE_DIR D2RTOOL UNIT_JSON | mapping GAME_DIR CACHE_DIR D2RTOOL MAPPING_TOML MODEL_KEY | mapping-all GAME_DIR CACHE_DIR D2RTOOL MAPPING_TOML | environment GAME_DIR CACHE_DIR D2RTOOL ENV_TOML | ui|portal GAME_DIR CACHE_DIR D2RTOOL".into());
+        return Err("Unrecognised arguments. Usage: d2r-convert convert GAME_DIR CACHE_DIR D2RTOOL UNIT_JSON | mapping GAME_DIR CACHE_DIR D2RTOOL MAPPING_TOML MODEL_KEY | mapping-all GAME_DIR CACHE_DIR D2RTOOL MAPPING_TOML | environment GAME_DIR CACHE_DIR D2RTOOL ENV_TOML | ui|portal GAME_DIR CACHE_DIR D2RTOOL".into());
     }
     let cache = PathBuf::from(&args[2]);
     let mut storage = NativeStorage::new(&args[1], &cache, &args[3])?;
     if args[0] == "environment" {
-        let recipe = std::fs::read_to_string(&args[4]).map_err(|e| e.to_string())?;
+        let recipe = read_recipe(&args[4])?;
         let build = storage.build_version()?;
         let dir = cache.join("glb");
         let manifest = d2r_converter::environment::build(
@@ -63,39 +111,41 @@ fn run() -> Result<(), String> {
                     return Err(format!("Invalid output path {path}"));
                 }
                 let target = dir.join(relative);
-                std::fs::create_dir_all(target.parent().unwrap()).map_err(|e| e.to_string())?;
-                std::fs::write(target, bytes).map_err(|e| e.to_string())
+                write_output(&target, bytes)
             },
         )?;
         let dest = dir.join("env/env.resolved.json");
-        std::fs::create_dir_all(dest.parent().unwrap()).map_err(|e| e.to_string())?;
-        std::fs::write(
-            dest,
-            serde_json::to_vec_pretty(&manifest).map_err(|e| e.to_string())?,
-        )
-        .map_err(|e| e.to_string())?;
+        write_output(&dest, json(&manifest)?)?;
         return Ok(());
     }
     if args[0] == "mapping-all" {
-        let recipe = std::fs::read_to_string(&args[4]).map_err(|e| e.to_string())?;
+        let recipe = read_recipe(&args[4])?;
         let specs = mapping::plan(&recipe)?;
         let directory = cache.join("glb");
-        std::fs::create_dir_all(&directory).map_err(|e| e.to_string())?;
+        create_dir(&directory)?;
         if directory.join("mapping.resolved.json").exists() {
             return Err(
-                "Refusing to overwrite an existing converted mapping; select a new working cache"
+                "Refusing to overwrite an existing converted mapping; clear the D2R import in the launcher and import again"
                     .into(),
             );
         }
         let identity = format!(
             "{:x}",
-            Sha256::digest(format!("{}\n{}", storage.build_version()?, recipe).as_bytes())
+            Sha256::digest(
+                format!(
+                    "{}\n{}\n{}",
+                    storage.build_version()?,
+                    d2r_converter::texture::OUTPUT_FORMAT,
+                    recipe
+                )
+                .as_bytes(),
+            )
         );
         let identity_path = cache.join(".rust-mapping-identity");
         let resume = match std::fs::read_to_string(&identity_path) {
             Ok(previous) if previous != identity => {
                 let has_models = std::fs::read_dir(&directory)
-                    .map_err(|e| e.to_string())?
+                    .map_err(|e| format!("Cannot list {}: {e}", directory.display()))?
                     .filter_map(Result::ok)
                     .any(|entry| {
                         entry.path().is_file()
@@ -105,17 +155,17 @@ fn run() -> Result<(), String> {
                             )
                     });
                 if has_models {
-                    return Err("Mapping work belongs to another recipe or game build; select a new working cache".into());
+                    return Err("Mapping work in the cache belongs to another recipe or game build; clear the D2R import in the launcher and import again".into());
                 }
-                std::fs::write(&identity_path, identity).map_err(|e| e.to_string())?;
+                write_output(&identity_path, identity.as_bytes())?;
                 false
             }
             Ok(_) => true,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                std::fs::write(identity_path, identity).map_err(|e| e.to_string())?;
+                write_output(&identity_path, identity.as_bytes())?;
                 false
             }
-            Err(e) => return Err(e.to_string()),
+            Err(e) => return Err(format!("Cannot read {}: {e}", identity_path.display())),
         };
         let mut metadata = BTreeMap::new();
         for (index, spec) in specs.iter().enumerate() {
@@ -136,16 +186,13 @@ fn run() -> Result<(), String> {
                 .map_err(|e| format!("{}: {e}", spec.key))?;
             for (name, bytes) in result.files {
                 let path = directory.join(name);
-                std::fs::create_dir_all(path.parent().unwrap()).map_err(|e| e.to_string())?;
-                std::fs::write(path, bytes).map_err(|e| e.to_string())?;
+                write_output(&path, bytes)?;
             }
-            std::fs::write(directory.join(format!("{}.glb", spec.key)), result.glb)
-                .map_err(|e| e.to_string())?;
-            std::fs::write(
-                directory.join(format!("{}.json", spec.key)),
-                serde_json::to_vec_pretty(&result.sidecar).map_err(|e| e.to_string())?,
-            )
-            .map_err(|e| e.to_string())?;
+            write_output(&directory.join(format!("{}.glb", spec.key)), result.glb)?;
+            write_output(
+                &directory.join(format!("{}.json", spec.key)),
+                json(&result.sidecar)?,
+            )?;
             metadata.insert(spec.key.clone(), result.sidecar);
         }
         let (resolved, problems) =
@@ -153,11 +200,7 @@ fn run() -> Result<(), String> {
         for problem in &problems {
             eprintln!("mapping: {problem}");
         }
-        std::fs::write(
-            directory.join("mapping.resolved.json"),
-            serde_json::to_vec_pretty(&resolved).map_err(|e| e.to_string())?,
-        )
-        .map_err(|e| e.to_string())?;
+        write_output(&directory.join("mapping.resolved.json"), json(&resolved)?)?;
         return Ok(());
     }
     if args[0] == "ui" || args[0] == "portal" {
@@ -172,14 +215,13 @@ fn run() -> Result<(), String> {
         };
         for (path, bytes) in files {
             let destination = cache.join("glb").join(path);
-            std::fs::create_dir_all(destination.parent().unwrap()).map_err(|e| e.to_string())?;
-            std::fs::write(destination, bytes).map_err(|e| e.to_string())?;
+            write_output(&destination, bytes)?;
         }
         return Ok(());
     }
     let (path, stem, parts, all_variants, clips, dyes, attachments, variant_names, sources) =
         if args[0] == "mapping" {
-            let recipe = std::fs::read_to_string(&args[4]).map_err(|e| e.to_string())?;
+            let recipe = read_recipe(&args[4])?;
             let spec = mapping::plan(&recipe)?
                 .into_iter()
                 .find(|s| s.key == args[5])
@@ -236,35 +278,43 @@ fn run() -> Result<(), String> {
         1024,
     )?;
     let destination = cache.join("glb").join(format!("{stem}.glb"));
-    std::fs::create_dir_all(destination.parent().unwrap()).map_err(|e| e.to_string())?;
-    std::fs::write(&destination, &output.glb).map_err(|e| e.to_string())?;
+    write_output(&destination, &output.glb)?;
     for (name, bytes) in baked.files {
         let target = cache.join("glb").join(name);
-        std::fs::create_dir_all(target.parent().unwrap()).map_err(|e| e.to_string())?;
-        std::fs::write(target, bytes).map_err(|e| e.to_string())?;
+        write_output(&target, bytes)?;
     }
     let sidecar = serde_json::json!({"source":path,"meshes":output.meshes,"bones":output.bones,"clips":output.clips,"variants":baked.variants});
-    std::fs::write(
-        destination.with_extension("json"),
-        serde_json::to_vec_pretty(&sidecar).map_err(|e| e.to_string())?,
-    )
-    .map_err(|e| e.to_string())?;
+    write_output(&destination.with_extension("json"), json(&sidecar)?)?;
     eprintln!(
         "Converted {path}: {} bones, {} meshes",
         output.bones, output.meshes
     );
     Ok(())
 }
+
 fn main() {
-    if let Err(error) = run() {
-        eprintln!("{error}");
-        std::process::exit(1);
-    }
+    let line = match arguments() {
+        Err(error) => error_line(None, &error),
+        Ok(args) => match run(&args) {
+            Ok(()) => return,
+            Err(error) => error_line(args.first().map(String::as_str), &error),
+        },
+    };
+    eprintln!("{line}");
+    std::process::exit(1);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn errors_print_as_one_prefixed_line() {
+        assert_eq!(
+            error_line(Some("mapping-all"), "hero: Cannot write x:\n  disk full"),
+            "d2r-convert: error: mapping-all: hero: Cannot write x: disk full"
+        );
+        assert_eq!(error_line(None, "bad"), "d2r-convert: error: bad");
+    }
     #[test]
     fn resume_requires_complete_glb_and_every_variant_file() {
         let temp = std::env::temp_dir().join(format!(

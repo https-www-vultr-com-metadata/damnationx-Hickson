@@ -538,7 +538,7 @@ fn material<F: FnMut(&str, &str) -> Result<Option<Vec<u8>>, String>>(
     ] {
         let path = format!("{source}{suffix}.texture");
         let png = texture(&path, usage)?.ok_or_else(|| format!("cathedral requires {path}"))?;
-        let id = g.image_png(&png, &path)?;
+        let id = g.image(&png, &path)?;
         match usage {
             "albedo" => m["pbrMetallicRoughness"]["baseColorTexture"] = json!({"index":id}),
             "normal" => m["normalTexture"] = json!({"index":id,"scale":0.85}),

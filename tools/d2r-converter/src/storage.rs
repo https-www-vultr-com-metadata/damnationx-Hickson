@@ -75,6 +75,16 @@ impl Install {
             Self::BattleNet { game } => {
                 let mut path = game.as_os_str().to_os_string();
                 path.push(std::path::MAIN_SEPARATOR.to_string());
+                // CascLib opens the first active row of .build.info. When
+                // Battle.net lists several (a PTR or another product beside
+                // D2R), name D2R's product code so the right build opens.
+                let rows = fs::read(game.join(".build.info"))
+                    .map(|bytes| build_info_rows(&String::from_utf8_lossy(&bytes)))
+                    .unwrap_or_default();
+                let active: Vec<_> = rows.iter().filter(|row| row.active).collect();
+                if active.len() > 1 && active.iter().any(|row| row.product == D2R_PRODUCT) {
+                    path.push(format!("*{D2R_PRODUCT}"));
+                }
                 path
             }
             Self::Steam { build_config } => build_config.as_os_str().to_os_string(),
@@ -186,17 +196,199 @@ fn plain_path(path: PathBuf) -> PathBuf {
     path
 }
 
-fn helper_error(output: &std::process::Output) -> String {
-    format!(
-        "d2rtool exited with {}: {}",
-        output.status,
-        String::from_utf8_lossy(&output.stderr).trim()
-    )
+fn write_error(path: &Path, error: std::io::Error) -> String {
+    format!("Cannot write {}: {error}", path.display())
+}
+
+/// What a CascLib open error (a Win32 error code on every platform) most likely
+/// means for a player's D2R install, so the launcher can show a fix.
+fn casc_open_hint(code: i64) -> &'static str {
+    match code {
+        2 | 3 => "the folder is missing D2R archive files; choose the folder that holds D2R.exe and Data, and let Battle.net or Steam finish installing",
+        5 => "access was denied; check the folder's permissions and that antivirus is not blocking d2rtool.exe",
+        32 | 33 => "the archives are in use; close D2R and let Battle.net or Steam finish any update, then retry",
+        11 | 13 | 1392 => "the archives look damaged or mid-update; let Battle.net or Steam finish updating, or run Scan and Repair / Verify integrity",
+        50 => "this D2R build stores its archives in a format the bundled reader does not support yet; report the D2R version",
+        8 | 14 => "the system ran out of memory",
+        _ => "check that the folder is a complete, up-to-date D2R install",
+    }
+}
+
+/// Battle.net's product code for Diablo II: Resurrected.
+const D2R_PRODUCT: &str = "osi";
+
+/// One build row of a Battle.net `.build.info` (a `|`-separated table whose
+/// header names columns like `Active!DEC:1`).
+#[derive(Debug, Default, PartialEq, Eq)]
+struct BuildRow {
+    active: bool,
+    product: String,
+    build_key: String,
+    cdn_key: String,
+    version: String,
+}
+
+fn build_info_rows(text: &str) -> Vec<BuildRow> {
+    let mut lines = text
+        .trim_start_matches('\u{feff}')
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'));
+    let Some(header) = lines.next() else {
+        return Vec::new();
+    };
+    let columns: Vec<String> = header
+        .split('|')
+        .map(|column| column.split('!').next().unwrap_or("").trim().to_ascii_lowercase())
+        .collect();
+    let index = |name: &str| columns.iter().position(|column| column == name);
+    let (active, product, build_key, cdn_key, version) = (
+        index("active"),
+        index("product"),
+        index("build key"),
+        index("cdn key"),
+        index("version"),
+    );
+    lines
+        .map(|line| {
+            let fields: Vec<&str> = line.split('|').collect();
+            let field = |at: Option<usize>| {
+                at.and_then(|at| fields.get(at)).map_or(String::new(), |value| value.trim().to_string())
+            };
+            BuildRow {
+                active: field(active) == "1",
+                product: field(product),
+                build_key: field(build_key).to_ascii_lowercase(),
+                cdn_key: field(cdn_key).to_ascii_lowercase(),
+                version: field(version),
+            }
+        })
+        .collect()
+}
+
+/// Why CascLib most likely could not find a Battle.net install's files
+/// (error 2), read from `.build.info` and the `Data` folder.
+fn battle_net_diagnosis(game: &Path) -> Option<String> {
+    let text = fs::read(game.join(".build.info")).ok()?;
+    let rows = build_info_rows(&String::from_utf8_lossy(&text));
+    if rows.is_empty() {
+        return Some(".build.info lists no builds; run Scan and Repair in Battle.net".into());
+    }
+    let active: Vec<_> = rows.iter().filter(|row| row.active).collect();
+    let Some(row) = active
+        .iter()
+        .find(|row| row.product == D2R_PRODUCT)
+        .or_else(|| active.first())
+    else {
+        return Some(
+            ".build.info marks no build as active, so Battle.net has an install or update pending; \
+             open Battle.net, let Diablo II: Resurrected finish updating, then retry"
+                .into(),
+        );
+    };
+    let data = game.join("Data");
+    for (what, key) in [("build config", &row.build_key), ("CDN config", &row.cdn_key)] {
+        if key.len() < 4 || !key.is_ascii() {
+            return Some(format!(".build.info has no valid {what} key; run Scan and Repair in Battle.net"));
+        }
+        let config = data.join("config").join(&key[0..2]).join(&key[2..4]).join(key);
+        if !config.is_file() {
+            return Some(format!(
+                "Battle.net has not finished downloading D2R {} ({} is missing); open Battle.net and let it \
+                 finish updating, or run Scan and Repair",
+                if row.version.is_empty() { "build" } else { &row.version },
+                config.display()
+            ));
+        }
+    }
+    let indices = fs::read_dir(data.join("data"))
+        .map(|entries| {
+            entries
+                .flatten()
+                .filter(|entry| {
+                    entry.path().extension().is_some_and(|ext| ext.eq_ignore_ascii_case("idx"))
+                })
+                .count()
+        })
+        .unwrap_or(0);
+    if indices == 0 {
+        return Some(format!(
+            "{} has no archive index files (*.idx); the install is incomplete, so run Scan and Repair in Battle.net",
+            data.join("data").display()
+        ));
+    }
+    None
+}
+
+/// One-line description of a failed d2rtool run, with a likely fix.
+fn helper_error(output: &std::process::Output, install: &Install) -> String {
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let message = stderr.split_whitespace().collect::<Vec<_>>().join(" ");
+    if let Some(code) = message
+        .strip_prefix("open failed ")
+        .and_then(|rest| rest.split_whitespace().next())
+        .and_then(|code| code.parse::<i64>().ok())
+    {
+        let diagnosis = match install {
+            Install::BattleNet { game } if code == 2 || code == 3 => battle_net_diagnosis(game),
+            _ => None,
+        };
+        return format!(
+            "d2rtool could not open the D2R archives (CascLib error {code}): {}",
+            diagnosis.as_deref().unwrap_or(casc_open_hint(code))
+        );
+    }
+    let detail = if message.is_empty() {
+        "no error output".to_string()
+    } else {
+        message
+    };
+    format!("d2rtool {}: {detail}", describe_status(output.status))
+}
+
+/// `exited with exit code: 1`, plus the meaning of Windows crash and loader codes.
+pub fn describe_status(status: std::process::ExitStatus) -> String {
+    match status
+        .code()
+        .and_then(|code| windows_status_meaning(code as u32))
+    {
+        Some(meaning) => format!("exited with {status} ({meaning})"),
+        None => format!("exited with {status}"),
+    }
+}
+
+/// NTSTATUS values a process exits with when Windows itself stopped it.
+pub fn windows_status_meaning(code: u32) -> Option<&'static str> {
+    Some(match code {
+        0xC000_0135 => "a required DLL was not found; install the Microsoft Visual C++ 2015-2022 x64 Redistributable",
+        0xC000_007B => "a DLL is for the wrong architecture or damaged; reinstall the Microsoft Visual C++ 2015-2022 x64 Redistributable",
+        0xC000_0139 | 0xC000_0142 => "a required DLL failed to load",
+        0xC000_0005 => "it crashed with an access violation",
+        0xC000_00FD => "it crashed with a stack overflow",
+        0xC000_0409 => "it aborted on an internal check",
+        0xC000_0017 | 0xC000_009A => "the system ran out of memory",
+        0xC000_013A => "it was interrupted",
+        0xC000_0022 => "access was denied; antivirus may be blocking it",
+        _ => return None,
+    })
+}
+
+impl NativeStorage {
+    /// The helper could not be started at all: usually quarantined by antivirus
+    /// or missing because the package was not fully extracted.
+    fn spawn_error(&self, error: std::io::Error) -> String {
+        format!(
+            "Cannot start the D2R archive helper {}: {error}. Re-extract the full package; if antivirus quarantined d2rtool.exe, restore it or allow it",
+            self.tool.display()
+        )
+    }
 }
 
 impl NativeStorage {
     pub fn build_version(&self) -> Result<String, String> {
-        let bytes = fs::read(self.install.build_file()).map_err(|e| e.to_string())?;
+        let file = self.install.build_file();
+        let bytes = fs::read(&file)
+            .map_err(|e| format!("Cannot read the D2R build file {}: {e}", file.display()))?;
         Ok(self.install.cache_key(&bytes))
     }
     pub fn new(
@@ -218,8 +410,14 @@ impl NativeStorage {
                 .canonicalize()
                 .map_err(|e| format!("D2R archive helper unavailable: {e}"))?,
         );
-        fs::create_dir_all(cache.as_ref()).map_err(|e| e.to_string())?;
-        let cache = plain_path(cache.as_ref().canonicalize().map_err(|e| e.to_string())?);
+        let cache_error = |e: std::io::Error| {
+            format!(
+                "Cannot use the conversion cache {}: {e}",
+                cache.as_ref().display()
+            )
+        };
+        fs::create_dir_all(cache.as_ref()).map_err(cache_error)?;
+        let cache = plain_path(cache.as_ref().canonicalize().map_err(cache_error)?);
         if cache.starts_with(&game) {
             return Err("The conversion cache must be outside the D2R installation".into());
         }
@@ -249,18 +447,19 @@ impl NativeStorage {
                         .command()
                         .arg("list")
                         .output()
-                        .map_err(|e| e.to_string())?;
+                        .map_err(|e| self.spawn_error(e))?;
                     if !out.status.success() {
-                        return Err(helper_error(&out));
+                        return Err(helper_error(&out, &self.install));
                     }
                     let temp = file.with_extension("tsv.tmp");
-                    fs::write(&temp, &out.stdout).map_err(|e| e.to_string())?;
-                    fs::rename(&temp, &file).map_err(|e| e.to_string())?;
+                    fs::write(&temp, &out.stdout).map_err(|e| write_error(&temp, e))?;
+                    fs::rename(&temp, &file).map_err(|e| write_error(&file, e))?;
                     out.stdout
                 }
-                Err(e) => return Err(e.to_string()),
+                Err(e) => return Err(format!("Cannot read {}: {e}", file.display())),
             };
-            let contents = std::str::from_utf8(&contents).map_err(|e| e.to_string())?;
+            let contents = std::str::from_utf8(&contents)
+                .map_err(|e| format!("The archive listing {} is not UTF-8: {e}", file.display()))?;
             let mut listing = BTreeMap::new();
             for line in contents.lines() {
                 if let Some((size, name)) = line.split_once('\t') {
@@ -288,7 +487,7 @@ impl NativeStorage {
         if missing.is_empty() {
             return Ok(());
         }
-        fs::create_dir_all(&raw).map_err(|e| e.to_string())?;
+        fs::create_dir_all(&raw).map_err(|e| write_error(&raw, e))?;
         let mut child = self
             .command()
             .arg("batch")
@@ -297,7 +496,7 @@ impl NativeStorage {
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
             .spawn()
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| self.spawn_error(e))?;
         let mut input = child.stdin.take().unwrap();
         // Drain stderr while writing stdin: a large batch of missing files can
         // otherwise fill both pipes and deadlock the helper.
@@ -307,13 +506,15 @@ impl NativeStorage {
             }
             Ok(())
         });
-        let out = child.wait_with_output().map_err(|e| e.to_string())?;
+        let out = child
+            .wait_with_output()
+            .map_err(|e| format!("The D2R archive helper did not finish: {e}"))?;
         let write_result = writer
             .join()
             .map_err(|_| "Archive input writer failed".to_string())?;
         // 3 reports individual missing entries; read() reports exactly which.
         if !out.status.success() && out.status.code() != Some(3) {
-            return Err(helper_error(&out));
+            return Err(helper_error(&out, &self.install));
         }
         write_result?;
         Ok(())
@@ -335,7 +536,7 @@ impl NativeStorage {
         let flat = PathBuf::from(flat);
         let source_time = fs::metadata(&source)
             .and_then(|m| m.modified())
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| format!("Cannot read {}: {e}", source.display()))?;
         let stale = fs::metadata(&flat)
             .and_then(|m| m.modified())
             .map_or(true, |t| t < source_time);
@@ -347,18 +548,18 @@ impl NativeStorage {
                 .arg(&source)
                 .arg(&temp)
                 .output()
-                .map_err(|e| e.to_string())?;
+                .map_err(|e| self.spawn_error(e))?;
             if !out.status.success() {
                 let _ = fs::remove_file(&temp);
-                return Err(helper_error(&out));
+                return Err(helper_error(&out, &self.install));
             }
             // A failed helper must never leave a fresh-looking partial cache.
             if flat.exists() {
-                fs::remove_file(&flat).map_err(|e| e.to_string())?;
+                fs::remove_file(&flat).map_err(|e| write_error(&flat, e))?;
             }
-            fs::rename(temp, &flat).map_err(|e| e.to_string())?;
+            fs::rename(temp, &flat).map_err(|e| write_error(&flat, e))?;
         }
-        fs::read(flat).map_err(|e| e.to_string())
+        fs::read(&flat).map_err(|e| format!("Cannot read {}: {e}", flat.display()))
     }
 }
 
@@ -510,6 +711,95 @@ mod tests {
             .unwrap()
             .join(format!("listfile-{key}.tsv"))
             .is_file());
+    }
+
+    /// Helper failures reach the launcher as one line that names the cause.
+    #[cfg(unix)]
+    #[test]
+    fn helper_failures_are_one_explained_line() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = TempDir::new("helper-errors");
+        let game = temp.path().join("D2R");
+        write(&game.join(".build.info"), "Version!STRING:0\n1.6.80273\n");
+        fs::create_dir_all(game.join("Data")).unwrap();
+        let tool = temp.path().join("d2rtool");
+        let mut errors = Vec::new();
+        for script in [
+            "echo 'open failed 2' >&2; exit 1",
+            "echo 'open failed 32' >&2; exit 1",
+            "echo 'boom' >&2; echo 'second line' >&2; exit 4",
+            "exit 9",
+        ] {
+            write(&tool, &format!("#!/bin/sh\n{script}\n"));
+            fs::set_permissions(&tool, fs::Permissions::from_mode(0o755)).unwrap();
+            let mut storage = NativeStorage::new(&game, temp.path().join("cache"), &tool).unwrap();
+            errors.push(storage.listing().unwrap_err());
+        }
+        assert!(errors[0].starts_with("d2rtool could not open the D2R archives (CascLib error 2)"));
+        assert!(errors[1].contains("close D2R"), "{}", errors[1]);
+        assert_eq!(
+            errors[2],
+            "d2rtool exited with exit status: 4: boom second line"
+        );
+        assert_eq!(
+            errors[3],
+            "d2rtool exited with exit status: 9: no error output"
+        );
+        assert!(errors.iter().all(|e| !e.contains('\n')));
+        fs::remove_file(&tool).unwrap();
+        let missing = NativeStorage::new(&game, temp.path().join("cache"), &tool);
+        assert!(missing.is_err_and(|e| e.starts_with("D2R archive helper unavailable")));
+    }
+
+
+    /// CascLib error 2 on a Battle.net install names what is missing.
+    #[test]
+    fn battle_net_open_errors_name_the_missing_piece() {
+        let temp = TempDir::new("diagnosis");
+        let game = temp.path().join("D2R");
+        let header = "Branch!STRING:0|Active!DEC:1|Build Key!HEX:16|CDN Key!HEX:16|Version!STRING:0|Product!STRING:0";
+        let build = "aabbccddeeff00112233445566778899";
+        let cdn = "0123456789abcdef0123456789abcdef";
+        write(
+            &game.join(".build.info"),
+            &format!("{header}\nus|0|{build}|{cdn}|3.3.93847|osi\n"),
+        );
+        fs::create_dir_all(game.join("Data/data")).unwrap();
+        assert!(battle_net_diagnosis(&game).unwrap().contains("no build as active"));
+
+        write(
+            &game.join(".build.info"),
+            &format!("{header}\nus|1|{build}|{cdn}|3.3.93847|osi\n"),
+        );
+        let missing = battle_net_diagnosis(&game).unwrap();
+        assert!(missing.contains("3.3.93847") && missing.contains(build), "{missing}");
+
+        for key in [build, cdn] {
+            write(
+                &game.join("Data/config").join(&key[0..2]).join(&key[2..4]).join(key),
+                "",
+            );
+        }
+        assert!(battle_net_diagnosis(&game).unwrap().contains("*.idx"));
+        write(&game.join("Data/data/0000000001.idx"), "");
+        assert_eq!(battle_net_diagnosis(&game), None);
+
+        // One active row opens as before; several name D2R's product.
+        let install = Install::detect(&game).unwrap();
+        assert!(!install.storage_arg().to_string_lossy().contains('*'));
+        write(
+            &game.join(".build.info"),
+            &format!("{header}\nus|1|{cdn}|{cdn}|9.9|osib\nus|1|{build}|{cdn}|3.3.93847|osi\n"),
+        );
+        assert!(install.storage_arg().to_string_lossy().ends_with("*osi"));
+        assert_eq!(battle_net_diagnosis(&game), None);
+    }
+    #[test]
+    fn windows_loader_and_crash_codes_are_explained() {
+        assert!(windows_status_meaning(0xC000_0135)
+            .unwrap()
+            .contains("Visual C++"));
+        assert!(windows_status_meaning(1).is_none());
     }
 
     #[test]
